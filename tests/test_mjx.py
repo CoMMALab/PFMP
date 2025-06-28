@@ -1,150 +1,43 @@
+
+import fire
 import time
 import jax
 import jax.numpy as jnp
 import mujoco
 import matplotlib.pyplot as plt
+import importlib
 
-from typing import NamedTuple
-from genjax import gen, mv_normal
-from mujoco import mjx
 from mujoco.viewer import launch_passive
+from mujoco import mjx
 from pfmp import PFMP
 
 
-class DataTracer(NamedTuple):
-    ctrl: jax.Array
-    qpos: jax.Array
-    qvel: jax.Array
+def load_model(name: str):
+    with open(f"tests/mjx_mod/assets/{name}.xml", 'r') as f:
+        xml = f.read()
 
-class ControlParams(NamedTuple):
-    coarse_control: float
-    fine_control: float
-    fine_angle_bounds: float
+    mj_model = mujoco.MjModel.from_xml_string(xml)
+    mj_data = mujoco.MjData(mj_model)
+    mjx_model = mjx.put_model(mj_model)
+    x0 = mjx.put_data(mj_model, mj_data)
 
-# === Load inverted_pendulum.xml ===
-with open("tests/mjx_mod/assets/inverted_double_pendulum.xml", "r") as f:
-    xml = f.read()
+    parent = importlib.import_module(f"mjx_mod")
+    module = getattr(parent, name)
+    data = {k: getattr(module, k) for k in dir(module) if not k.startswith("_")}
 
-# with open("tests/mujoco/assets/inverted_double_pendulum.xml", "r") as f:
-#     xml = f.read()
-
-mj_model = mujoco.MjModel.from_xml_string(xml)
-mj_data = mujoco.MjData(mj_model)
-mjx_model = mjx.put_model(mj_model)
-# mjx_data = mjx.put_data(mj_model, mj_data)
-n_act = mjx_model.nu  # == 1 for inverted (single|double) pendulum
-
-mjx_step = jax.jit(mjx.step)
-
-@gen
-def transition_fn(data: mjx.Data, params: ControlParams, t: int) -> tuple[mjx.Data, DataTracer]:
-    theta = data.qpos[1]
-    near_upright = jnp.abs(theta - jnp.pi) < params.fine_angle_bounds
-    scale = jnp.where(near_upright, params.fine_control, params.coarse_control)
-    ctrl = mv_normal(jnp.zeros(n_act), jnp.eye(n_act) * scale) @ "control"
-    data = data.replace(ctrl=ctrl)
-    data = mjx_step(mjx_model, data)
-    return data, DataTracer(
-        ctrl = data.ctrl,
-        qpos = data.qpos,
-        qvel = data.qvel
+    pfmp = PFMP(
+        data['transition_fn'],
+        data['cost_fn'],
+        carry_mjx=True
     )
+    return pfmp, x0, data['u']._replace(mjx_model=mjx_model), mj_model, mj_data
 
-# @jax.jit
-# def cost_fn(data: mjx.Data, _: ControlParams, t: int) -> float:
-#     (p, theta), (dp, dtheta) = data.qpos, data.qvel
-#     pos_cost = 0.1 * p**2
-#     vel_cost = 0.02 * dp**2
-#     angle_cost = 1 + jnp.cos(theta)
-#     ang_vel_cost = 0.01 * dtheta**2
-#     return (
-#         pos_cost +
-#         vel_cost +
-#         angle_cost +
-#         ang_vel_cost
-#     )
-
-@jax.jit
-def cost_fn(data: mjx.Data, _: ControlParams, t: int) -> float:
-    p, theta1, theta2 = data.qpos
-    dp, dtheta1, dtheta2 = data.qvel
-    
-    # Angular deviations from upright (more direct formulation)
-    angle_cost1 = (1 + jnp.cos(theta1)) / 2  # 0 when upright, 20 when downward
-    angle_cost2 = (1 - jnp.cos(theta2)) / 2  # 0 when upright, 20 when downward
-    
-    # Position and velocity costs with different weights
-    pos_cost = 0.1 * p**2     # light penalty on cart position
-    vel_cost = 0.02 * dp**2   # light penalty on cart velocity
-    
-    # Angular velocity costs (prevent excessive spinning)
-    ang_vel_cost1 = 0.01 * dtheta1**2
-    ang_vel_cost2 = 0.01 * dtheta2**2
-    
-    # Control effort penalty (energy efficiency)
-    control_cost = 0.001 * data.ctrl[0]**2
-    
-    total_cost = (
-        angle_cost1 + angle_cost2 +      # Primary objective: keep upright
-        pos_cost + vel_cost +            # Secondary: control cart
-        ang_vel_cost1 + ang_vel_cost2 +  # Prevent excessive motion
-        control_cost                     # Penalize large control efforts
-    )
-    
-    return total_cost
-
-def decelerating_schedule(H: int, start_gap: int = 3, max_gap: int = 20):
-    gaps = jnp.linspace(start_gap, max_gap, H // 2)
-    indices = jnp.cumsum(gaps).astype(int)
-    indices = indices[indices < H]
-    return jnp.zeros(H, dtype=bool).at[indices].set(True)
-
-# === Copy MJX data into MjData for visualization ===
 def sync_to_mujoco(mj_data, traj, t):
     mj_data.qpos[:] = jax.device_get(traj.qpos[t])
     mj_data.qvel[:] = jax.device_get(traj.qvel[t])
     mj_data.ctrl[:] = jax.device_get(traj.ctrl[t])
 
-# def loop_viewer(traj, u):
-#     dt = mj_model.opt.timestep
-#     with launch_passive(mj_model, data=mj_data, show_left_ui=False, show_right_ui=False) as viewer:
-#         t = 0
-
-#         # --- before the viewer loop ---
-#         plt.ion()
-#         fig, ax = plt.subplots()
-#         line, = ax.plot([], [], lw=2)
-#         ax.set_xlim(0, 500)           # adjust based on expected t
-#         ax.set_ylim(0, 1000)          # adjust based on expected cost
-#         ax.set_xlabel("Time step")
-#         ax.set_ylabel("Cost")
-
-#         costs = []
-#         times = []
-
-#         while viewer.is_running():
-#             print(t)
-#             sync_to_mujoco(mj_data, traj, t)
-#             mujoco.mj_forward(mj_model, mj_data)
-
-#             x = jax.tree.map(lambda field: field[t], traj)
-#             print(f"qpos: {x.qpos}")
-#             cost = float(cost_fn(x, u, t))  # convert to Python float
-
-#             # --- update live plot ---
-#             costs.append(cost)
-#             times.append(t)
-#             line.set_data(times, costs)
-#             ax.set_xlim(0, max(500, t + 10))
-#             ax.set_ylim(0, max(costs) * 1.1)
-#             fig.canvas.draw()
-#             fig.canvas.flush_events()
-
-#             viewer.sync()
-#             time.sleep(dt)
-#             t += 1
-
-def loop_viewer(traj, u):
+def loop_viewer(mj_model, mj_data, traj, u, cost_fn):
     dt = mj_model.opt.timestep
     with launch_passive(mj_model, data=mj_data, show_left_ui=False, show_right_ui=False) as viewer:
         t = 0
@@ -176,10 +69,11 @@ def loop_viewer(traj, u):
         times = []
         
         while viewer.is_running():
+            print(t)
             sync_to_mujoco(mj_data, traj, t)
             mujoco.mj_forward(mj_model, mj_data)
             x = jax.tree.map(lambda field: field[t], traj)
-            # print(f"qpos[{t}] = {x.qpos}")
+            print(f"qpos: {x.qpos}")
             
             cost = float(cost_fn(x, u, t))
             ctrl = float(x.ctrl[0]) if len(x.ctrl) > 0 else 0.0  # assuming single control input
@@ -206,39 +100,35 @@ def loop_viewer(traj, u):
             fig.canvas.draw()
             fig.canvas.flush_events()
             viewer.sync()
-            time.sleep(dt)
+            # time.sleep(dt)
             t += 1
 
-def test_mjx():
-    H, K = 800, 100000
-    pfmp = PFMP(transition_fn, cost_fn, carry_mjx=True)
-    key = jax.random.key(0)
+def decelerating_schedule(H: int, start_gap: int = 3, max_gap: int = 20):
+    gaps = jnp.linspace(start_gap, max_gap, H // 2)
+    indices = jnp.cumsum(gaps).astype(int)
+    indices = indices[indices < H]
+    return jnp.zeros(H, dtype=bool).at[indices].set(True)
 
-    x0 = mjx.put_data(mj_model, mj_data)
+def test_mjx(
+    name: str,
+    h: int,
+    k: int
+):
+    key = jax.random.key(2)
+    pfmp, x0, u, mj_model, mj_data = load_model(name)
 
-    u = ControlParams(
-        coarse_control = 5.0,
-        fine_control = 0.01,
-        fine_angle_bounds = 0.1
-    )
-
+    t0 = time.time()
     j_sample_forward = jax.jit(pfmp.sample_forward, static_argnames=['block_shape'])
-    for i in range(1):
-        t0 = time.time()
-        (key, subkey) = jax.random.split(key)
-        sched = decelerating_schedule(H, 3, 3)
-        # sched = jnp.full(H, True)
-        (states, ancestors) = jax.block_until_ready(
-            j_sample_forward(subkey, (H, K), x0, u, sched)
-        )
-        t1 = time.time()
-        if i == 0:
-            print(f"sample_forward (first run): {t1 - t0}")
-        else:
-            print(f"sample_forward (after jit): {t1 - t0}")
+    # sched = decelerating_schedule(h, 3, 3)
+    sched = jnp.full(h, True)
+    (states, ancestors) = jax.block_until_ready(
+        j_sample_forward(key, (h, k), x0, u, sched)
+    )
+    t1 = time.time()
+    print(f"total time: {t1 - t0}")
 
     traj = pfmp.choose_path(states, ancestors, 0)
-    loop_viewer(traj, u)
+    loop_viewer(mj_model, mj_data, traj, u, pfmp.cost_fn)
 
 if __name__ == "__main__":
-    test_mjx()
+    fire.Fire(test_mjx)
