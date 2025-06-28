@@ -153,15 +153,18 @@ def test_pfmp():
 
     (key, subkey) = jax.random.split(key)
     traj = pfmp.choose_path(states, ancestors, 0)
+    traj = jax.tree.map(lambda head, tail: jnp.concat((head[None], tail)), x0, traj)
 
     assert traj.delta.shape == (H,)
     assert traj.location.shape == (H,2)
 
+    l = 10
     for i in range(5):
         t0 = time.time()
         trajs = jax.block_until_ready(
-            pfmp.choose_paths(states, ancestors, jnp.arange(10))
+            pfmp.choose_paths(states, ancestors, jnp.arange(l))
         )
+        trajs = jax.tree.map(lambda head, tail: jnp.concat((jnp.broadcast_to(head, (l,1) + jnp.shape(head)), tail), axis=1), x0, trajs)
         t1 = time.time()
         if i == 0:
             print(f"choose_paths (first run): {t1 - t0}")
@@ -220,7 +223,9 @@ def test_mppi():
     assert traj.delta.shape == (H,)
     assert traj.location.shape == (H,2)
 
-    trajs = jax.tree.map(lambda x: x[:10], trajs)
+    l = 10
+    trajs = jax.tree.map(lambda x: x[:l], trajs)
+    trajs = jax.tree.map(lambda head, tail: jnp.concat((jnp.broadcast_to(head, (l,1) + jnp.shape(head)), tail), axis=1), x0, trajs)
 
     plt.axis('equal')
     plt.xlabel('x')
@@ -280,7 +285,9 @@ def test_cem():
     assert traj.delta.shape == (H,)
     assert traj.location.shape == (H,2)
 
-    trajs = jax.tree.map(lambda x: x[:10], trajs)
+    l = 10
+    trajs = jax.tree.map(lambda x: x[:l], trajs)
+    trajs = jax.tree.map(lambda head, tail: jnp.concat((jnp.broadcast_to(head, (l,1) + jnp.shape(head)), tail), axis=1), x0, trajs)
 
     plt.axis('equal')
     plt.xlabel('x')
