@@ -146,8 +146,8 @@ def test_pfmp():
     (key, subkey) = jax.random.split(key)
     traj = pfmp.choose_path(states, ancestors, 0)
 
-    assert traj[0].shape == (H+1,2)
-    assert traj[1].shape == (H+1,)
+    assert traj[0].shape == (H,2)
+    assert traj[1].shape == (H,)
 
     for i in range(5):
         t0 = time.time()

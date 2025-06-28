@@ -203,16 +203,10 @@ class PFMP(NamedTuple):
                 # plain tuple
                 state = tuple(vals)
 
-            next_idx = jax.lax.cond(
-                tau >= 0,
-                lambda _: ancestors[tau, idx],
-                lambda _: idx,
-                operand=None
-            )
-            return next_idx, state
+            return ancestors[tau, idx], state
 
-        # scan from h→0, then reverse
-        times = jnp.arange(h, -1, -1)
+        # scan from h-1 → 0, then reverse
+        times = jnp.arange(h-1, -1, -1)
         _, traj_back = jax.lax.scan(body, index, times)
         return jax.tree_map(lambda x: x[::-1], traj_back)
 
