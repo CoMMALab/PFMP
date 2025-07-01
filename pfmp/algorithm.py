@@ -100,9 +100,9 @@ class PFMP(NamedTuple):
                 return new_xs, new_ys, jnp.arange(k), new_log_ws
 
             # adaptive resampling
-            # ws = jnp.exp(new_log_ws - jnp.max(new_log_ws))
-            # ps = ws / jnp.sum(ws)
-            # should_resample = 1 / jnp.sum(ps ** 2) < 0.5*k
+            ws = jnp.exp(new_log_ws - jnp.max(new_log_ws))
+            ps = ws / jnp.sum(ws)
+            should_resample = 1 / jnp.sum(ps ** 2) < 0.8*k
 
             next_xs, next_ys, parents, next_log_ws = jax.lax.cond(
                 should_resample, do_resample, dont_resample, operand=None
@@ -139,7 +139,7 @@ class PFMP(NamedTuple):
         generate_keys = jax.random.split(key, h * k).reshape(h, k)
         resample_keys = jax.random.split(key, h)
 
-        x0s = jax.tree.map(lambda x: jnp.broadcast_to(x, (k,) + jnp.shape(x)), x0)
+        x0s = jax.tree.map(lambda x: jnp.repeat(x[None], k, axis=0), x0)
 
         return jax.lax.scan(
             self.kernel,
