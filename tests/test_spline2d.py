@@ -11,7 +11,7 @@ matplotlib.use('Qt5Agg')
 
 
 class ParState(NamedTuple):
-    ctrl: jax.Array
+    u: jax.Array
 
 class ParParams(NamedTuple):
     # goal: jax.Array
@@ -24,9 +24,9 @@ class ParParams(NamedTuple):
 
 def init():
     x0 = ParState(
-        # ctrl = jnp.array([[0., 0.]]),             # linear
-        # ctrl = jnp.array([[0., 0.], [0., 0.]]),       # cubic
-        ctrl = jnp.array([[0., 0.], [0., 0.], [0., 0]]), # quintic
+        # u = jnp.array([[0., 0.]]),             # linear
+        # u = jnp.array([[0., 0.], [0., 0.]]),       # cubic
+        u = jnp.array([[0., 0.], [0., 0.], [0., 0]]), # quintic
     )
 
     theta = ParParams(
@@ -38,18 +38,22 @@ def init():
     return (x0, theta)
 
 @gen
-def transition_fn(state: ParState, theta: ParParams, t: int) -> ParState:
-    nu = state.ctrl.shape[1]
-    pred_u = mv_normal(state.ctrl[0] + state.ctrl[1], jnp.eye(nu) * theta.u_stdev) @ "u"
-    pred_du = mv_normal(state.ctrl[1], jnp.eye(nu) * theta.du_stdev) @ "du"
+def proposal_fn(state: ParState, theta: ParParams, t: int) -> ParState:
+    nu = state.u.shape[1]
+    pred_u = mv_normal(state.u[0] + state.u[1], jnp.eye(nu) * theta.u_stdev) @ "u"
+    pred_du = mv_normal(state.u[1], jnp.eye(nu) * theta.du_stdev) @ "du"
     pred_ddu = mv_normal(jnp.zeros(nu), jnp.eye(nu) * theta.ddu_stdev) @ "ddu"
     # pred_du = mv_normal(jnp.zeros(nu), jnp.eye(nu) * theta.du_stdev) @ "du"
     # pred_ddu = mv_normal(jnp.zeros(nu), jnp.eye(nu) * theta.ddu_stdev) @ "ddu"
-    return state._replace(
-        # ctrl = jnp.array([pred_u]),                   # linear
-        # ctrl = jnp.array([pred_u, pred_du]),          # cubic
-        ctrl = jnp.array([pred_u, pred_du, pred_ddu]),  # quintic
-    )
+    return jnp.array([pred_u, pred_du, pred_ddu])
+    # return state._replace(
+    #     # u = jnp.array([pred_u]),                  # linear
+    #     # u = jnp.array([pred_u, pred_du]),         # cubic
+    #     u = jnp.array([pred_u, pred_du, pred_ddu])  # quintic
+    # )
+
+def dynamics_fn(x, u, theta, t):
+    return x._replace(u=u)
 
 @jax.jit
 def cost_fn(state: ParState, theta: ParParams, t: float) -> float:
@@ -62,9 +66,9 @@ def cost_fn(state: ParState, theta: ParParams, t: float) -> float:
     tangent = jnp.array([-jnp.sin(angle), jnp.cos(angle)])    # CCW tangent
 
     # Extract control components
-    u_actual = state.ctrl[0]      # position or control signal
-    velocity = state.ctrl[1]      # assumed shape (2,)
-    acceleration = state.ctrl[2]  # assumed shape (2,)
+    u_actual = state.u[0]      # position or control signal
+    velocity = state.u[1]      # assumed shape (2,)
+    acceleration = state.u[2]  # assumed shape (2,)
 
     # 1. Position cost: minimize distance from point on circle
     u_target = r * radial
@@ -90,7 +94,7 @@ def cost_fn(state: ParState, theta: ParParams, t: float) -> float:
 #     r = 1.0  # radius of the target circle
 
 #     u_target = jnp.array([r * jnp.cos(angle), r * jnp.sin(angle)])
-#     u_actual = state.ctrl[0]  # shape (2,) for 2D control
+#     u_actual = state.u[0]  # shape (2,) for 2D control
 
 #     return jnp.sum((u_actual - u_target) ** 2)
 
@@ -99,22 +103,17 @@ def cost_fn(state: ParState, theta: ParParams, t: float) -> float:
 K, H, L = 100000, 8, 100
 
 def test_navigate():
-    model_t = make_transition_model(transition_fn, cost_fn, l = L)
+    N = 10
+    model_t = make_transition_model(proposal_fn, cost_fn, dynamics_fn, l = L)
     pfmp = PFMP(model_t)
     (x0, theta) = init()
 
     key = jax.random.key(42)
-    j_run_sir = jax.jit(pfmp.run_sir, static_argnames=['h', 'k', 'rho'])
-    (states, ancestors) = j_run_sir(key, x0, theta, H, K, 0.8)
-
-    n_display = 10
-    trajs = pfmp.choose_paths(states, ancestors, jnp.arange(n_display)).ctrl
-
-    D, N = trajs.shape[3:]  # (10, 4, 100, 3, 2)
-
+    (states, ancestors) = pfmp.run_sir(key, x0, theta, h=H, k=K, rho=0.8)
+    trajs = pfmp.choose_paths(states, ancestors, jnp.arange(N)).u
     fig, ax = plt.subplots(figsize=(8, 8))
 
-    for k in range(n_display):
+    for k in range(N):
         u1_full = []
         u2_full = []
         knot_points = []
@@ -141,6 +140,7 @@ def test_navigate():
         # Plot knot points
         knot_points = jnp.array(knot_points)
         ax.scatter(knot_points[:, 0], knot_points[:, 1], color='magenta', s=50, zorder=10)
+
 
     ax.set_title("Hermite-Interpolated Control (u₁ vs u₂)")
     ax.set_xlabel("u₁")

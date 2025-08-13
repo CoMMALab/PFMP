@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 import genjax
 
+from functools import partial
 from genjax import gen, ChoiceMapBuilder as C
 from jaxtyping import PyTree, PRNGKeyArray
 from typing import NamedTuple, Callable
@@ -40,45 +41,49 @@ def make_zoh_model(mpc_transition, mpc_cost):
 
     return transition_model
 
-def make_transition_model(mpc_transition, mpc_cost, l: int):
+def make_transition_model(
+        mpc_proposal,
+        mpc_cost,
+        mpc_dynamics = lambda x, u, _th, _t: x._replace(u=u),
+        l: int = 128,
+        interp_retv: bool = True
+    ):
+
+    dt = 1 / l
 
     @gen
     def spline_transition_model(x: PyTree, theta: PyTree, t: int) -> PyTree:
-        # Sample next-step u proposal
-        ctrl_proposed = (mpc_transition(x, theta, t) @ "MPC transition").ctrl
+        # Propose next-step Hermite spline control points from a prior
+        u = mpc_proposal(x, theta, t) @ 'q'
 
-        # Interpolate u over spline
+        # Interpolate u over the spline
         t0, t1 = t.astype(float), (t + 1).astype(float)
-        u_spline = jnp.permute_dims(
+        spline = jnp.permute_dims(
             hermite_spline(
-                jnp.reshape(x.ctrl, (x.ctrl.shape[0], -1)),
-                jnp.reshape(ctrl_proposed, (ctrl_proposed.shape[0], -1)),
+                jnp.reshape(x.u, (x.u.shape[0], -1)),
+                jnp.reshape(u, (u.shape[0], -1)),
                 t0, t1, l + 1
             ),
             (1, 0, 2)
-        )
+        ).squeeze()
 
-        dt = 1 / l
-
-        def interpolate_ctrl(carry: tuple[jax.Array, float], ui: tuple[jax.Array, float]) -> tuple[tuple[jax.Array, float], None]:
-            xi, cost, t = carry
-            x = jnp.squeeze(ui[0])
-            v = jnp.squeeze(ui[1])
-            a = jnp.squeeze(ui[2])
-            cmap = C.n().at["u"].set(x) \
-                        .at["du"].set(v) \
-                        .at["ddu"].set(a)
-            xi_next = mpc_transition.generate(jax.random.key(0), cmap, (xi, theta, t))[0].retval
+        def dynamics_fn(
+            carry: tuple[jax.Array, float, float],
+            ui: tuple[jax.Array, float]
+        ) -> tuple[tuple[jax.Array, float, float], None]:
+            xi, c, t = carry
+            xi_next = mpc_dynamics(xi, ui, theta, t)
             ci = mpc_cost(xi_next, theta, t)
-            return (xi_next, cost + ci, t + dt), xi_next
+            print(xi_next.u.shape)
+            return (xi_next, c + ci, t + dt), xi_next
 
-        (_, total_cost, _), interpolated = jax.lax.scan(interpolate_ctrl, (x, 0.0, t0), u_spline[1:])
+        (_, total_cost, _), interp_xs = jax.lax.scan(dynamics_fn, (x, 0.0, t0), spline[1:])
 
-        # Probability of optimality is proportional
-        # to exponential negative cost
+        # U[t] = u is optimal with probability equal
+        # to exponential negative total cost
         genjax.bernoulli(probs=jnp.exp(-total_cost)) @ 'O'
 
-        return interpolated
+        return jax.tree.map(lambda x: x[-1], interp_xs), interp_xs
 
     return spline_transition_model
 
@@ -103,7 +108,6 @@ class PFMP(NamedTuple):
         (MJX) cost_fn : (mjx.Data, PyTree, t) -> float. Cost function for Mujoco XLA Data.
         carry_mjx: bool. Indicates if the type of the carry in `kernel` is `mjx.Data` or `Particle`.
     """
-
     transition_model: Callable[[PyTree,PyTree,int,int],PyTree]
     cond_O1 = C.n().at['O'].set(True)  # Optimality Condition
 
@@ -112,7 +116,7 @@ class PFMP(NamedTuple):
         (x, score) = carry
         (key, t) = inp
         trace, dscore = self.transition_model.generate(key, self.cond_O1, (x, theta, t))
-        return (jax.tree.map(lambda x: x[-1], trace.retval), score + dscore), trace.retval
+        return (trace.retval[0], score + dscore), trace.retval[1]
 
     @jax.jit
     def unfold_cond_O1(self, keys, x0, theta):
@@ -124,10 +128,11 @@ class PFMP(NamedTuple):
         )
         return trace_retvals, carry_out[1]
 
+    @partial(jax.jit, static_argnames=['h', 'k'])
     def run_sis(
         self,
         key,
-        x0: PyTree,
+        x0: PyTree,     # state
         theta: PyTree,
         h: int,
         k: int
@@ -149,15 +154,14 @@ class PFMP(NamedTuple):
         (generate_keys, resample_key, t) = inp
         k = log_ws.shape[0]
 
-        (new_xs, new_log_ws), new_interp = jax.vmap(
+        (new_xs, new_log_ws), new_interp_xs = jax.vmap(
             lambda xs, log_ws, key: self.generate_cond_O1(theta, (xs, log_ws), (key, t))
         )(xs, log_ws, generate_keys)
 
         ws = jnp.exp(new_log_ws - jnp.max(new_log_ws))
         ps = ws / jnp.sum(ws)
-        # ess = 1 / jnp.sum(ps ** 2)
-        # should_resample = ess / k < rho
-        should_resample = 1 / jnp.sum(ps ** 2) < k * rho
+        ess = 1 / jnp.sum(ps ** 2)
+        should_resample = ess / k < rho
 
         def do_resample(_):
             parents = jax.random.choice(resample_key, k, shape=(k,), p=ps, replace=True)
@@ -171,10 +175,11 @@ class PFMP(NamedTuple):
         )
 
         resampled_xs = jax.tree.map(lambda x: x[parents], new_xs)
-        resampled_interp = jax.tree.map(lambda x: x[parents], new_interp)
+        resampled_interp_xs = jax.tree.map(lambda x: x[parents], new_interp_xs)
 
-        return (resampled_log_ws, resampled_xs, theta), (resampled_interp, parents)
+        return (resampled_log_ws, resampled_xs, theta), (resampled_interp_xs, parents)
 
+    @partial(jax.jit, static_argnames=['h', 'k', 'rho'])
     def run_sir(
         self,
         key: PRNGKeyArray,
@@ -238,10 +243,10 @@ class PFMP(NamedTuple):
     def choose_paths(
         states: PyTree[jax.Array],  # (H,K,...)
         ancestors: jax.Array,       # (H,K)
-        indices: jax.Array          # (L,) where K >= L
-    ) -> PyTree[jax.Array]:         # (L,H,...)
+        indices: jax.Array          # (N,) where K >= N
+    ) -> PyTree[jax.Array]:         # (N,H,...)
         """
-        Trace back the trajectories for L particles among K, for finite horizon H.
+        Trace back the trajectories for N particles among K, for finite horizon H.
 
         Args:
             states: PyTree with leaves of shape (H, K, ...) representing the full simulation state at each time step.
@@ -249,6 +254,6 @@ class PFMP(NamedTuple):
             indices: jax.Array, array of indices for the final L particles at time H.
 
         Returns:
-            NamedTuple: containing fields with shape (L, H, ...), representing L reconstructed trajectories.
+            NamedTuple: containing fields with shape (L, H, ...), representing N reconstructed trajectories.
         """
         return jax.vmap(PFMP.choose_path, in_axes=(None, None, 0))(states, ancestors, indices)

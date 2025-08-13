@@ -11,7 +11,7 @@ matplotlib.use('Qt5Agg')
 
 
 class ParState(NamedTuple):
-    ctrl: jax.Array
+    u: jax.Array
 
 class ParParams(NamedTuple):
     u_stdev: float
@@ -23,21 +23,19 @@ def transition_fn(state: ParState, theta: ParParams, t: int) -> ParState:
     pred_u = normal(0., theta.u_stdev) @ "u"
     pred_du = normal(0., theta.du_stdev) @ "du"
     pred_ddu = normal(0., theta.ddu_stdev) @ "ddu"
-    return state._replace(
-        # ctrl = jnp.array([pred_u]),                   # linear
-        # ctrl = jnp.array([pred_u, pred_du]),          # cubic
-        ctrl = jnp.array([pred_u, pred_du, pred_ddu]),  # quintic
-    )
+    # return jnp.array([pred_u])                   # linear
+    # return jnp.array([pred_u, pred_du])          # cubic
+    return jnp.array([pred_u, pred_du, pred_ddu])  # quintic
 
 @jax.jit
 def cost_fn(state: ParState, theta: ParParams, t: float) -> float:
-    return (jnp.sin(2*jnp.pi*t/H) - state.ctrl[0]) ** 2
+    return (jnp.sin(2*jnp.pi*t/H) - state.u[0]) ** 2
 
 def init():
     x0 = ParState(
-        # ctrl = jnp.array([0.]),             # linear
-        # ctrl = jnp.array([0., 0.]),       # cubic
-        ctrl = jnp.array([0., 0., 0.]), # quintic
+        # u = jnp.array([0.]),             # linear
+        # u = jnp.array([0., 0.]),       # cubic
+        u = jnp.array([0., 0., 0.]), # quintic
     )
 
     theta = ParParams(
@@ -76,8 +74,8 @@ def test_sis():
     sampled_idxs = jax.random.choice(key, p.shape[0], shape=(10,), p=p)
 
     # Use those indices to grab trajectories
-    first_10 = trajs.ctrl[:10,:,:,0]  # shape (10, 4, 200)
-    # first_10 = trajs.ctrl[sampled_idxs, :, :, 0]  # shape (10, 4, 200)
+    first_10 = trajs.u[:10,:,:,0]  # shape (10, 4, 200)
+    # first_10 = trajs.u[sampled_idxs, :, :, 0]  # shape (10, 4, 200)
 
     fig, ax = plt.subplots(figsize=(14, 6))
 
@@ -138,8 +136,8 @@ def test_sir():
         else:
             print(f"sample_forward (after jit): {t1 - t0}")
 
-    # first_10 = trajs.ctrl[:10,:,:,0]  # shape (10, 4, 200)
-    first_10 = pfmp.choose_paths(states, ancestors, jnp.arange(10)).ctrl[:,:,:,0]
+    # first_10 = trajs.u[:10,:,:,0]  # shape (10, 4, 200)
+    first_10 = pfmp.choose_paths(states, ancestors, jnp.arange(10)).u[:,:,:,0]
 
     fig, ax = plt.subplots(figsize=(14, 6))
 
