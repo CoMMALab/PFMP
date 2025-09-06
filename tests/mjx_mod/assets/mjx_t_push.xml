@@ -1,0 +1,26 @@
+<mujoco model="panda_t_push">
+  <include file="mjx_scene.xml"/>
+
+  <worldbody>
+  <body name="t_block" pos="0.6 0 0.045">
+      <freejoint/>
+      <!-- T stem -->
+      <geom type="box" name="t_stem" size="0.0225 0.0675 0.0225"
+          rgba="1 0.5 0 1" condim="3"
+          friction="1 .03 .003" contype="2" conaffinity="1" solref="0.01 1"/>
+      <!-- T bar -->
+      <geom type="box" name="t_bar" size="0.0675 0.0225 0.0225" pos="0 0.0675 0"
+          rgba="1 0.5 0 1" condim="3"
+          friction="1 .03 .003" contype="2" conaffinity="1" solref="0.01 1"/>
+      <site name="t_com" pos="0 0 0" size="0.004" rgba="0.1 0.9 0.1 0.6"/>
+  </body>
+  </worldbody>
+
+  <keyframe>
+    <key name="home"
+        qpos="0 -0.785398 0 -2.356194 0 1.570796 0.785398
+              0.04 0.04
+              0.60 0.00 0.03  1 0 0 0"/>
+  </keyframe>
+
+</mujoco>
