@@ -29,7 +29,7 @@ def get_field_info(x):
     raise TypeError(f"Unsupported state type: {type(x)}")
 
 
-class PFMP(NamedTuple):
+class _PFMP_V1(NamedTuple):
     """
     Particle Flow Motion Planning (PFMP): a modular GPU-accelerated JIT-compiled planning-as-
     inference kernel that generalizes MPPI, compatible with both MJX and tuple/dataclass types.

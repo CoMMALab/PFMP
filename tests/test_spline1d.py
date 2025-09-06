@@ -10,8 +10,7 @@ import time
 matplotlib.use('Qt5Agg')
 
 
-class ParState(NamedTuple):
-    u: jax.Array
+# GOAL: make this file work
 
 class ParParams(NamedTuple):
     u_stdev: float
@@ -19,7 +18,7 @@ class ParParams(NamedTuple):
     ddu_stdev: float
 
 @gen
-def transition_fn(state: ParState, theta: ParParams, t: int) -> ParState:
+def transition_fn(x: jax.Array, u: jax.Array, theta: ParParams, t: int) -> jax.Array:
     pred_u = normal(0., theta.u_stdev) @ "u"
     pred_du = normal(0., theta.du_stdev) @ "du"
     pred_ddu = normal(0., theta.ddu_stdev) @ "ddu"
@@ -28,15 +27,14 @@ def transition_fn(state: ParState, theta: ParParams, t: int) -> ParState:
     return jnp.array([pred_u, pred_du, pred_ddu])  # quintic
 
 @jax.jit
-def cost_fn(state: ParState, theta: ParParams, t: float) -> float:
-    return (jnp.sin(2*jnp.pi*t/H) - state.u[0]) ** 2
+def cost_fn(x: jax.Array, u: jax.Array, theta: ParParams, t: float) -> float:
+    return (jnp.sin(2*jnp.pi*t/H) - x[0]) ** 2
 
 def init():
-    x0 = ParState(
-        # u = jnp.array([0.]),             # linear
-        # u = jnp.array([0., 0.]),       # cubic
-        u = jnp.array([0., 0., 0.]), # quintic
-    )
+    # x0 = jnp.array([0.])          # linear
+    # x0 = jnp.array([0., 0.])      # cubic
+    x0 = jnp.array([0., 0., 0.])  # quintic
+    u0 = x0
 
     theta = ParParams(
         u_stdev = 0.5,
@@ -44,20 +42,20 @@ def init():
         ddu_stdev = 0.5
     )
 
-    return (x0, theta)
+    return (x0, u0, theta)
 
 K, H, L = 1000, 4, 100
 
 def test_sis():
     model_t = make_transition_model(transition_fn, cost_fn, l = L)
     pfmp = PFMP(model_t)
-    (x0, theta) = init()
+    (x0, u0, theta) = init()
 
     key = jax.random.key(42)
     j_run_sis = jax.jit(pfmp.run_sis, static_argnames=['h', 'k'])
     for i in range(5):
         t0 = time.time()
-        (trajs, scores) = jax.block_until_ready(j_run_sis(key, x0, theta, H, K))
+        (trajs, scores) = jax.block_until_ready(j_run_sis(key, x0, u0, theta, H, K))
         t1 = time.time()
         if i == 0:
             print(f"sample_forward (first run): {t1 - t0}")
@@ -123,13 +121,13 @@ def test_sis():
 def test_sir():
     model_t = make_transition_model(transition_fn, cost_fn, l = L)
     pfmp = PFMP(model_t)
-    (x0, theta) = init()
+    (x0, u0, theta) = init()
 
     key = jax.random.key(42)
     j_run_sir = jax.jit(pfmp.run_sir, static_argnames=['h', 'k', 'rho'])
     for i in range(5):
         t0 = time.time()
-        (states, ancestors) = jax.block_until_ready(j_run_sir(key, x0, theta, H, K, 0.8))
+        (states, ancestors) = jax.block_until_ready(j_run_sir(key, x0, u0, theta, H, K, 0.8))
         t1 = time.time()
         if i == 0:
             print(f"sample_forward (first run): {t1 - t0}")
