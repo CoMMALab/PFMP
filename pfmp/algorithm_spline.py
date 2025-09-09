@@ -9,7 +9,7 @@ from jaxtyping import PyTree, PRNGKeyArray
 from typing import NamedTuple, Callable
 from dataclasses import is_dataclass, fields
 from .interpolate import hermite_spline
-from .interpolateh import hermite_interp1d
+# from .interpolateh import hermite_interp1d
 
 
 # def get_field_info(x):
@@ -277,3 +277,41 @@ class PFMP(NamedTuple):
             NamedTuple: containing fields with shape (L, H, ...), representing N reconstructed trajectories.
         """
         return jax.vmap(PFMP.choose_path, in_axes=(None, None, 0))(states, ancestors, indices)
+
+
+    def __call__(
+        self,
+        key: PRNGKeyArray,
+        x0: PyTree,
+        u0: jax.Array,
+        theta: PyTree,
+        h: int,
+        k: int,
+        rho: float,
+        n_samples: int,
+        index: int = 0,
+        return_best = False
+    ) -> PyTree[jax.Array]:
+        """
+        Run the model to return trajectories
+
+        Args:
+            All args needed to run the model
+        
+        Returns:
+            NamedTuple: containing fields with shape (L, H, ...), representing N reconstructed trajectories.
+       
+        """
+
+        (states, ancestors) = self.run_sir(
+            key=key, 
+            x0=x0, 
+            u0=u0,
+            theta=theta, 
+            h=H, 
+            k=K, 
+            rho=rho
+        )
+        if return_best:
+            return self.choose_path(states, ancestors, index)
+        return self.choose_paths(states, ancestors, jnp.arange(n_samples))
