@@ -64,7 +64,7 @@ class StateTracker(NamedTuple):
     txyz: jax.Array
 
 def load_mj(name: str):
-    os.chdir("tests/mjx_mod/assets")
+    os.chdir("assets")
     with open(f"{name}.xml", 'r') as f:
         xml = f.read()
 

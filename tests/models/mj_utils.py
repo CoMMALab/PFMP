@@ -5,7 +5,7 @@ from typing import Tuple
 
 def load_mj(name: str) -> Tuple[mujoco.MjModel, mujoco.MjData]:
     cwd = os.getcwd()
-    os.chdir("tests/mjx_mod/assets")
+    os.chdir("assets")
     with open(f"{name}.xml", 'r') as f:
         xml = f.read()
     

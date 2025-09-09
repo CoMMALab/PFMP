@@ -20,7 +20,7 @@ from pfmp.interpolate import hermite_spline
 from runner.arg_utils import build_parser_and_parse_args
 from runner.file_utils import _to_jsonable, _atomic_write_json, save_trajs_npz_named
 
-from tests.mjx_mod.models.problem import ProblemDesc
+from tests.models.problem import ProblemDesc
 
 N_SAMPLES: int = 10
 
@@ -142,28 +142,29 @@ class ExperimentRunner:
         t1 = time.time()
 
 
-        # run and profile algorithm
-        # time grid as float
-        t_seq = jnp.arange(self.config.H * self.config.L, dtype=jnp.float32) / jnp.float32(self.config.L)
-        # sum over T for a single trajectory (leaves shaped (T, ...))
-        traj_cost_fn = lambda tau: jnp.sum(
-            jax.vmap(self.problem.cost_fn, in_axes=(0, 0, None, 0))(tau, tau.ctrl, theta, t_seq)
-        )
+        # # run and profile algorithm
+        # # time grid as float
+        # t_seq = jnp.arange(self.config.H * self.config.L, dtype=jnp.float32) / jnp.float32(self.config.L)
+        # # sum over T for a single trajectory (leaves shaped (T, ...))
+        # traj_cost_fn = lambda tau: jnp.sum(
+        #     jax.vmap(self.problem.cost_fn, in_axes=(0, 0, None, 0))(tau, tau.ctrl, theta, t_seq)
+        # )
 
-        # mean over K of per-trajectory totals (leaves shaped (K, T, ...))
-        average_cost_fn = lambda trajs_flat: jnp.mean(
-            jax.vmap(traj_cost_fn, in_axes=0)(trajs_flat)
-        )
+        # # mean over K of per-trajectory totals (leaves shaped (K, T, ...))
+        # average_cost_fn = lambda trajs_flat: jnp.mean(
+        #     jax.vmap(traj_cost_fn, in_axes=0)(trajs_flat)
+        # )
 
-        # (K,H,L,...) -> (K,H*L,...)
-        trajs_flat = jax.tree.map(
-            lambda x: x.reshape((x.shape[0], self.config.H * self.config.L) + x.shape[3:]),
-            trajs,
-        )
+        # # (K,H,L,...) -> (K,H*L,...)
+        # trajs_flat = jax.tree.map(
+        #     lambda x: x.reshape((x.shape[0], self.config.H * self.config.L) + x.shape[3:]),
+        #     trajs,
+        # )
 
         return Metrics(
             runtime = t1 - t0,
-            average_cost = average_cost_fn(trajs_flat),
+            # average_cost = average_cost_fn(trajs_flat),
+            average_cost = 0.,
         ), jax.tree.map(lambda x: x[:N_SAMPLES], trajs),
 
 

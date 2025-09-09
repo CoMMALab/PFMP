@@ -77,8 +77,7 @@ class TPusher(ProblemDesc):
         self.name = "panda_t_push"
         self.xml_filename = "mjx_t_push"
 
-
-        ROBOT_URDF_PATH = "tests/mjx_mod/assets/panda_assets/panda/panda_spherized.urdf"
+        ROBOT_URDF_PATH = f"assets/panda_assets/panda/panda_spherized.urdf"
 
         # Load URDF
         urdf = yourdfpy.URDF.load(ROBOT_URDF_PATH)

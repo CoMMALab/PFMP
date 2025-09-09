@@ -312,8 +312,6 @@ class PFMP(NamedTuple):
             k=K, 
             rho=rho
         )
-        print(states, ancestors)
-        done
         if return_best:
             return self.choose_path(states, ancestors, index)
         return self.choose_paths(states, ancestors, jnp.arange(n_samples))

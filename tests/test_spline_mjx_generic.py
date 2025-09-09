@@ -39,7 +39,7 @@ class StateTracker(NamedTuple):
     ctrl: jax.Array
 
 def load_mj(name: str):
-    with open(f"tests/mjx_mod/assets/{name}.xml", 'r') as f:
+    with open(f"assets/{name}.xml", 'r') as f:
         xml = f.read()
 
     mj_model = mujoco.MjModel.from_xml_string(xml)
@@ -525,7 +525,7 @@ def test_mjx():
 
 import os
 def load_mj(name: str):
-    os.chdir("tests/mjx_mod/assets")
+    os.chdir("assets")
     with open(f"{name}.xml", 'r') as f:
         xml = f.read()
 

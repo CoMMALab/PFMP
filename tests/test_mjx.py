@@ -47,7 +47,7 @@ def print_all_site_names(model):
         print(f"Site {i}: '{name}'")
 
 def load_model(name: str):
-    with open(f"tests/mjx_mod/assets/{name}.xml", 'r') as f:
+    with open(f"assets/{name}.xml", 'r') as f:
         xml = f.read()
 
     mj_model = mujoco.MjModel.from_xml_string(xml)

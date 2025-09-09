@@ -4,8 +4,8 @@ from runner.expt_runner import Config, ExperimentRunner
 from runner.file_utils import _to_jsonable
 from typing import NamedTuple
 # from tests.mjx_mod.models.inverted_double_pendulum import linear_proposal_fn, cubic_proposal_fn, quintic_proposal_fn, cost_fn, dynamics_fn
-from tests.mjx_mod.models.inverted_double_pendulum import InvertedDoublePendulum
-from tests.mjx_mod.models.panda_t_pushing import TPusher
+from tests.models.inverted_double_pendulum import InvertedDoublePendulum
+from tests.models.panda_t_pushing import TPusher
 
 def main():
     args = build_parser_and_parse_args()
