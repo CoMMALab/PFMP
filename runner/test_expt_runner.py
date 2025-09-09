@@ -1,9 +1,11 @@
 import os
 from runner.arg_utils import build_parser_and_parse_args
-from runner.expt_runner import Config, Problem, ExperimentRunner
+from runner.expt_runner import Config, ExperimentRunner
 from runner.file_utils import _to_jsonable
 from typing import NamedTuple
-from tests.mjx_mod.models.inverted_double_pendulum import linear_proposal_fn, cubic_proposal_fn, quintic_proposal_fn, cost_fn, dynamics_fn
+# from tests.mjx_mod.models.inverted_double_pendulum import linear_proposal_fn, cubic_proposal_fn, quintic_proposal_fn, cost_fn, dynamics_fn
+from tests.mjx_mod.models.inverted_double_pendulum import InvertedDoublePendulum
+from tests.mjx_mod.models.panda_t_pushing import TPusher
 
 def main():
     args = build_parser_and_parse_args()
@@ -16,18 +18,14 @@ def main():
                 deg = args.deg,
                 rho = args.rho
                 )
+    inv_pend_problem = InvertedDoublePendulum()
+    t_push_problem = TPusher()
 
-    problem = Problem(
-        name = "inverted_double_pendulum",
-        linear_proposal_fn=linear_proposal_fn,
-        cubic_proposal_fn=cubic_proposal_fn,
-        quintic_proposal_fn=quintic_proposal_fn,
-        cost_fn=cost_fn,
-        dynamics_fn=dynamics_fn
-    )
-
+    # expt_runner = ExperimentRunner(
+    #     config=config, problem=inv_pend_problem, results_dir = "experiments/try_class"
+    # )
     expt_runner = ExperimentRunner(
-        config=config, problem=problem, results_dir = "experiments/try"
+        config=config, problem=t_push_problem, results_dir = "experiments/try_class_push"
     )
 
     expt_runner.reset_experiment()

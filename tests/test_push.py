@@ -26,7 +26,7 @@ from pfmp.algorithm_spline import PFMP, make_transition_model
 # Robot setup
 # ===============================
 
-ROBOT_URDF_PATH = "/home/austin/src/panda_scripts/assets/panda_spherized.urdf"
+ROBOT_URDF_PATH = "tests/mjx_mod/assets/panda_assets/panda/panda_spherized.urdf"
 
 # Load URDF
 urdf = yourdfpy.URDF.load(ROBOT_URDF_PATH)

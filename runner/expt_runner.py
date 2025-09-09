@@ -18,12 +18,12 @@ from pfmp.algorithm_spline import make_transition_model, PFMP
 from pfmp.interpolate import hermite_spline
 
 from runner.arg_utils import build_parser_and_parse_args
-from runner.mj_utils import load_mj
 from runner.file_utils import _to_jsonable, _atomic_write_json, save_trajs_npz_named
 
-FINE_ANGLE_BOUNDS: float = 0.1
-FINE_ANGLE_SIGMA: float = 0.01
+from tests.mjx_mod.models.problem import ProblemDesc
+
 N_SAMPLES: int = 10
+
 
 class Config(NamedTuple):
     K: int
@@ -33,14 +33,6 @@ class Config(NamedTuple):
     deg: int
     rho: float        
         
-
-class PParams(NamedTuple):
-    mjx_model: mjx.Model
-    nominal_u: jax.Array
-    sigma: float
-    fine_angle_bounds: float
-    fine_angle_sigma: float
-
 
 class Metrics(NamedTuple):
     runtime: str
@@ -55,17 +47,10 @@ class Results(NamedTuple):
     metrics: Metrics
     sampled_trajs: jax.tree.map
 
-class Problem(NamedTuple):
-    name: str
-    linear_proposal_fn: callable
-    cubic_proposal_fn: callable
-    quintic_proposal_fn: callable
-    cost_fn: callable
-    dynamics_fn: callable
 
 
 class ExperimentRunner:
-    def __init__(self, problem: Problem, config: Config, results_dir):
+    def __init__(self, problem: ProblemDesc, config: Config, results_dir):
 
         self.problem = problem
         self.config = config
@@ -93,17 +78,7 @@ class ExperimentRunner:
 
 
 
-    def init_mjx(self, mj_model, mj_data):
-        self.mjx_model = mjx.put_model(mj_model)
-        self.x0 = mjx.put_data(mj_model, mj_data)
-        self.mj_data = mj_data
-        self.theta = PParams(
-            self.mjx_model,
-            jnp.zeros((self.config.H,1)),
-            sigma=self.config.sigma,
-            fine_angle_bounds=FINE_ANGLE_BOUNDS,
-            fine_angle_sigma=FINE_ANGLE_SIGMA,
-        )
+
 
     def init_mjx_mpc(self):
         """
@@ -142,22 +117,25 @@ class ExperimentRunner:
         self.mpc_model = PFMP(self.init_mjx_mpc())
 
 
-    def run_model_and_benchmark(self):
+    def run_model_and_benchmark(
+            self,
+            x0,
+            u0,
+            theta
+        ):
         """
         This is just a placeholder. Will be replaced later
         """
 
-
-        u0 = jnp.zeros((self.config.deg+1)//2)
-
         t0 = time.time()
+
         trajs = self.mpc_model(
             key = self.key, 
-            x0 = self.x0, 
+            x0 = x0, 
             u0 = u0,
-            theta = self.theta,
-            h=self.config.H, 
-            k=self.config.K, 
+            theta = theta,
+            H=self.config.H, 
+            K=self.config.K, 
             rho=self.config.rho,
             n_samples = N_SAMPLES
         )
@@ -169,7 +147,7 @@ class ExperimentRunner:
         t_seq = jnp.arange(self.config.H * self.config.L, dtype=jnp.float32) / jnp.float32(self.config.L)
         # sum over T for a single trajectory (leaves shaped (T, ...))
         traj_cost_fn = lambda tau: jnp.sum(
-            jax.vmap(self.problem.cost_fn, in_axes=(0, 0, None, 0))(tau, tau.ctrl, self.theta, t_seq)
+            jax.vmap(self.problem.cost_fn, in_axes=(0, 0, None, 0))(tau, tau.ctrl, theta, t_seq)
         )
 
         # mean over K of per-trajectory totals (leaves shaped (K, T, ...))
@@ -191,24 +169,28 @@ class ExperimentRunner:
 
     def visualize(self, traj):
 
-        with launch_passive(self.mj_model, data=self.mj_data, show_left_ui=False, show_right_ui=False) as viewer:
-            for t in range(traj.qpos.shape[0]):
-                for s in range(self.config.L):
-                    self.mj_data.qpos[:] = jax.device_get(traj.qpos[t,s])
-                    self.mj_data.qvel[:] = jax.device_get(traj.qvel[t,s])
-                    mujoco.mj_forward(self.mj_model, self.mj_data)
-                    time.sleep(0.01)
-                    viewer.sync()
+        self.problem.visualize()
+
+        # with launch_passive(self.mj_model, data=self.mj_data, show_left_ui=False, show_right_ui=False) as viewer:
+        #     for t in range(traj.qpos.shape[0]):
+        #         for s in range(self.config.L):
+        #             self.mj_data.qpos[:] = jax.device_get(traj.qpos[t,s])
+        #             self.mj_data.qvel[:] = jax.device_get(traj.qvel[t,s])
+        #             mujoco.mj_forward(self.mj_model, self.mj_data)
+        #             time.sleep(0.01)
+        #             viewer.sync()
 
 
 
     def evaluate(self, visualize: bool = False, save_results: bool = True):
 
-        mj_model, mj_data = load_mj(self.name)
-        self.init_mjx(mj_model, mj_data)
-        self.load_mpc_model()
+        # mj_model, mj_data = load_mj(self.name)
+        # self.problem.init_mjx(mj_model, mj_data)
 
-        metrics, sampled_trajs = self.run_model_and_benchmark()
+        self.load_mpc_model()
+        x0, u0, theta = self.problem.initialize_problem(self.config)
+
+        metrics, sampled_trajs = self.run_model_and_benchmark(x0, u0, theta)
 
         results = Results(
             name = self.name,
@@ -278,5 +260,5 @@ class ExperimentRunner:
                 ]
 
         _atomic_write_json(payload, json_path, indent=2)
-        # print(f"  → saved {json_name} in {payload['meta']['elapsed_sec']:.2f}s")
-        # print(f"    cost = {results.metrics.average_cost}")
+        print(f"  → saved {json_name} in {payload['meta']['elapsed_sec']:.2f}s")
+        print(f"    cost = {results.metrics.average_cost}")
