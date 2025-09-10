@@ -96,18 +96,18 @@ def make_transition_model(
         ) -> tuple[tuple[jax.Array, float, float], None]:
             x_i, c = carry
             u_i, t_i = inps
-            (x_i_next, interp_x_i) = mpc_dynamics(x_i, u_i, theta, t_i)
+            (x_i_next, interp_y_i) = mpc_dynamics(x_i, u_i, theta, t_i)
             c_i = mpc_cost(x_i_next, u_i, theta, t_i)
-            return (x_i_next, c + c_i), interp_x_i
+            return (x_i_next, c + c_i), interp_y_i
 
         # Scan over the spline and numerically integrate cost
-        (x1, cost), interp_xs = jax.lax.scan(interpolate_step, (x0, 0.0), (us[1:], t_grid[1:]))
+        (x1, cost), interp_ys = jax.lax.scan(interpolate_step, (x0, 0.0), (us[1:], t_grid[1:]))
 
         # `u` are optimal with transient probability
         # equal to exponential negative cost
         genjax.bernoulli(probs=jnp.exp(-cost)) @ 'O'
 
-        return (x1, u1), interp_xs
+        return (x1, u1), interp_ys
 
     return mpc_hermite_spline
 
@@ -126,8 +126,8 @@ class PFMP(NamedTuple):
         (key, t) = inp
         (trace, dscore) = self.transition_model.generate(key, self.cond_O1, (x0, u0, theta, t))
         (x1, u1) = trace.retval[0]
-        interp_xs = trace.retval[1]
-        return (x1, u1, score + dscore), interp_xs
+        interp_ys = trace.retval[1]
+        return (x1, u1, score + dscore), interp_ys
 
     @jax.jit
     def unfold_cond_O1(self, keys, x0, u0, theta):
@@ -165,7 +165,7 @@ class PFMP(NamedTuple):
         (generate_keys, resample_key, t) = inp
         k = log_ws.shape[0]
 
-        (sampled_xs, sampled_us, sampled_log_ws), sampled_interp_xs = jax.vmap(
+        (sampled_xs, sampled_us, sampled_log_ws), sampled_interp_ys = jax.vmap(
             lambda xs, us, log_ws, key: self.generate_cond_O1(theta, (xs, us, log_ws), (key, t))
         )(xs, us, log_ws, generate_keys)
         # (sampled_xs, sampled_log_ws), sampled_us = jax.vmap(self.generate_cond_O1, in_axes=[0, (0,)])(xs, us, log_ws, generate_keys)
@@ -188,9 +188,9 @@ class PFMP(NamedTuple):
 
         resampled_xs = jax.tree.map(lambda x: x[parents], sampled_xs)
         resampled_us = jax.tree.map(lambda u: u[parents], sampled_us)
-        resampled_interp_xs = jax.tree.map(lambda x: x[parents], sampled_interp_xs)
+        resampled_interp_ys = jax.tree.map(lambda x: x[parents], sampled_interp_ys)
 
-        return (resampled_log_ws, resampled_xs, resampled_us, theta), (resampled_interp_xs, parents)
+        return (resampled_log_ws, resampled_xs, resampled_us, theta), (resampled_interp_ys, parents)
 
     @partial(jax.jit, static_argnames=['h', 'k', 'rho'])
     def run_sir(
@@ -203,11 +203,12 @@ class PFMP(NamedTuple):
         resample_keys = jax.random.split(key, h)
         x0s = jax.tree.map(lambda x: jnp.repeat(x[None], k, axis=0), x0)
         u0s = jax.tree.map(lambda u: jnp.repeat(u[None], k, axis=0), u0)
-        return jax.lax.scan(
+        (states, ancestors) = jax.lax.scan(
             lambda carry, inp: self.sample_resample_step(carry, inp, rho),
             (jnp.zeros(k), x0s, u0s, theta),
             (generate_keys, resample_keys, jnp.arange(h))
         )[1]
+        return (states, ancestors)
 
     @staticmethod
     @jax.jit
