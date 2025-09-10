@@ -26,7 +26,7 @@ from pfmp.algorithm_spline import PFMP, make_transition_model
 # Robot setup
 # ===============================
 
-ROBOT_URDF_PATH = "tests/mjx_mod/assets/panda_assets/panda/panda_spherized.urdf"
+ROBOT_URDF_PATH = "assets/panda_assets/panda/panda_spherized.urdf"
 
 # Load URDF
 urdf = yourdfpy.URDF.load(ROBOT_URDF_PATH)
@@ -275,7 +275,7 @@ def proposal_fn(x: mjx.Data, u: jax.Array, th: ParParams, t: int) -> jax.Array:
     nu = u.shape[1]  # eg. Cartesian 2D/3D 
     pred_x = mv_normal(x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET+2], jnp.eye(nu) * theta.u_stdev) @ "u"
     pred_v = mv_normal(u[1], jnp.eye(nu) * th.du_stdev) @ "du"
-    return jnp.array([pred_x, pred_v])  # cubic
+    return jnp.array([pred_x])  # cubic
 
 @jax.jit
 def dynamics_fn(x, u, th, t) -> Tuple[jax.Array,jax.Array]:
@@ -313,7 +313,7 @@ def error_fn(th: PParams, t_qpos: jax.Array) -> jax.Array:
     return jnp.array([x_err, y_err, ang_err])
 
 @jax.jit
-def cost_fn(x: mjx.Data, _u, th: PParams, _t) -> float:
+def cost_fn(x: StateTracker, th: PParams, _t) -> float:
     # Free joint layout: [px, py, pz, qw, qx, qy, qz]
     error = error_fn(th, x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET+7])
     return jnp.dot(th.cost_factors, error ** 2)
@@ -332,7 +332,7 @@ if __name__ == "__main__":
 
     u0 = jnp.array([
         [0.4, -0.3],  # ( x0,  y0)
-        [0.0,  0.2]   # (vx0, vy0)
+        # [0.0,  0.2]   # (vx0, vy0)
     ])
     
     # p0 = mj_data.site_xpos[ee_sid].copy()

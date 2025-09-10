@@ -52,8 +52,8 @@ def quintic_proposal_fn(x: mjx.Data, u: jax.Array, theta: PParams, t: int) -> ja
     nu = u.shape[1]  # eg. Cartesian 2D/3D 
     pred_x = mv_normal(x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET+2], jnp.eye(nu) * theta.u_stdev) @ "u"
     pred_v = mv_normal(u[1], jnp.eye(nu) * theta.du_stdev) @ "du"
-    pred_a = mv_normal(u[2], jnp.eye(nu) * theta.ddu_stdev) @ "du"
-    return jnp.array([pred_x, pred_v, pred_a])  # cubic
+    pred_a = mv_normal(u[2], jnp.eye(nu) * theta.ddu_stdev) @ "ddu"
+    return jnp.array([pred_x, pred_v, pred_a])  # quintic
 
 @gen
 def cubic_proposal_fn(x: mjx.Data, u: jax.Array, theta: PParams, t: int) -> jax.Array:
@@ -66,7 +66,7 @@ def cubic_proposal_fn(x: mjx.Data, u: jax.Array, theta: PParams, t: int) -> jax.
 def linear_proposal_fn(x: mjx.Data, u: jax.Array, theta: PParams, t: int) -> jax.Array:
     nu = u.shape[1]  # eg. Cartesian 2D/3D 
     pred_x = mv_normal(x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET+2], jnp.eye(nu) * theta.u_stdev) @ "u"
-    return jnp.array([pred_x])  # cubic
+    return jnp.array([pred_x])  # linear
 
 
 
@@ -136,8 +136,17 @@ class TPusher(ProblemDesc):
 
         u0 = jnp.array([
             [0.4, -0.3],  # ( x0,  y0)
-            [0.0,  0.2]   # (vx0, vy0)
+            [0.0,  0.2],  # (vx0, vy0)
+            [0.0,  0.0]   # (ax0, ay0)
         ])
+        if config.deg == 1:
+            u0 = u0[:1]
+        elif config.deg == 3:
+            u0 = u0[:2]
+        elif config.deg == 5:
+            pass
+        else:
+            raise ValueError(f"Polynomial order not supported: {config.deg}")
         
         txyz = jnp.array([u0[0,0], u0[0,1], self.HEIGHT])
         tR = jnp.array([

@@ -162,7 +162,7 @@ class ExperimentRunner:
             runtime = t1 - t0,
             # average_cost = average_cost_fn(trajs_flat),
             average_cost = 0.,
-        ), jax.tree.map(lambda x: x, trajs), jax.tree.map(lambda x: x, costs)
+        ), trajs, costs
 
 
     def visualize(self, traj):
@@ -189,6 +189,7 @@ class ExperimentRunner:
         x0, u0, theta = self.problem.initialize_problem(self.config)
 
         metrics, trajs, traj_costs = self.run_model_and_benchmark(x0, u0, theta)
+        # (K, H, L, D)
 
         print(trajs)
 
@@ -213,14 +214,16 @@ class ExperimentRunner:
         # print(type(traj))
 
         total_costs = traj_costs.reshape(traj_costs.shape[0], -1).sum(axis=1)
-        besti = jnp.argmin(total_costs)
+        map_idx = jnp.argmin(total_costs)
+        map_traj = jax.tree.map(lambda x: x[map_idx].reshape(self.config.H*self.config.L,-1), trajs)
+        print(map_traj.qpos.shape)
         # assert total_costs[besti] == jnp.sum(PFMP.project_cost(self.problem.cost_fn, trajs[besti], theta))
         # traj = trajs[jnp.array([besti])]
-        traj = jax.tree.map(lambda x: x[besti], trajs)
+        # traj = jax.tree.map(lambda x: x[map_idx], trajs)
 
 
         if visualize:
-            self.problem.visualize(theta = theta, config = self.config, traj=traj)
+            self.problem.visualize(theta = theta, config = self.config, traj=map_traj)
 
         # if save_results:
         #     self.save_results(results)

@@ -358,4 +358,4 @@ class PFMP(NamedTuple):
         )
         if return_best:
             return self.choose_path(states, ancestors, index)
-        return self.choose_paths(states, ancestors, jnp.arange(n_samples))
+        return self.choose_paths(states, ancestors, jnp.arange(K))

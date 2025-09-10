@@ -114,7 +114,7 @@ def newtonian_dynamics_fn(x: DState, u: jax.Array, th: DParams, t: float) -> Tup
     return x_next, obs
 
 @jax.jit
-def error_fn(x: DState, u: jax.Array, th: DParams, t: float) -> float:
+def error_fn(x: DState, th: DParams, t: float) -> float:
     p = x.qpos[:2] - th.target
     perr = jnp.dot(p,p) + x.qpos[2]**2
 
