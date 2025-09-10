@@ -9,29 +9,7 @@ from jaxtyping import PyTree, PRNGKeyArray
 from typing import NamedTuple, Callable
 from dataclasses import is_dataclass, fields
 from .interpolate import hermite_spline
-# from .interpolateh import hermite_interp1d
-
-
-# def get_field_info(x):
-#     """
-#     Given a states‐object x, return
-#       • field_names: tuple of keys (str names or integer positions)
-#       • accessor:  fn(obj, key) -> getattr or obj[key]
-#     """
-#     # dataclass?
-#     if is_dataclass(x):
-#         names = tuple(f.name for f in fields(x))
-#         return names, lambda obj, n: getattr(obj, n)
-#     # namedtuple?
-#     if hasattr(x, "_fields") and isinstance(x._fields, tuple):
-#         names = x._fields
-#         return names, lambda obj, n: getattr(obj, n)
-#     # plain tuple?
-#     if isinstance(x, tuple):
-#         names = tuple(range(len(x)))
-#         return names, lambda obj, i: obj[i]
-#     raise TypeError(f"Unsupported state type: {type(x)}")
-
+from .interpolateh import hermite_interp1d
 
 def get_field_info(x):
     """
@@ -72,21 +50,10 @@ def get_field_info(x):
     raise TypeError(f"Unsupported state type: {type(x)}")
 
 
-
-def make_zoh_model(mpc_transition, mpc_cost):
-
-    @gen
-    def transition_model(x: PyTree, theta: PyTree, t: int) -> PyTree:
-        new_x = mpc_transition(x, theta, t) @ "MPC transition"
-        genjax.bernoulli(-mpc_cost(new_x, theta, t + 1)) @ "O"
-        return new_x
-
-    return transition_model
-
 def make_transition_model(
-        mpc_proposal,
-        mpc_cost,
-        mpc_dynamics = lambda x, u, _th, _t: (x, u),
+        mpc_proposal: Callable,
+        mpc_cost: Callable,
+        mpc_dynamics: Callable,
         l: int = 1
     ):
 
@@ -127,20 +94,20 @@ def make_transition_model(
             carry: tuple[jax.Array, float, float],
             inps: tuple[jax.Array, float]
         ) -> tuple[tuple[jax.Array, float, float], None]:
-            xi, c = carry
-            ui, si = inps
-            (xi_next, tracker) = mpc_dynamics(xi, ui, theta, si)
-            ci = mpc_cost(xi_next, ui, theta, si)
-            return (xi_next, c + ci), tracker
+            x_i, c = carry
+            u_i, t_i = inps
+            (x_i_next, interp_x_i) = mpc_dynamics(x_i, u_i, theta, t_i)
+            c_i = mpc_cost(x_i_next, u_i, theta, t_i)
+            return (x_i_next, c + c_i), interp_x_i
 
         # Scan over the spline and numerically integrate cost
-        (x1, cost), trackers = jax.lax.scan(interpolate_step, (x0, 0.0), (us[1:], t_grid[1:]))
+        (x1, cost), interp_xs = jax.lax.scan(interpolate_step, (x0, 0.0), (us[1:], t_grid[1:]))
 
         # `u` are optimal with transient probability
         # equal to exponential negative cost
         genjax.bernoulli(probs=jnp.exp(-cost)) @ 'O'
 
-        return x1, (u1, trackers)
+        return (x1, u1), interp_xs
 
     return mpc_hermite_spline
 
@@ -150,25 +117,27 @@ class PFMP(NamedTuple):
     Particle Filtering for Model Predictive Control (PFMPC)
     """
 
-    transition_model: Callable[[PyTree,PyTree,int,int],PyTree]
+    transition_model: Callable[[PyTree,PyTree,PyTree,int],PyTree]
     cond_O1 = C.n().at['O'].set(True)  # Optimality Condition
 
     @jax.jit
     def generate_cond_O1(self, theta, carry, inp) -> tuple[PyTree, float]:
-        (x, u, score) = carry
+        (x0, u0, score) = carry
         (key, t) = inp
-        trace, dscore = self.transition_model.generate(key, self.cond_O1, (x, u, theta, t))
-        return (trace.retval[0], trace.retval[1][0], score + dscore), trace.retval[1][1]
+        (trace, dscore) = self.transition_model.generate(key, self.cond_O1, (x0, u0, theta, t))
+        (x1, u1) = trace.retval[0]
+        interp_xs = trace.retval[1]
+        return (x1, u1, score + dscore), interp_xs
 
     @jax.jit
     def unfold_cond_O1(self, keys, x0, u0, theta):
         h = jnp.shape(keys)[0]
-        (carry_out, trackers) = jax.lax.scan(
+        (carry_out, trajs) = jax.lax.scan(
             lambda carry, inp: self.generate_cond_O1(theta, carry, inp),
             (x0, u0, 0.0),
             (keys, jnp.arange(h))
         )
-        return trackers, carry_out[2]
+        return trajs, carry_out[2]
 
     @partial(jax.jit, static_argnames=['h', 'k'])
     def run_sis(
@@ -181,27 +150,27 @@ class PFMP(NamedTuple):
         k: int
     ) -> tuple[jax.Array, jax.Array]:
         generate_keys = jax.random.split(key, h * k).reshape(k, h)
-        k_trackers, k_scores = jax.vmap(
+        k_trajs, k_scores = jax.vmap(
             lambda key: self.unfold_cond_O1(key, x0, u0, theta)
         )(generate_keys)
-        return k_trackers, k_scores
+        return k_trajs, k_scores
 
     def sample_resample_step(
         self,
-        carry: tuple[jax.Array, PyTree[jax.Array], PyTree],
-        inp: tuple[PRNGKeyArray, PRNGKeyArray, int, float],
+        carry: tuple[jax.Array, PyTree[jax.Array], PyTree[jax.Array], PyTree],
+        inp: tuple[PRNGKeyArray, PRNGKeyArray, float],
         rho: float
     ) -> tuple[jax.Array, PyTree[jax.Array], PyTree]:
         (log_ws, xs, us, theta) = carry
         (generate_keys, resample_key, t) = inp
         k = log_ws.shape[0]
 
-        (new_xs, new_us, new_log_ws), new_trackers = jax.vmap(
+        (sampled_xs, sampled_us, sampled_log_ws), sampled_interp_xs = jax.vmap(
             lambda xs, us, log_ws, key: self.generate_cond_O1(theta, (xs, us, log_ws), (key, t))
         )(xs, us, log_ws, generate_keys)
-        # (new_xs, new_log_ws), new_us = jax.vmap(self.generate_cond_O1, in_axes=[0, (0,)])(xs, us, log_ws, generate_keys)
+        # (sampled_xs, sampled_log_ws), sampled_us = jax.vmap(self.generate_cond_O1, in_axes=[0, (0,)])(xs, us, log_ws, generate_keys)
 
-        ws = jnp.exp(new_log_ws - jnp.max(new_log_ws))
+        ws = jnp.exp(sampled_log_ws - jnp.max(sampled_log_ws))
         ps = ws / jnp.sum(ws)
         ess = 1 / jnp.sum(ps ** 2)
         should_resample = ess < rho * k
@@ -211,17 +180,17 @@ class PFMP(NamedTuple):
             return parents, jnp.zeros(k)
 
         def dont_resample(_):
-            return jnp.arange(k), new_log_ws
+            return jnp.arange(k), sampled_log_ws
 
         parents, resampled_log_ws = jax.lax.cond(
             should_resample, do_resample, dont_resample, operand=None
         )
 
-        resampled_xs = jax.tree.map(lambda x: x[parents], new_xs)
-        resampled_us = jax.tree.map(lambda u: u[parents], new_us)
-        resampled_trackers = jax.tree.map(lambda x: x[parents], new_trackers)
+        resampled_xs = jax.tree.map(lambda x: x[parents], sampled_xs)
+        resampled_us = jax.tree.map(lambda u: u[parents], sampled_us)
+        resampled_interp_xs = jax.tree.map(lambda x: x[parents], sampled_interp_xs)
 
-        return (resampled_log_ws, resampled_xs, resampled_us, theta), (resampled_trackers, parents)
+        return (resampled_log_ws, resampled_xs, resampled_us, theta), (resampled_interp_xs, parents)
 
     @partial(jax.jit, static_argnames=['h', 'k', 'rho'])
     def run_sir(
@@ -263,13 +232,13 @@ class PFMP(NamedTuple):
     def choose_paths(
         states: PyTree[jax.Array],  # (H,K,...)
         ancestors: jax.Array,       # (H,K)
-        indices: jax.Array          # (N,) where K >= N
+        indices: jax.Array          # (N,) where N <= K
     ) -> PyTree[jax.Array]:         # (N,H,...)
         """
         Trace back the trajectories for N particles among K, for finite horizon H.
 
         Args:
-            states: PyTree with leaves of shape (H, K, ...) representing the full simulation state at each time step.
+            states: PyTree with leaves of shape (H, K, ...) representing the tracked simulation state at each time step.
             ancestors: (H, K) int32 array specifying indices for `states` that were resampled.
             indices: jax.Array, array of indices for the final L particles at time H.
 
@@ -277,41 +246,3 @@ class PFMP(NamedTuple):
             NamedTuple: containing fields with shape (L, H, ...), representing N reconstructed trajectories.
         """
         return jax.vmap(PFMP.choose_path, in_axes=(None, None, 0))(states, ancestors, indices)
-
-
-    def __call__(
-        self,
-        key: PRNGKeyArray,
-        x0: PyTree,
-        u0: jax.Array,
-        theta: PyTree,
-        H: int,
-        K: int,
-        rho: float,
-        n_samples: int,
-        index: int = 0,
-        return_best = False
-    ) -> PyTree[jax.Array]:
-        """
-        Run the model to return trajectories
-
-        Args:
-            All args needed to run the model
-        
-        Returns:
-            NamedTuple: containing fields with shape (L, H, ...), representing N reconstructed trajectories.
-       
-        """
-
-        (states, ancestors) = self.run_sir(
-            key=key, 
-            x0=x0, 
-            u0=u0,
-            theta=theta, 
-            h=H, 
-            k=K, 
-            rho=rho
-        )
-        if return_best:
-            return self.choose_path(states, ancestors, index)
-        return self.choose_paths(states, ancestors, jnp.arange(n_samples))
