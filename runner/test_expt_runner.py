@@ -25,11 +25,11 @@ def main():
     #     config=config, problem=inv_pend_problem, results_dir = "experiments/try_class"
     # )
     expt_runner = ExperimentRunner(
-        config=config, problem=problem, results_dir = "experiments/try_class_push"
+        config=config, problem=problem, results_dir = "experiments/push_grid_search"
     )
 
     expt_runner.reset_experiment()
-    expt_runner.evaluate(save_results = True)
+    expt_runner.evaluate(save_results = True, visualize=True)
 
 
 if __name__ == '__main__':

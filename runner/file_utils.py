@@ -59,6 +59,19 @@ def save_trajs_npz_named(trajs: Any, path) -> None:
         arrays[f] = np.asarray(getattr(trajs, f))
     np.savez_compressed(path, **arrays)
 
+def save_traj_costs_npz_named(traj_costs: Any, path) -> None:
+    """
+    If `trajs` is a NamedTuple, save fields by name.
+    """
+    if isinstance(path, str):
+        path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    arrays = {}
+    arrays['traj_costs'] = np.asarray(traj_costs)
+    np.savez_compressed(path, **arrays)
+
+
 def load_trajs_npz_named(path, as_namedtuple: Type | None = None):
     """
     Load .npz to:

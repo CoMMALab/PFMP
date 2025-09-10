@@ -9,7 +9,7 @@ from jaxtyping import PyTree, PRNGKeyArray
 from typing import NamedTuple, Callable
 from dataclasses import is_dataclass, fields
 from .interpolate import hermite_spline
-from .interpolateh import hermite_interp1d
+# from .interpolateh import hermite_interp1d
 
 import jax.numpy as jnp
 from jax.tree_util import tree_leaves, tree_map

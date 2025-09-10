@@ -7,7 +7,8 @@ import jax_dataclasses as jdc
 import yourdfpy
 from mujoco import mjx
 from typing import NamedTuple, Tuple
-
+import numpy as np
+import time
 from genjax import gen, mv_normal
 
 # for urdf
@@ -24,6 +25,7 @@ from functools import partial
 
 # for viz
 from mujoco.viewer import launch_passive
+import mujoco
 
 
 T_QPOS_OFFSET=9
@@ -49,8 +51,9 @@ class StateTracker(NamedTuple):
 def quintic_proposal_fn(x: mjx.Data, u: jax.Array, theta: PParams, t: int) -> jax.Array:
     nu = u.shape[1]  # eg. Cartesian 2D/3D 
     pred_x = mv_normal(x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET+2], jnp.eye(nu) * theta.u_stdev) @ "u"
-    pred_v = mv_normal(u[1], jnp.eye(nu) * th.du_stdev) @ "du"
-    return jnp.array([pred_x, pred_v])  # cubic
+    pred_v = mv_normal(u[1], jnp.eye(nu) * theta.du_stdev) @ "du"
+    pred_a = mv_normal(u[2], jnp.eye(nu) * theta.ddu_stdev) @ "du"
+    return jnp.array([pred_x, pred_v, pred_a])  # cubic
 
 @gen
 def cubic_proposal_fn(x: mjx.Data, u: jax.Array, theta: PParams, t: int) -> jax.Array:
@@ -63,8 +66,7 @@ def cubic_proposal_fn(x: mjx.Data, u: jax.Array, theta: PParams, t: int) -> jax.
 def linear_proposal_fn(x: mjx.Data, u: jax.Array, theta: PParams, t: int) -> jax.Array:
     nu = u.shape[1]  # eg. Cartesian 2D/3D 
     pred_x = mv_normal(x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET+2], jnp.eye(nu) * theta.u_stdev) @ "u"
-    pred_v = mv_normal(u[1], jnp.eye(nu) * theta.du_stdev) @ "du"
-    return jnp.array([pred_x, pred_v])  # cubic
+    return jnp.array([pred_x])  # cubic
 
 
 
@@ -353,7 +355,7 @@ class TPusher(ProblemDesc):
 
         with launch_passive(
                 self.mj_model,
-                data=mj_data,
+                data=self.mj_data,
                 show_left_ui=False,
                 show_right_ui=False,
             ) as viewer:
@@ -362,7 +364,7 @@ class TPusher(ProblemDesc):
                 # mj_data.ctrl[:7] = step_ik_7d_from_mat4(mj_data.qpos[:7], mat4_from_pose(txyz, R_des))[0]
                 txyz = traj.txyz[t]
                 self.mj_data.qpos = traj.qpos[t]
-                mujoco.mj_step(mj_model, self.mj_data)
+                mujoco.mj_step(self.mj_model, self.mj_data)
 
                 print(f"errors = {self.error_fn(theta, self.mj_data.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET+7])}")
 

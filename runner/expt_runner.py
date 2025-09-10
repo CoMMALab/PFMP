@@ -18,7 +18,7 @@ from pfmp.algorithm_spline import make_transition_model, PFMP
 from pfmp.interpolate import hermite_spline
 
 from runner.arg_utils import build_parser_and_parse_args
-from runner.file_utils import _to_jsonable, _atomic_write_json, save_trajs_npz_named
+from runner.file_utils import _to_jsonable, _atomic_write_json, save_trajs_npz_named, save_traj_costs_npz_named, load_trajs_npz_named
 
 from tests.models.problem import ProblemDesc
 
@@ -46,6 +46,7 @@ class Results(NamedTuple):
     comments: str
     metrics: Metrics
     sampled_trajs: jax.tree.map
+    traj_costs: jnp.array
 
 
 
@@ -135,6 +136,8 @@ class ExperimentRunner:
         )
         t1 = time.time()
 
+        costs = self.mpc_model.project_costs(self.problem.cost_fn, trajs, theta)
+
 
         # # run and profile algorithm
         # # time grid as float
@@ -159,7 +162,7 @@ class ExperimentRunner:
             runtime = t1 - t0,
             # average_cost = average_cost_fn(trajs_flat),
             average_cost = 0.,
-        ), jax.tree.map(lambda x: x[:N_SAMPLES], trajs),
+        ), jax.tree.map(lambda x: x, trajs), jax.tree.map(lambda x: x, costs)
 
 
     def visualize(self, traj):
@@ -185,21 +188,42 @@ class ExperimentRunner:
         self.mpc_model = PFMP(self.init_mjx_mpc())
         x0, u0, theta = self.problem.initialize_problem(self.config)
 
-        metrics, sampled_trajs = self.run_model_and_benchmark(x0, u0, theta)
+        metrics, trajs, traj_costs = self.run_model_and_benchmark(x0, u0, theta)
 
-        results = Results(
-            name = self.name,
-            comments = self.comments,
-            config = self.config,
-            metrics = metrics,
-            sampled_trajs = sampled_trajs
-        )
+        print(trajs)
+
+        # results = Results(
+        #     name = self.name,
+        #     comments = self.comments,
+        #     config = self.config,
+        #     metrics = metrics,
+        #     sampled_trajs = sampled_trajs,
+        #     traj_costs = traj_costs,
+        # )
+
+        # json_name, json_path = self.get_file_name_from_config()
+        # trajs_fname = "panda_t_push_trajs_n10panda_t_push_k100_d3_h20_l80_s0p0625.npz"
+        # trajs_path  = os.path.join(self.results_dir, trajs_fname)
+
+        # sampled_trajs = load_trajs_npz_named(trajs_path)
+        # trajs = jax.tree.map(lambda x: x.reshape(self.config.K,-1,x.shape[-1]), sampled_trajs)
+
+        # traj = jax.tree.map(lambda x: x[0], trajs)
+        # traj = jax.tree_util.tree_map(jnp.array, traj)
+        # print(type(traj))
+
+        total_costs = traj_costs.reshape(traj_costs.shape[0], -1).sum(axis=1)
+        besti = jnp.argmin(total_costs)
+        # assert total_costs[besti] == jnp.sum(PFMP.project_cost(self.problem.cost_fn, trajs[besti], theta))
+        # traj = trajs[jnp.array([besti])]
+        traj = jax.tree.map(lambda x: x[besti], trajs)
+
 
         if visualize:
-            self.visualize(results.sampled_trajs[0])
+            self.problem.visualize(theta = theta, config = self.config, traj=traj)
 
-        if save_results:
-            self.save_results(results)
+        # if save_results:
+        #     self.save_results(results)
 
     def get_file_name_from_config(self):
         _ffmt = lambda x: f"{float(x):g}".replace(".", "p")
@@ -217,10 +241,14 @@ class ExperimentRunner:
         json_name, json_path = self.get_file_name_from_config()
 
         sample_trajs = results.sampled_trajs
+        traj_costs = results.traj_costs
         n_samples = sample_trajs[0].shape[0]
 
         trajs_fname = f"{self.name}_trajs_n{n_samples}{json_path.stem}.npz"
         trajs_path  = os.path.join(self.results_dir, trajs_fname)
+
+        traj_costs_fname = f"{self.name}_traj_costs_n{n_samples}{json_path.stem}.npz"
+        traj_costs_path  = os.path.join(self.results_dir, traj_costs_fname)
 
         results = results._replace(sampled_trajs = None)
 
@@ -253,7 +281,17 @@ class ExperimentRunner:
                     {"key": k, "shape": list(z[k].shape), "dtype": str(z[k].dtype)}
                     for k in sorted(z.files)
                 ]
+        if traj_costs is not None:
+            save_traj_costs_npz_named(traj_costs, traj_costs_path)
+            payload["meta"]["traj_costs_fname"] = traj_costs_fname
+            # Add a tiny schema preview for convenience (optional)
+            with np.load(traj_costs_path) as z:
+                payload["meta"]["traj_costs_fields"] = [
+                    {"key": k, "shape": list(z[k].shape), "dtype": str(z[k].dtype)}
+                    for k in sorted(z.files)
+                ]
+
 
         _atomic_write_json(payload, json_path, indent=2)
-        print(f"  → saved {json_name} in {payload['meta']['elapsed_sec']:.2f}s")
-        print(f"    cost = {results.metrics.average_cost}")
+        # print(f"  → saved {json_name} in {payload['meta']['elapsed_sec']:.2f}s")
+        # print(f"    cost = {results.metrics.average_cost}")
