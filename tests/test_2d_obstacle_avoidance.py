@@ -81,8 +81,7 @@ def dynamics_fn(state, u, th, t: float):
     ), location
 
 @jax.jit
-def cost_fn(xy: jax.Array, u: ParUniform, th, t: int) -> float:
-    xy = xy.location
+def cost_fn(xy: jax.Array, th, t: int) -> float:
     sdf_vals = jax.vmap(lambda bounds: sdf_aabb(xy, bounds))(th.obstacles)
     sdf_val = jnp.min(sdf_vals)
     obstacle_loss = th.collision_multiplier * hinge_loss(sdf_val, th.collision_buffer)
@@ -120,8 +119,8 @@ def init(H: int):
     th = ParUniform(
         goal = jnp.array([1.25, 1.25]),
         obstacles = generate_obstacle_grid(5, 5, 0.1, 0.1) + 0.2,
-        heading_nominal = jnp.full(H, jnp.pi/4),
-        heading_stdev = 0.5,
+        heading_nominal = jnp.full(H, 0.),
+        heading_stdev = 1.0,
         speed = 0.05,
         # collision_buffer = 0.03,
         collision_buffer = 0.1,
@@ -151,8 +150,6 @@ def test_pfmp():
         else:
             print(f"sample_forward (after jit): {t1 - t0}")
 
-    print()
-
     # assert states.delta.shape == (H,K)
     # assert states.location.shape == (H,K,2)
     # assert ancestors.shape == (H,K)
@@ -167,6 +164,21 @@ def test_pfmp():
 
     n_samples = 100
     trajs = pfmp.choose_paths(states, ancestors, jnp.arange(n_samples))
+    print(trajs.shape)
+    g = jax.vmap(
+            jax.vmap(
+                jax.vmap(cost_fn, in_axes=(0, None, None)),
+                in_axes=(0, None, None)
+            ),
+            in_axes=(0, None, None)
+        )
+    mat_costs = PFMP.project_cost(cost_fn, trajs, th)
+    total_costs = mat_costs.reshape(mat_costs.shape[0], -1).sum(axis=1)
+    besti = jnp.argmin(total_costs)
+    print(besti)
+    print(total_costs[besti])
+    print(trajs[besti])
+    trajs = trajs[jnp.array([besti])]
     # trajs = states[:n_samples]
 
     # l = 10
@@ -190,7 +202,7 @@ def test_pfmp():
 
     plot_goal(th.goal)
     plot_obstacles(th.obstacles)
-    locs = trajs.reshape(n_samples,-1,2)
+    locs = trajs.reshape(1,-1,2)
     plot_locations(locs)
 
     plt.show()

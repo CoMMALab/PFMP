@@ -11,6 +11,10 @@ from dataclasses import is_dataclass, fields
 from .interpolate import hermite_spline
 from .interpolateh import hermite_interp1d
 
+import jax.numpy as jnp
+from jax.tree_util import tree_leaves, tree_map
+
+
 def get_field_info(x):
     """
     Return:
@@ -96,9 +100,9 @@ def make_transition_model(
         ) -> tuple[tuple[jax.Array, float, float], None]:
             x_i, c = carry
             u_i, t_i = inps
-            (x_i_next, interp_y_i) = mpc_dynamics(x_i, u_i, theta, t_i)
-            c_i = mpc_cost(x_i_next, u_i, theta, t_i)
-            return (x_i_next, c + c_i), interp_y_i
+            (x_i_next, y_i_next) = mpc_dynamics(x_i, u_i, theta, t_i)
+            c_i = mpc_cost(y_i_next, theta, t_i)
+            return (x_i_next, c + c_i), y_i_next
 
         # Scan over the spline and numerically integrate cost
         (x1, cost), interp_ys = jax.lax.scan(interpolate_step, (x0, 0.0), (us[1:], t_grid[1:]))
@@ -247,3 +251,42 @@ class PFMP(NamedTuple):
             NamedTuple: containing fields with shape (L, H, ...), representing N reconstructed trajectories.
         """
         return jax.vmap(PFMP.choose_path, in_axes=(None, None, 0))(states, ancestors, indices)
+
+    @partial(jax.jit, static_argnames=("cost_fn",))
+    def project_cost(cost_fn, trajs, th):
+        """
+        cost_fn: (traj_slice, th, t_scalar) -> array_like
+        trajs  : PyTree whose leaves have shape (K, H, L, ...), sharing the same (K,H,L)
+        th     : static params (PyTree), not batched
+
+        returns: array_like with leading shape (K, H, L, ...cost_fn output shape...)
+        """
+        leaf0 = tree_leaves(trajs)[0]
+        assert leaf0.ndim >= 3, "Each leaf must start with (K, H, L, ...)"
+        K, H, L = leaf0.shape[:3]
+
+        # (Optional) sanity-check that all leaves share (K,H,L)
+        def _check(x):
+            assert x.shape[:3] == (K, H, L), "All leaves must share leading (K,H,L)."
+            return x
+        _ = tree_map(_check, trajs)
+
+        # Build time grid t[n, l] = n + l/L for n=0..H-1, l=0..L-1
+        t_dtype = leaf0.dtype if jnp.issubdtype(leaf0.dtype, jnp.floating) else jnp.float32
+        t_HL = (jnp.arange(H, dtype=t_dtype)[:, None] +
+                jnp.arange(L, dtype=t_dtype)[None, :] / L)          # (H, L)
+        t_batched = jnp.broadcast_to(t_HL, (K, H, L))               # (K, H, L)
+
+        # Vmap over L, then H, then K. th is static (captured).
+        def f_one(a, t_scalar):
+            return cost_fn(a, th, t_scalar)
+
+        vmapped = jax.vmap(                      # over K
+                    jax.vmap(                    # over H
+                        jax.vmap(f_one, in_axes=(0, 0)),  # over L
+                        in_axes=(0, 0)
+                    ),
+                    in_axes=(0, 0)
+                )
+
+        return vmapped(trajs, t_batched)
