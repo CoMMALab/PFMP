@@ -290,3 +290,40 @@ class PFMP(NamedTuple):
                 )
 
         return vmapped(trajs, t_batched)
+
+    def __call__(
+        self,
+        key: PRNGKeyArray,
+        x0: PyTree,
+        u0: jax.Array,
+        theta: PyTree,
+        H: int,
+        K: int,
+        rho: float,
+        n_samples: int,
+        index: int = 0,
+        return_best = False
+    ) -> PyTree[jax.Array]:
+        """
+        Run the model to return trajectories
+
+        Args:
+            All args needed to run the model
+        
+        Returns:
+            NamedTuple: containing fields with shape (L, H, ...), representing N reconstructed trajectories.
+       
+        """
+
+        (states, ancestors) = self.run_sir(
+            key=key, 
+            x0=x0, 
+            u0=u0,
+            theta=theta, 
+            h=H, 
+            k=K, 
+            rho=rho
+        )
+        if return_best:
+            return self.choose_path(states, ancestors, index)
+        return self.choose_paths(states, ancestors, jnp.arange(n_samples))

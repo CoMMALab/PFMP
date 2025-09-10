@@ -107,9 +107,9 @@ class InvertedDoublePendulum(ProblemDesc):
 
 
     @partial(jax.jit, static_argnames=['self'])
-    def cost_fn(self, data: mjx.Data, _u: jax.Array, _th: PParams, _t: float) -> float:
-        p, theta1, theta2 = data.qpos
-        dp, dtheta1, dtheta2 = data.qvel
+    def cost_fn(self, state: StateTracker, _th: PParams, _t: float) -> float:
+        p, theta1, theta2 = state.qpos
+        dp, dtheta1, dtheta2 = state.qvel
         
         # Angular deviations from upright (more direct formulation)
         angle_cost1 = 1 + jnp.cos(theta1)

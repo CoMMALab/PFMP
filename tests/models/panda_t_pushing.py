@@ -248,11 +248,10 @@ class TPusher(ProblemDesc):
 
 
     @partial(jax.jit, static_argnames=['self'])
-    def cost_fn(self, x: mjx.Data, _u, th: PParams, _t) -> float:
+    def cost_fn(self, state: StateTracker, th: PParams, _t) -> float:
         # Free joint layout: [px, py, pz, qw, qx, qy, qz]
-        error = self.error_fn(th, x.qpos[self.T_QPOS_OFFSET:self.T_QPOS_OFFSET+7])
+        error = self.error_fn(th, state.qpos[self.T_QPOS_OFFSET:self.T_QPOS_OFFSET+7])
         return jnp.dot(th.cost_factors, error ** 2)
-
 
     # some viz utils
     # Debug draw: red line + green target

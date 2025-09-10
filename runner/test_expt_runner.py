@@ -18,14 +18,14 @@ def main():
                 deg = args.deg,
                 rho = args.rho
                 )
-    inv_pend_problem = InvertedDoublePendulum()
-    t_push_problem = TPusher()
+    # problem = InvertedDoublePendulum()
+    problem = TPusher()
 
     # expt_runner = ExperimentRunner(
     #     config=config, problem=inv_pend_problem, results_dir = "experiments/try_class"
     # )
     expt_runner = ExperimentRunner(
-        config=config, problem=t_push_problem, results_dir = "experiments/try_class_push"
+        config=config, problem=problem, results_dir = "experiments/try_class_push"
     )
 
     expt_runner.reset_experiment()

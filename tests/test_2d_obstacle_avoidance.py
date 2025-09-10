@@ -165,13 +165,6 @@ def test_pfmp():
     n_samples = 100
     trajs = pfmp.choose_paths(states, ancestors, jnp.arange(n_samples))
     print(trajs.shape)
-    g = jax.vmap(
-            jax.vmap(
-                jax.vmap(cost_fn, in_axes=(0, None, None)),
-                in_axes=(0, None, None)
-            ),
-            in_axes=(0, None, None)
-        )
     mat_costs = PFMP.project_cost(cost_fn, trajs, th)
     total_costs = mat_costs.reshape(mat_costs.shape[0], -1).sum(axis=1)
     besti = jnp.argmin(total_costs)

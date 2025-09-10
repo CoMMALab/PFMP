@@ -111,12 +111,6 @@ class ExperimentRunner:
         return make_transition_model(proposal_fn, self.problem.cost_fn, self.problem.dynamics_fn, l=self.config.L)
 
 
-
-    def load_mpc_model(self):
-
-        self.mpc_model = PFMP(self.init_mjx_mpc())
-
-
     def run_model_and_benchmark(
             self,
             x0,
@@ -188,7 +182,7 @@ class ExperimentRunner:
         # mj_model, mj_data = load_mj(self.name)
         # self.problem.init_mjx(mj_model, mj_data)
 
-        self.load_mpc_model()
+        self.mpc_model = PFMP(self.init_mjx_mpc())
         x0, u0, theta = self.problem.initialize_problem(self.config)
 
         metrics, sampled_trajs = self.run_model_and_benchmark(x0, u0, theta)
