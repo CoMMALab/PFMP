@@ -252,44 +252,76 @@ class PFMP(NamedTuple):
         """
         return jax.vmap(PFMP.choose_path, in_axes=(None, None, 0))(states, ancestors, indices)
 
+    @staticmethod
     @partial(jax.jit, static_argnames=("cost_fn",))
-    def project_cost(cost_fn, trajs, th):
+    def project_cost(cost_fn, traj, th):
         """
-        cost_fn: (traj_slice, th, t_scalar) -> array_like
-        trajs  : PyTree whose leaves have shape (K, H, L, ...), sharing the same (K,H,L)
-        th     : static params (PyTree), not batched
+        Project a cost function over a single trajectory.
 
-        returns: array_like with leading shape (K, H, L, ...cost_fn output shape...)
+        Args:
+            cost_fn: callable (traj_slice, th, t_scalar) -> array_like
+                     where traj_slice corresponds to the PyTree leaves at a single (h, l).
+            traj:    PyTree whose leaves have shape (H, L, ...).
+            th:      static params (PyTree), not batched.
+
+        Returns:
+            array_like with shape (H, L, ...cost_fn output shape...).
         """
+        leaf0 = tree_leaves(traj)[0]
+        assert leaf0.ndim >= 2, "Each leaf must start with (H, L, ...)"
+        H, L = leaf0.shape[:2]
+
+        # (Optional) sanity-check that all leaves share (H, L)
+        def _check(x):
+            assert x.shape[:2] == (H, L), "All leaves must share leading (H, L)."
+            return x
+        _ = tree_map(_check, traj)
+
+        # Build time grid t[h, l] = h + l/L  (shape: (H, L))
+        t_dtype = leaf0.dtype if jnp.issubdtype(leaf0.dtype, jnp.floating) else jnp.float32
+        t_HL = (jnp.arange(H, dtype=t_dtype)[:, None] +
+                jnp.arange(L, dtype=t_dtype)[None, :] / L)
+
+        def f_one(a_slice, t_scalar):
+            return cost_fn(a_slice, th, t_scalar)
+
+        # vmap over H, then L (or vice versa); traj leaves are (H, L, ...)
+        vmapped = jax.vmap(                    # over H axis
+                    jax.vmap(f_one,            # over L axis
+                             in_axes=(0, 0)),
+                    in_axes=(0, 0)
+                  )
+
+        return vmapped(traj, t_HL)
+
+    @staticmethod
+    @partial(jax.jit, static_argnames=("cost_fn",))
+    def project_costs(cost_fn, trajs, th):
+        """
+        Batched version: vmap project_cost over leading K.
+
+        Args:
+            cost_fn: callable (traj_slice, th, t_scalar) -> array_like
+            trajs:   PyTree whose leaves have shape (K, H, L, ...).
+            th:      static params (PyTree), not batched.
+
+        Returns:
+            array_like with leading shape (K, H, L, ...cost_fn output shape...).
+        """
+        # Quick shape probe for (K, H, L)
         leaf0 = tree_leaves(trajs)[0]
         assert leaf0.ndim >= 3, "Each leaf must start with (K, H, L, ...)"
-        K, H, L = leaf0.shape[:3]
+        K = leaf0.shape[0]
 
-        # (Optional) sanity-check that all leaves share (K,H,L)
+        # (Optional) sanity-check all leaves share (K, H, L)
         def _check(x):
-            assert x.shape[:3] == (K, H, L), "All leaves must share leading (K,H,L)."
+            assert x.shape[:3] == leaf0.shape[:3], "All leaves must share leading (K, H, L)."
             return x
         _ = tree_map(_check, trajs)
 
-        # Build time grid t[n, l] = n + l/L for n=0..H-1, l=0..L-1
-        t_dtype = leaf0.dtype if jnp.issubdtype(leaf0.dtype, jnp.floating) else jnp.float32
-        t_HL = (jnp.arange(H, dtype=t_dtype)[:, None] +
-                jnp.arange(L, dtype=t_dtype)[None, :] / L)          # (H, L)
-        t_batched = jnp.broadcast_to(t_HL, (K, H, L))               # (K, H, L)
+        # vmap the single-trajectory projector across K
+        return jax.vmap(PFMP.project_cost, in_axes=(None, 0, None))(cost_fn, trajs, th)
 
-        # Vmap over L, then H, then K. th is static (captured).
-        def f_one(a, t_scalar):
-            return cost_fn(a, th, t_scalar)
-
-        vmapped = jax.vmap(                      # over K
-                    jax.vmap(                    # over H
-                        jax.vmap(f_one, in_axes=(0, 0)),  # over L
-                        in_axes=(0, 0)
-                    ),
-                    in_axes=(0, 0)
-                )
-
-        return vmapped(trajs, t_batched)
 
     def __call__(
         self,

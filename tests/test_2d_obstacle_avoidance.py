@@ -165,11 +165,12 @@ def test_pfmp():
     n_samples = 100
     trajs = pfmp.choose_paths(states, ancestors, jnp.arange(n_samples))
     print(trajs.shape)
-    mat_costs = PFMP.project_cost(cost_fn, trajs, th)
+    mat_costs = PFMP.project_costs(cost_fn, trajs, th)
     total_costs = mat_costs.reshape(mat_costs.shape[0], -1).sum(axis=1)
     besti = jnp.argmin(total_costs)
     print(besti)
-    print(total_costs[besti])
+    print(total_costs[besti], jnp.sum(PFMP.project_cost(cost_fn, trajs[besti], th)))
+    assert total_costs[besti] == jnp.sum(PFMP.project_cost(cost_fn, trajs[besti], th))
     print(trajs[besti])
     trajs = trajs[jnp.array([besti])]
     # trajs = states[:n_samples]
