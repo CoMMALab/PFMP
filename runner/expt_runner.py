@@ -7,9 +7,7 @@ import os, math, pickle, itertools, time, traceback, sys
 import numpy as np
 
 from genjax import gen, mv_normal
-from mujoco import mjx
 from typing import NamedTuple, Type
-from mujoco.viewer import launch_passive
 from pathlib import Path
 from typing import Sequence, Tuple, Any, Iterable
 from collections import OrderedDict
@@ -69,7 +67,6 @@ class ExperimentRunner:
 
         """
 
-        self.mjx_model = None
         self.x0 = None
         self.theta = None
         self.mpc_model = None
@@ -79,9 +76,7 @@ class ExperimentRunner:
 
 
 
-
-
-    def init_mjx_mpc(self):
+    def init_transition_model_mpc(self):
         """
         Build an MPC transition model with a proposal matched to `deg` and `l`.
 
@@ -138,15 +133,6 @@ class ExperimentRunner:
 
         costs = self.mpc_model.project_costs(self.problem.cost_fn, trajs, theta)
 
-
-        # # run and profile algorithm
-        # # time grid as float
-        # t_seq = jnp.arange(self.config.H * self.config.L, dtype=jnp.float32) / jnp.float32(self.config.L)
-        # # sum over T for a single trajectory (leaves shaped (T, ...))
-        # traj_cost_fn = lambda tau: jnp.sum(
-        #     jax.vmap(self.problem.cost_fn, in_axes=(0, 0, None, 0))(tau, tau.ctrl, theta, t_seq)
-        # )
-
         # # mean over K of per-trajectory totals (leaves shaped (K, T, ...))
         # average_cost_fn = lambda trajs_flat: jnp.mean(
         #     jax.vmap(traj_cost_fn, in_axes=0)(trajs_flat)
@@ -165,68 +151,36 @@ class ExperimentRunner:
         ), trajs, costs
 
 
-    def visualize(self, traj):
-
-        self.problem.visualize()
-
-        # with launch_passive(self.mj_model, data=self.mj_data, show_left_ui=False, show_right_ui=False) as viewer:
-        #     for t in range(traj.qpos.shape[0]):
-        #         for s in range(self.config.L):
-        #             self.mj_data.qpos[:] = jax.device_get(traj.qpos[t,s])
-        #             self.mj_data.qvel[:] = jax.device_get(traj.qvel[t,s])
-        #             mujoco.mj_forward(self.mj_model, self.mj_data)
-        #             time.sleep(0.01)
-        #             viewer.sync()
-
-
-
     def evaluate(self, visualize: bool = False, save_results: bool = True):
 
-        # mj_model, mj_data = load_mj(self.name)
-        # self.problem.init_mjx(mj_model, mj_data)
 
-        self.mpc_model = PFMP(self.init_mjx_mpc())
+        self.mpc_model = PFMP(self.init_transition_model_mpc())
         x0, u0, theta = self.problem.initialize_problem(self.config)
+
+        print(x0, u0, theta)
 
         metrics, trajs, traj_costs = self.run_model_and_benchmark(x0, u0, theta)
         # (K, H, L, D)
 
-        print(trajs)
-
-        # results = Results(
-        #     name = self.name,
-        #     comments = self.comments,
-        #     config = self.config,
-        #     metrics = metrics,
-        #     sampled_trajs = sampled_trajs,
-        #     traj_costs = traj_costs,
-        # )
-
-        # json_name, json_path = self.get_file_name_from_config()
-        # trajs_fname = "panda_t_push_trajs_n10panda_t_push_k100_d3_h20_l80_s0p0625.npz"
-        # trajs_path  = os.path.join(self.results_dir, trajs_fname)
-
-        # sampled_trajs = load_trajs_npz_named(trajs_path)
-        # trajs = jax.tree.map(lambda x: x.reshape(self.config.K,-1,x.shape[-1]), sampled_trajs)
-
-        # traj = jax.tree.map(lambda x: x[0], trajs)
-        # traj = jax.tree_util.tree_map(jnp.array, traj)
-        # print(type(traj))
+        results = Results(
+            name = self.name,
+            comments = self.comments,
+            config = self.config,
+            metrics = metrics,
+            sampled_trajs = trajs,
+            traj_costs = traj_costs,
+        )
 
         total_costs = traj_costs.reshape(traj_costs.shape[0], -1).sum(axis=1)
         map_idx = jnp.argmin(total_costs)
         map_traj = jax.tree.map(lambda x: x[map_idx].reshape(self.config.H*self.config.L,-1), trajs)
-        print(map_traj.qpos.shape)
-        # assert total_costs[besti] == jnp.sum(PFMP.project_cost(self.problem.cost_fn, trajs[besti], theta))
-        # traj = trajs[jnp.array([besti])]
-        # traj = jax.tree.map(lambda x: x[map_idx], trajs)
 
 
         if visualize:
             self.problem.visualize(theta = theta, config = self.config, traj=map_traj)
 
-        # if save_results:
-        #     self.save_results(results)
+        if save_results:
+            self.save_results(results)
 
     def get_file_name_from_config(self):
         _ffmt = lambda x: f"{float(x):g}".replace(".", "p")

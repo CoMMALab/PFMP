@@ -20,6 +20,6 @@ if __name__ == "__main__":
     problem = TPusher()
 
     gs = GridSearch(
-        problem, results_dir = "experiments/push_grid_search", resume_from_iteration = 0, resume = True
+        problem, results_dir = "experiments/push_grid_search_pfmp", resume_from_iteration = 0, resume = True
     )
     gs()
