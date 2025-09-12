@@ -158,6 +158,10 @@ class TPusher(ProblemDesc):
         self.mj_data.qpos[:7] = q0
         (x0, theta) = self.init_mjx(self.mj_model, self.mj_data)
         theta = theta._replace(goal_xy = jnp.array([-0.4, 0.3]), goal_angle=-0.2)
+        theta = theta._replace(u_stdev = config.sigma)
+        theta = theta._replace(du_stdev = config.sigma * 2.0)
+        theta = theta._replace(ddu_stdev = config.sigma * 4.0)
+
         qpos = jnp.concat((q0,self.mj_data.qpos[7:]))
         x0 = x0.replace(qpos=qpos)
 
@@ -371,11 +375,11 @@ class TPusher(ProblemDesc):
             while True:
                 # txyz = traj[t]
                 # mj_data.ctrl[:7] = step_ik_7d_from_mat4(mj_data.qpos[:7], mat4_from_pose(txyz, R_des))[0]
-                txyz = traj.txyz[t]
-                self.mj_data.qpos = traj.qpos[t]
+                txyz = traj['txyz'][t]
+                self.mj_data.qpos = traj['qpos'][t]
                 mujoco.mj_step(self.mj_model, self.mj_data)
 
-                print(f"errors = {self.error_fn(theta, self.mj_data.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET+7])}")
+                # print(f"errors = {self.error_fn(theta, self.mj_data.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET+7])}")
 
                 # Clear previous markers
                 viewer.user_scn.ngeom = 0
@@ -385,7 +389,7 @@ class TPusher(ProblemDesc):
 
                 # Add knot markers
                 for n in range(0,config.H*config.L,config.L):
-                    self.add_sphere(viewer.user_scn, traj.txyz[n], radius=0.01)
+                    self.add_sphere(viewer.user_scn, traj['txyz'][n], radius=0.01)
 
                 # Add interpolated markers
                 # for n in range(0,H*L):

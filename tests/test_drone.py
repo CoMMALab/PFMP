@@ -55,7 +55,7 @@ def init():
         target = jnp.array([2., -2.]),
         gains = Gains(10, 0.1)
     )
-    x0 = DState(qpos=jnp.array([0.,0.,0.8]), qvel=jnp.array([0.,0.,0.]))
+    x0 = DState(qpos=jnp.array([-4.0,3.0,0.8]), qvel=jnp.array([0.,0.,0.]))
     return th, x0
 
 ### Thrust-based Controller

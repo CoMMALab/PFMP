@@ -151,13 +151,17 @@ class ExperimentRunner:
         ), trajs, costs
 
 
+    def visualize(self, traj):
+
+        x0, u0, theta = self.problem.initialize_problem(self.config)
+        self.problem.visualize(theta = theta, config = self.config, traj=traj)
+
+
     def evaluate(self, visualize: bool = False, save_results: bool = True):
 
 
         self.mpc_model = PFMP(self.init_transition_model_mpc())
         x0, u0, theta = self.problem.initialize_problem(self.config)
-
-        print(x0, u0, theta)
 
         metrics, trajs, traj_costs = self.run_model_and_benchmark(x0, u0, theta)
         # (K, H, L, D)
@@ -185,7 +189,7 @@ class ExperimentRunner:
     def get_file_name_from_config(self):
         _ffmt = lambda x: f"{float(x):g}".replace(".", "p")
 
-        params_str = f"_k{self.config.K}_d{self.config.deg}_h{self.config.H}_l{self.config.L}_s{_ffmt(self.config.sigma)}"
+        params_str = f"_k{self.config.K}_d{self.config.deg}_h{self.config.H}_l{self.config.L}_s{_ffmt(self.config.sigma)}_rho{_ffmt(self.config.rho)}"
         json_name  = f"{self.name}{params_str}.json"
         json_path  = Path(self.results_dir, json_name)
 
@@ -208,6 +212,7 @@ class ExperimentRunner:
         traj_costs_path  = os.path.join(self.results_dir, traj_costs_fname)
 
         results = results._replace(sampled_trajs = None)
+        results = results._replace(traj_costs = None)
 
         payload = {
             "meta": {

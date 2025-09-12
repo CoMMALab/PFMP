@@ -50,6 +50,11 @@ class DParams(NamedTuple):
     target: jax.Array
     gains: Gains
 
+    # with obstacles
+    obstacles: jax.Array
+    collision_buffer: float
+    collision_multiplier: float
+
 class DState(NamedTuple):
     qpos: jax.Array
     qvel: jax.Array
@@ -69,7 +74,7 @@ def quintic_proposal_fn(x: DState, u: jax.Array, th: DParams, t: float) -> jax.A
 
 @gen
 def cubic_proposal_fn(x: DState, u: jax.Array, th: DParams, t: float) -> jax.Array:
-    rho = 0.8   # correlation coefficient, -1 <= rho <= 1
+    rho = 0.0   # correlation coefficient, -1 <= rho <= 1
     Sigma = th.sigma**2 * jnp.array([
         [1.0, rho],
         [rho, 1.0]
@@ -136,11 +141,18 @@ class Drone2DNav(ProblemDesc):
             half_length = half_length,
             moi = moi,
             max_thrust = 100.0,
-            sigma = 10.0,
-            target = jnp.array([2., -2.]),
-            gains = Gains(10, 0.1)
+            sigma = config.sigma,
+            target = jnp.array([4.5, 0.]),
+            # target = jnp.array([2., -2.]),
+            gains = Gains(0.2, 0.05),
+            obstacles = self.generate_obstacle_grid(5, 5, 0.1, 1),
+            collision_buffer = 0.3,
+            collision_multiplier = 1e3,
+
         )
-        x0 = DState(qpos=jnp.array([0.,0.,0.8]), qvel=jnp.array([0.,0.,0.]))
+        x0 = DState(qpos=jnp.array([-4.0,3.0,0.8]), qvel=jnp.array([0.,0.,0.]))
+
+        x0 = DState(qpos=jnp.array([-4.0,-3.0,0.8]), qvel=jnp.array([0.,0.,0.]))
         # return th, x0
 
         return x0, u0, theta
@@ -199,9 +211,79 @@ class Drone2DNav(ProblemDesc):
         perr = jnp.dot(p,p) + x.qpos[2]**2
 
         d = x.qvel[:2]
-        derr = jnp.dot(d,d) + x.qvel[2]**2
+        derr = jnp.dot(d,d) + (x.qvel[2] * 0.001 )**2
 
-        return theta.gains.kp*perr + theta.gains.kd*derr
+        sdf_vals = jax.vmap(lambda bounds: self.sdf_aabb(x.qpos[:2], bounds))(theta.obstacles)
+        sdf_val = jnp.min(sdf_vals)
+        obstacle_loss = theta.collision_multiplier * self.hinge_loss(sdf_val, theta.collision_buffer)
+        # this is in-case `u.collision_multiplier == jnp.inf`
+        obstacle_loss = jnp.nan_to_num(obstacle_loss, nan=0.0, posinf=jnp.inf, neginf=0.0)
+
+        # return (obstacle_loss) ** 2
+        return (obstacle_loss) ** 2 + (theta.gains.kp*perr * (t + 1.0) / 160) + theta.gains.kd*derr
+        # return theta.gains.kp*perr + theta.gains.kd*derr
+
+
+    # Adding obstacles for cost function
+    def generate_obstacle_grid(self, num_x: int, num_y: int, box_size: float, gap: float):
+        """ Generate a regular grid of AABB obstacles.
+
+        Args:
+            num_x: number of boxes along the x-axis
+            num_y: number of boxes along the y-axis
+            box_size: side length of each box (square)
+            gap: gap between boxes (same in x and y)
+
+        Returns:
+            A (num_x * num_y, 4) array of AABB boxes as (xmin, xmax, ymin, ymax)
+        """
+        obstacles = []
+
+        # obstacles.append(jnp.array([-3.5, -3.3, -1, 3]))
+        # obstacles.append(jnp.array([-5.75, -1.5, -2.3, -2.1]))
+        # obstacles.append(jnp.array([-0.1, 4, -2.3, -2.1]))
+        # obstacles.append(jnp.array([-6.0, -5.8, -6.0, 6.0]))
+        # obstacles.append(jnp.array([3.9, 4.0, -6.0, 6.0]))
+        # obstacles.append(jnp.array([-6.0, 6.0, -6.0, -5.9]))
+        # obstacles.append(jnp.array([-6.0, 6.0, 3.9, 5.0]))
+
+        obstacles.append(jnp.array([-3.5, -3.3, -6, -1]))
+        obstacles.append(jnp.array([-1.5, -1.3, -0.5, 6]))
+        obstacles.append(jnp.array([0.5, 0.7, -6, 0]))
+        obstacles.append(jnp.array([2.5, 2.6, -0.5, 6]))
+        # obstacles.append(jnp.array([-5.75, -1.5, -2.3, -2.1]))
+        # obstacles.append(jnp.array([-0.1, 4, -2.3, -2.1]))
+        # obstacles.append(jnp.array([-6.0, -5.8, -6.0, 6.0]))
+        # obstacles.append(jnp.array([3.9, 4.0, -6.0, 6.0]))
+        # obstacles.append(jnp.array([-6.0, 6.0, -6.0, -5.9]))
+        # obstacles.append(jnp.array([-6.0, 6.0, 3.9, 5.0]))
+
+        # for i in range(num_x):
+        #     for j in range(num_y):
+        #         xmin = i * (box_size + gap)
+        #         ymin = j * (box_size + gap)
+        #         xmax = xmin + box_size
+        #         ymax = ymin + box_size
+        #         obstacles.append(jnp.array([xmin, xmax, ymin, ymax]))
+        return jnp.stack(obstacles)
+        
+
+    @partial(jax.jit, static_argnames=['self'])
+    def sdf_aabb(self, pos: jax.Array, bounds: jax.Array) -> float:
+        xmin, xmax, ymin, ymax = bounds
+        center = jnp.array([(xmin + xmax) / 2, (ymin + ymax) / 2])
+        half_extents = jnp.array([(xmax - xmin) / 2, (ymax - ymin) / 2])
+        
+        d = jnp.abs(pos - center) - half_extents
+        outside_dist = jnp.linalg.norm(jnp.maximum(d, 0.0))
+        inside_dist = jnp.minimum(jnp.maximum(d[0], d[1]), 0.0)
+        return outside_dist + inside_dist
+
+    @partial(jax.jit, static_argnames=['self'])
+    def hinge_loss(self, sdf: float, epsilon: float) -> float:
+        return jnp.where(sdf < epsilon, 0.5 * (epsilon - sdf) ** 2, 0.0)
+
+
 
 
     def draw_drone(self, ax, x: DState, th: DParams = None):
@@ -237,9 +319,21 @@ class Drone2DNav(ProblemDesc):
         ax.set_ylabel("y")
 
 
+    def plot_obstacles(self, obstacles, color='black'):
+        """Plot a list of AABB obstacles."""
+        ax = plt.gca()
+        for obs in obstacles:
+            xmin, xmax, ymin, ymax = obs
+            width = xmax - xmin
+            height = ymax - ymin
+            rect = plt.Rectangle((xmin, ymin), width, height,
+                                edgecolor=color, facecolor='black', linewidth=1)
+            ax.add_patch(rect)
+
+
     def visualize(self, theta, config, traj):
 
-        interval=50
+        interval=1
         save_path = None
         fig, ax = plt.subplots()
         ax.set_xlim(-5, 5)
@@ -248,6 +342,8 @@ class Drone2DNav(ProblemDesc):
 
         # Container for artists (we’ll re-draw the drone each frame)
         artists = []
+
+
 
         def init():
             ax.clear()
@@ -262,7 +358,8 @@ class Drone2DNav(ProblemDesc):
             ax.set_ylim(-5, 5)
             ax.set_aspect("equal", adjustable="box")
 
-            plt.plot([2], [-2], marker='*', linestyle='-', color='blue', markersize=10)
+            plt.plot(theta.target[0], theta.target[1], marker='*', linestyle='-', color='blue', markersize=10)
+            self.plot_obstacles(theta.obstacles)
             # pick frame (you had [t,s], so flatten here if needed)
             # t, s = divmod(frame_idx, traj.qpos.shape[1])
             state = jax.tree.map(lambda x: x[frame_idx], traj)

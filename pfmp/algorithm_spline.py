@@ -151,7 +151,8 @@ class PFMP(NamedTuple):
         u0: PyTree,
         theta: PyTree,
         h: int,
-        k: int
+        k: int,
+        rho:float = 0.0
     ) -> tuple[jax.Array, jax.Array]:
         generate_keys = jax.random.split(key, h * k).reshape(k, h)
         k_trajs, k_scores = jax.vmap(

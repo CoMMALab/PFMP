@@ -32,10 +32,18 @@ T_PUSH_CONFIG_RANGE = ConfigRange(
     K = [100, 1000, 5000, 10000],
     deg = [1, 3, 5],
     HL = [[10, 160], [20, 80], [40, 40], [80, 20]],
-    sigma = [2**n for n in range(-4,1)],
-    rho = [0.8]
-
+    sigma = [2**n for n in range(-6,-2)],
+    rho = [0.6, 0.8]
 )
+
+DRONE_FLAPPY_CONFIG_RANGE = ConfigRange(
+    K = [100, 500, 1000, 5000, 10000, 50000],
+    deg = [1, 3, 5],
+    HL = [[10, 160], [20, 80], [40, 40], [80, 20], [160, 10]],
+    sigma = [2**n for n in range(-2,6)],
+    rho = [0.6, 0.8]
+)
+
 
 class GridSearch:
     def __init__(self, problem, results_dir: str, resume: bool = True, resume_from_iteration: int = 0):
@@ -45,8 +53,10 @@ class GridSearch:
         self.config_ranges = None
         if problem.name == "inverted_double_pendulum":
             self.config_ranges = INVERTED_DOUBLE_PENDULUM_CONFIG_RANGE
-        else:
+        elif problem.name == "panda_t_push":
             self.config_ranges = T_PUSH_CONFIG_RANGE
+        elif problem.name == "drone_2d_nav":
+            self.config_ranges = DRONE_FLAPPY_CONFIG_RANGE
 
         self.problem = problem
         self.results_dir = results_dir
