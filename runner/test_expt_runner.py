@@ -6,7 +6,8 @@ from typing import NamedTuple
 # from tests.mjx_mod.models.inverted_double_pendulum import linear_proposal_fn, cubic_proposal_fn, quintic_proposal_fn, cost_fn, dynamics_fn
 from tests.models.inverted_double_pendulum import InvertedDoublePendulum
 from tests.models.panda_t_pushing import TPusher
-from tests.models.drone_2d_nav import Drone2DNav
+# from tests.models.drone_2d_nav import Drone2DNav
+from tests.models.drone_2d_nav_no_obs import Drone2DNav
 
 def main():
     args = build_parser_and_parse_args()
@@ -29,9 +30,20 @@ def main():
     expt_runner = ExperimentRunner(
         config=config, problem=problem, results_dir = "experiments/drone_2d_nav_test"
     )
-
     expt_runner.reset_experiment()
-    expt_runner.evaluate(save_results = True, visualize=True)
+    expt_runner.evaluate(save_results = False, visualize=False)
+
+    expt_runner = ExperimentRunner(
+        config=config, problem=problem, results_dir = "experiments/drone_2d_nav_test"
+    )
+    expt_runner.reset_experiment()
+    expt_runner.evaluate(save_results = False, visualize=False)
+
+    expt_runner = ExperimentRunner(
+        config=config, problem=problem, results_dir = "experiments/drone_2d_nav_test"
+    )
+    expt_runner.reset_experiment()
+    expt_runner.evaluate(save_results = False, visualize=False)
 
 
 if __name__ == '__main__':

@@ -12,8 +12,7 @@ from .analyze_results import get_result_from_file
 from .file_utils import load_trajs_npz_named
 
 def main():
-    problem = TPusher()
-    results_dir = "experiments/push_grid_search_pfmp"
+    results_dir = "experiments/drone_2d_nav_grid_search_pfmp"
 
 
     for filename in os.listdir(results_dir):
@@ -38,7 +37,7 @@ def main():
                         rho = 0.8
                         )
             print(config, results[0], results[1], results[2])
-            problem = TPusher()
+            problem = Drone2DNav()
             expt_runner = ExperimentRunner(
                 config=config, problem=problem, results_dir = ""
             )

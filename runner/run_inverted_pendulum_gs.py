@@ -3,7 +3,8 @@ import os
 
 from tests.models.inverted_double_pendulum import InvertedDoublePendulum
 from tests.models.panda_t_pushing import TPusher
-from tests.models.drone_2d_nav import Drone2DNav
+# from tests.models.drone_2d_nav import Drone2DNav
+from tests.models.drone_2d_nav_no_obs import Drone2DNav
 
 
 from runner.grid_search_runner import GridSearch
@@ -21,6 +22,6 @@ if __name__ == "__main__":
     problem = Drone2DNav()
 
     gs = GridSearch(
-        problem, results_dir = "experiments/drone_2d_nav_grid_search_pfmp", resume_from_iteration = 0, resume = True
+        problem, results_dir = "experiments/drone_2d_nav_no_obs_grid_search_pfmp", resume_from_iteration = 0, resume = True
     )
     gs()

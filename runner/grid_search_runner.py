@@ -40,7 +40,7 @@ DRONE_FLAPPY_CONFIG_RANGE = ConfigRange(
     K = [100, 500, 1000, 5000, 10000, 50000],
     deg = [1, 3, 5],
     HL = [[10, 160], [20, 80], [40, 40], [80, 20], [160, 10]],
-    sigma = [2**n for n in range(-2,6)],
+    sigma = [2**n for n in range(-6,6)],
     rho = [0.6, 0.8]
 )
 

@@ -61,11 +61,18 @@ def get_best_and_average_cost(filepath):
     traj_costs = load_trajs_npz_named(filepath)['traj_costs']
     total_costs = traj_costs.reshape(traj_costs.shape[0], -1).sum(axis=1)
 
+    terminal_costs = traj_costs.reshape(traj_costs.shape[0], -1)[:, -1]
 
-    best_cost = np.min(total_costs)
-    average_cost = np.mean(total_costs)
 
-    return best_cost, average_cost, np.argmin(total_costs)
+
+    best_cost = np.min(terminal_costs)
+    average_cost = np.mean(terminal_costs)
+
+    # best_cost = np.min(total_costs)
+    # average_cost = np.mean(total_costs)
+
+    # return best_cost, average_cost, np.argmin(total_costs)
+    return best_cost, average_cost, np.argmin(terminal_costs)
     # map_traj = jax.tree.map(lambda x: x[map_idx].reshape(self.config.H*self.config.L,-1), trajs)
 
 
@@ -80,10 +87,11 @@ def get_result_from_file(filepath, return_best_traj = False):
 
     metadata = json_data["meta"]
     results = json_data["results"]
+    config = json_data["results"]["config"]
 
     best_cost, average_cost, best_idx = get_best_and_average_cost(os.path.join(os.path.dirname(filepath), metadata["traj_costs_fname"]))
 
-    k, deg, h, l, sigma = metadata["k"], metadata["deg"], metadata["h"], metadata["l"], metadata["sigma"]
+    k, deg, h, l, sigma, rho = config["K"], config["deg"], config["H"], config["L"], config["sigma"], config["rho"]
     
     runtime = results["metrics"]["runtime"]
 
@@ -96,7 +104,7 @@ def get_result_from_file(filepath, return_best_traj = False):
         # best_traj = trajs[best_idx]
 
 
-    return ((k, deg, h, l, sigma),  (best_cost, average_cost, runtime, best_traj))
+    return ((k, deg, h, l, sigma, rho),  (best_cost, average_cost, runtime, best_traj))
 
     
 
@@ -105,7 +113,7 @@ def get_result_from_file(filepath, return_best_traj = False):
 
 if __name__ == "__main__":
     name = "inverted_double_pendulum"
-    results_dir = "experiments/push_t_grid_search_pfmp"
+    results_dir = "experiments/drone_2d_nav_no_obs_grid_search_pfmp"
     results_map = {}
 
     for filename in tqdm(os.listdir(results_dir)[::1]):
@@ -130,11 +138,11 @@ if __name__ == "__main__":
     best_costs = [v[0] for v in sorted_results.values()]
     average_costs = [v[1] for v in sorted_results.values()]
     runtimes = [v[2] for v in sorted_results.values()]
-    plt.scatter(runtimes, best_costs, c=[label_to_color[label_to_int[l]] for l in ks], s = 10)
+    plt.scatter(runtimes, np.log(best_costs), c=[label_to_color[label_to_int[l]] for l in ks], s = 10)
 
     for label, i in label_to_int.items():
         plt.scatter([], [], color=cmap(i), label=label)
-    plt.legend(title="k")
+    plt.legend(title="K")
 
     # print(np.min(best_costs), np.max(best_costs))
 
@@ -143,6 +151,155 @@ if __name__ == "__main__":
     costs = [v[1] for v in frontier]
     runtimes = [v[0] for v in frontier]
     print(runtimes, costs)
-    plt.scatter(runtimes, costs, color="magenta", s = 10)
-    plt.plot(runtimes, costs, color="magenta")
-    plt.show()
+    # plt.scatter(runtimes, np.log(costs), color="magenta", s = 10)
+    plt.plot(runtimes, np.log(costs), color="magenta")
+    # plt.show()
+    plt.savefig("experiments/matplotlib/k.png")
+    plt.close()
+
+
+    ks = [meta[1] for meta in sorted_results]
+    distinct_ks = set(ks)
+    label_to_int = {label: i for i, label in enumerate(sorted(distinct_ks))}
+    cmap = plt.cm.get_cmap("tab10", len(distinct_ks))
+    label_to_color = {label: cmap(i) for i, label in enumerate(range(0, len(distinct_ks)))}
+
+
+    best_costs = [v[0] for v in sorted_results.values()]
+    average_costs = [v[1] for v in sorted_results.values()]
+    runtimes = [v[2] for v in sorted_results.values()]
+    plt.scatter(runtimes, np.log(best_costs), c=[label_to_color[label_to_int[l]] for l in ks], s = 10)
+
+    for label, i in label_to_int.items():
+        plt.scatter([], [], color=cmap(i), label=label)
+    plt.legend(title="Deg")
+
+    # print(np.min(best_costs), np.max(best_costs))
+
+    
+    frontier = pareto_frontier(np.array([x for x in sorted_results.values()]))
+    costs = [v[1] for v in frontier]
+    runtimes = [v[0] for v in frontier]
+    print(runtimes, costs)
+    # plt.scatter(runtimes, np.log(costs), color="magenta", s = 10)
+    plt.plot(runtimes, np.log(costs), color="magenta")
+    # plt.show()
+    plt.savefig("experiments/matplotlib/deg.png")
+    plt.close()
+
+    ks = [meta[2] for meta in sorted_results]
+    distinct_ks = set(ks)
+    label_to_int = {label: i for i, label in enumerate(sorted(distinct_ks))}
+    cmap = plt.cm.get_cmap("tab10", len(distinct_ks))
+    label_to_color = {label: cmap(i) for i, label in enumerate(range(0, len(distinct_ks)))}
+
+
+    best_costs = [v[0] for v in sorted_results.values()]
+    average_costs = [v[1] for v in sorted_results.values()]
+    runtimes = [v[2] for v in sorted_results.values()]
+    plt.scatter(runtimes, np.log(best_costs), c=[label_to_color[label_to_int[l]] for l in ks], s = 10)
+
+    for label, i in label_to_int.items():
+        plt.scatter([], [], color=cmap(i), label=label)
+    plt.legend(title="H")
+
+    # print(np.min(best_costs), np.max(best_costs))
+
+    
+    frontier = pareto_frontier(np.array([x for x in sorted_results.values()]))
+    costs = [v[1] for v in frontier]
+    runtimes = [v[0] for v in frontier]
+    print(runtimes, costs)
+    # plt.scatter(runtimes, np.log(costs), color="magenta", s = 10)
+    plt.plot(runtimes, np.log(costs), color="magenta")
+    # plt.show()
+    plt.savefig("experiments/matplotlib/H.png")
+    plt.close()
+
+    ks = [meta[3] for meta in sorted_results]
+    distinct_ks = set(ks)
+    label_to_int = {label: i for i, label in enumerate(sorted(distinct_ks))}
+    cmap = plt.cm.get_cmap("tab10", len(distinct_ks))
+    label_to_color = {label: cmap(i) for i, label in enumerate(range(0, len(distinct_ks)))}
+
+
+    best_costs = [v[0] for v in sorted_results.values()]
+    average_costs = [v[1] for v in sorted_results.values()]
+    runtimes = [v[2] for v in sorted_results.values()]
+    plt.scatter(runtimes, np.log(best_costs), c=[label_to_color[label_to_int[l]] for l in ks], s = 10)
+
+    for label, i in label_to_int.items():
+        plt.scatter([], [], color=cmap(i), label=label)
+    plt.legend(title="L")
+
+    # print(np.min(best_costs), np.max(best_costs))
+
+    
+    frontier = pareto_frontier(np.array([x for x in sorted_results.values()]))
+    costs = [v[1] for v in frontier]
+    runtimes = [v[0] for v in frontier]
+    print(runtimes, costs)
+    # plt.scatter(runtimes, np.log(costs), color="magenta", s = 10)
+    plt.plot(runtimes, np.log(costs), color="magenta")
+    # plt.show()
+    plt.savefig("experiments/matplotlib/L.png")
+    plt.close()
+
+
+    ks = [meta[4] for meta in sorted_results]
+    distinct_ks = set(ks)
+    label_to_int = {label: i for i, label in enumerate(sorted(distinct_ks))}
+    cmap = plt.cm.get_cmap("tab10", len(distinct_ks))
+    label_to_color = {label: cmap(i) for i, label in enumerate(range(0, len(distinct_ks)))}
+
+
+    best_costs = [v[0] for v in sorted_results.values()]
+    average_costs = [v[1] for v in sorted_results.values()]
+    runtimes = [v[2] for v in sorted_results.values()]
+    plt.scatter(runtimes, np.log(best_costs), c=[label_to_color[label_to_int[l]] for l in ks], s = 10)
+
+    for label, i in label_to_int.items():
+        plt.scatter([], [], color=cmap(i), label=label)
+    plt.legend(title="sigma")
+
+    # print(np.min(best_costs), np.max(best_costs))
+
+    
+    frontier = pareto_frontier(np.array([x for x in sorted_results.values()]))
+    costs = [v[1] for v in frontier]
+    runtimes = [v[0] for v in frontier]
+    print(runtimes, costs)
+    # plt.scatter(runtimes, np.log(costs), color="magenta", s = 10)
+    plt.plot(runtimes, np.log(costs), color="magenta")
+    # plt.show()
+    plt.savefig("experiments/matplotlib/sigma.png")
+    plt.close()
+
+    ks = [meta[5] for meta in sorted_results]
+    distinct_ks = set(ks)
+    label_to_int = {label: i for i, label in enumerate(sorted(distinct_ks))}
+    cmap = plt.cm.get_cmap("tab10", len(distinct_ks))
+    label_to_color = {label: cmap(i) for i, label in enumerate(range(0, len(distinct_ks)))}
+
+
+    best_costs = [v[0] for v in sorted_results.values()]
+    average_costs = [v[1] for v in sorted_results.values()]
+    runtimes = [v[2] for v in sorted_results.values()]
+    plt.scatter(runtimes, np.log(best_costs), c=[label_to_color[label_to_int[l]] for l in ks], s = 10)
+
+    for label, i in label_to_int.items():
+        plt.scatter([], [], color=cmap(i), label=label)
+    plt.legend(title="rho")
+
+    # print(np.min(best_costs), np.max(best_costs))
+
+    
+    frontier = pareto_frontier(np.array([x for x in sorted_results.values()]))
+    costs = [v[1] for v in frontier]
+    runtimes = [v[0] for v in frontier]
+    print(runtimes, costs)
+    # plt.scatter(runtimes, np.log(costs), color="magenta", s = 10)
+    plt.plot(runtimes, np.log(costs), color="magenta")
+    # plt.show()                    
+    plt.savefig("experiments/matplotlib/rho.png")
+    plt.close()

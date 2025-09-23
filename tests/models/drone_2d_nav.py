@@ -49,6 +49,7 @@ class DParams(NamedTuple):
     sigma: float
     target: jax.Array
     gains: Gains
+    rho: float
 
     # with obstacles
     obstacles: jax.Array
@@ -62,7 +63,7 @@ class DState(NamedTuple):
 
 @gen
 def quintic_proposal_fn(x: DState, u: jax.Array, th: DParams, t: float) -> jax.Array:
-    rho = 0.8   # correlation coefficient, -1 <= rho <= 1
+    rho = th.rho   # correlation coefficient, -1 <= rho <= 1
     Sigma = th.sigma**2 * jnp.array([
         [1.0, rho],
         [rho, 1.0]
@@ -74,7 +75,7 @@ def quintic_proposal_fn(x: DState, u: jax.Array, th: DParams, t: float) -> jax.A
 
 @gen
 def cubic_proposal_fn(x: DState, u: jax.Array, th: DParams, t: float) -> jax.Array:
-    rho = 0.0   # correlation coefficient, -1 <= rho <= 1
+    rho = th.rho   # correlation coefficient, -1 <= rho <= 1
     Sigma = th.sigma**2 * jnp.array([
         [1.0, rho],
         [rho, 1.0]
@@ -85,7 +86,7 @@ def cubic_proposal_fn(x: DState, u: jax.Array, th: DParams, t: float) -> jax.Arr
 
 @gen
 def linear_proposal_fn(x: DState, u: jax.Array, th: DParams, t: float) -> jax.Array:
-    rho = 0.8   # correlation coefficient, -1 <= rho <= 1
+    rho = th.rho   # correlation coefficient, -1 <= rho <= 1
     Sigma = th.sigma**2 * jnp.array([
         [1.0, rho],
         [rho, 1.0]
@@ -146,13 +147,17 @@ class Drone2DNav(ProblemDesc):
             # target = jnp.array([2., -2.]),
             gains = Gains(0.2, 0.05),
             obstacles = self.generate_obstacle_grid(5, 5, 0.1, 1),
-            collision_buffer = 0.3,
+            collision_buffer = 0.25,
             collision_multiplier = 1e3,
+            rho = 0.8
 
         )
-        x0 = DState(qpos=jnp.array([-4.0,3.0,0.8]), qvel=jnp.array([0.,0.,0.]))
+        theta = theta._replace(rho = config.rho)
 
-        x0 = DState(qpos=jnp.array([-4.0,-3.0,0.8]), qvel=jnp.array([0.,0.,0.]))
+
+        # x0 = DState(qpos=jnp.array([-4.0,3.0,0.8]), qvel=jnp.array([0.,0.,0.]))
+
+        x0 = DState(qpos=jnp.array([-4.5,-3.0,0.8]), qvel=jnp.array([0.,0.,0.]))
         # return th, x0
 
         return x0, u0, theta
@@ -211,16 +216,16 @@ class Drone2DNav(ProblemDesc):
         perr = jnp.dot(p,p) + x.qpos[2]**2
 
         d = x.qvel[:2]
-        derr = jnp.dot(d,d) + (x.qvel[2] * 0.001 )**2
+        derr = jnp.dot(d,d) #+ (x.qvel[2] * 0.001 )**2
 
-        sdf_vals = jax.vmap(lambda bounds: self.sdf_aabb(x.qpos[:2], bounds))(theta.obstacles)
+        sdf_vals = jax.vmap(lambda bounds: self.sdf_aabb(x.qpos, theta.half_length, bounds))(theta.obstacles)
         sdf_val = jnp.min(sdf_vals)
         obstacle_loss = theta.collision_multiplier * self.hinge_loss(sdf_val, theta.collision_buffer)
         # this is in-case `u.collision_multiplier == jnp.inf`
         obstacle_loss = jnp.nan_to_num(obstacle_loss, nan=0.0, posinf=jnp.inf, neginf=0.0)
 
         # return (obstacle_loss) ** 2
-        return (obstacle_loss) ** 2 + (theta.gains.kp*perr * (t + 1.0) / 160) + theta.gains.kd*derr
+        return (obstacle_loss) ** 2 + (theta.gains.kp*perr * ((t + 1.0) / 160.0)) + theta.gains.kd*derr * ((t + 1.0) / 160.0)
         # return theta.gains.kp*perr + theta.gains.kd*derr
 
 
@@ -242,9 +247,9 @@ class Drone2DNav(ProblemDesc):
         # obstacles.append(jnp.array([-3.5, -3.3, -1, 3]))
         # obstacles.append(jnp.array([-5.75, -1.5, -2.3, -2.1]))
         # obstacles.append(jnp.array([-0.1, 4, -2.3, -2.1]))
-        # obstacles.append(jnp.array([-6.0, -5.8, -6.0, 6.0]))
+        # obstacles.append(jnp.array([-5.0, -4.95, -5.0, 5.0]))
         # obstacles.append(jnp.array([3.9, 4.0, -6.0, 6.0]))
-        # obstacles.append(jnp.array([-6.0, 6.0, -6.0, -5.9]))
+        obstacles.append(jnp.array([-5.0, 5.0, -5.0, -4.9]))
         # obstacles.append(jnp.array([-6.0, 6.0, 3.9, 5.0]))
 
         obstacles.append(jnp.array([-3.5, -3.3, -6, -1]))
@@ -266,18 +271,35 @@ class Drone2DNav(ProblemDesc):
         #         ymax = ymin + box_size
         #         obstacles.append(jnp.array([xmin, xmax, ymin, ymax]))
         return jnp.stack(obstacles)
-        
 
     @partial(jax.jit, static_argnames=['self'])
-    def sdf_aabb(self, pos: jax.Array, bounds: jax.Array) -> float:
+    def segment_endpoints(self, xpos, half_length):
+        x, y, theta = xpos
+        # theta *= 0.0
+        dx = jnp.cos(theta) * half_length
+        dy = jnp.sin(theta) * half_length
+        p1 = jnp.array([x - dx, y - dy])
+        p2 = jnp.array([x + dx, y + dy])
+        return p1, p2
+
+
+    @partial(jax.jit, static_argnames=['self'])
+    def sdf_aabb(self, pos: jax.Array, half_length: jax.Array, bounds: jax.Array) -> float:
         xmin, xmax, ymin, ymax = bounds
         center = jnp.array([(xmin + xmax) / 2, (ymin + ymax) / 2])
         half_extents = jnp.array([(xmax - xmin) / 2, (ymax - ymin) / 2])
-        
-        d = jnp.abs(pos - center) - half_extents
-        outside_dist = jnp.linalg.norm(jnp.maximum(d, 0.0))
-        inside_dist = jnp.minimum(jnp.maximum(d[0], d[1]), 0.0)
-        return outside_dist + inside_dist
+
+        p1, p2 = self.segment_endpoints(pos, half_length * 0.8)
+
+        d1 = jnp.abs(p1 - center) - half_extents
+        d2 = jnp.abs(p2 - center) - half_extents
+        outside_dist1 = jnp.linalg.norm(jnp.maximum(d1, 0.0))
+        inside_dist1 = jnp.minimum(jnp.maximum(d1[0], d1[1]), 0.0)
+
+        outside_dist2 = jnp.linalg.norm(jnp.maximum(d2, 0.0))
+        inside_dist2 = jnp.minimum(jnp.maximum(d2[0], d2[1]), 0.0)
+
+        return jnp.minimum(outside_dist1 + inside_dist1, outside_dist2 + inside_dist2)
 
     @partial(jax.jit, static_argnames=['self'])
     def hinge_loss(self, sdf: float, epsilon: float) -> float:
@@ -335,6 +357,7 @@ class Drone2DNav(ProblemDesc):
 
         interval=1
         save_path = None
+        # save_path = "experiments/drone_nav_co/path.gif"
         fig, ax = plt.subplots()
         ax.set_xlim(-5, 5)
         ax.set_ylim(-5, 5)

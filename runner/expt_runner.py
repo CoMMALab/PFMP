@@ -67,13 +67,16 @@ class ExperimentRunner:
 
         """
 
-        self.x0 = None
-        self.theta = None
         self.mpc_model = None
 
         # Setting to 42 for the answer to everything
         self.key = jax.random.key(42)
 
+        self.problem = None
+        self.config = None
+        self.name = None
+        self.comments = None
+        self.results_dir = None
 
 
     def init_transition_model_mpc(self):
@@ -255,5 +258,5 @@ class ExperimentRunner:
 
 
         _atomic_write_json(payload, json_path, indent=2)
-        # print(f"  → saved {json_name} in {payload['meta']['elapsed_sec']:.2f}s")
-        # print(f"    cost = {results.metrics.average_cost}")
+        print(f"  → saved {json_name} in {payload['meta']['elapsed_sec']:.2f}s")
+        print(f"    cost = {results.metrics.average_cost}")
