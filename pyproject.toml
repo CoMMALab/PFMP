@@ -1,3 +1,6 @@
+[tool.setuptools]
+packages = ["pfmp", "runner"]
+
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
@@ -18,4 +21,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = [ "matplotlib", "PyQt5" ]
+test = [
+    "matplotlib",
+    "PyQt5",
+    "jax_dataclasses",
+    "yourdfpy",
+    "jaxls",
+    "jaxlie",
+    "pyroki @ git+https://github.com/chungmin99/pyroki.git@main"
+]
