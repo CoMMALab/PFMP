@@ -19,7 +19,7 @@ from jax.scipy.spatial.transform import Rotation
 from mujoco import mjx
 from typing import NamedTuple, Tuple
 from mujoco.viewer import launch_passive
-from pfmp.algorithm_spline import PFMP, make_transition_model
+from pfmp import PFMP, make_transition_model
 
 
 # ===============================

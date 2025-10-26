@@ -1,6 +1,5 @@
 from typing import NamedTuple
-from pfmp import hermite_spline
-from pfmp.algorithm_spline import PFMP, make_transition_model
+from pfmp import PFMP, make_transition_model
 from genjax import gen, normal
 import jax
 import jax.numpy as jnp
@@ -9,8 +8,6 @@ import matplotlib.pyplot as plt
 import time
 matplotlib.use('Qt5Agg')
 
-
-# GOAL: make this file work
 
 class ParParams(NamedTuple):
     u_stdev: float
@@ -72,8 +69,8 @@ def test_sis():
     sampled_idxs = jax.random.choice(key, p.shape[0], shape=(10,), p=p)
 
     # Use those indices to grab trajectories
-    first_10 = trajs.u[:10,:,:,0]  # shape (10, 4, 200)
-    # first_10 = trajs.u[sampled_idxs, :, :, 0]  # shape (10, 4, 200)
+    # first_10 = trajs[:10,:,:,0]  # shape (10, 4, 200)
+    first_10 = trajs[sampled_idxs, :, :, 0]  # shape (10, 4, 200)
 
     fig, ax = plt.subplots(figsize=(14, 6))
 
@@ -135,7 +132,7 @@ def test_sir():
             print(f"sample_forward (after jit): {t1 - t0}")
 
     # first_10 = trajs.u[:10,:,:,0]  # shape (10, 4, 200)
-    first_10 = pfmp.choose_paths(states, ancestors, jnp.arange(10)).u[:,:,:,0]
+    first_10 = pfmp.choose_paths(states, ancestors, jnp.arange(10))[:,:,:,0]
 
     fig, ax = plt.subplots(figsize=(14, 6))
 

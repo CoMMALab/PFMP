@@ -14,8 +14,24 @@ dependencies = [
     "jax[cuda12]",
     "genjax",
     "mujoco",
-    "mujoco-mjx"
+    "mujoco-mjx",
+    "warp-lang"
 ]
 
+[tool.setuptools.packages.find]
+# Only include the pfmp package, exclude experiments
+include = ["pfmp*"]
+exclude = ["experiments*", "tests*"]
+
 [project.optional-dependencies]
-test = [ "matplotlib", "PyQt5" ]
+test = [
+    "matplotlib",
+    "PyQt5",
+    "jax_dataclasses",
+    "yourdfpy",
+    "jaxls",
+    "jaxlie",
+    "pyroki @ git+https://github.com/chungmin99/pyroki.git@main",
+    # "hydrax @ git+https://github.com/vincekurtz/hydrax.git"
+    # "dial-mpc @ git+https://github.com/LeCAR-Lab/dial-mpc.git",
+]

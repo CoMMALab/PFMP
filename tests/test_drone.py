@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 from typing import NamedTuple, Tuple
 from genjax import gen, mv_normal
-from pfmp.algorithm_spline import PFMP, make_transition_model
+from pfmp import PFMP, make_transition_model
 
 
 class Gains(NamedTuple):

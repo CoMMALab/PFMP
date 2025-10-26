@@ -1,6 +1,5 @@
 from typing import NamedTuple
-from pfmp import hermite_spline
-from pfmp.algorithm_spline import PFMP, make_transition_model
+from pfmp import PFMP, make_transition_model
 from genjax import gen, mv_normal_diag, mv_normal
 import jax
 import jax.numpy as jnp

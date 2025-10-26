@@ -3,17 +3,16 @@ import jax.numpy as jnp
 import mujoco
 import matplotlib.pyplot as plt
 import time
-import os, math, pickle, itertools, time, traceback
+import os, itertools, time, traceback
 import numpy as np
 
 from genjax import gen, mv_normal
-from pfmp.algorithm_spline import make_transition_model, PFMP
-from pfmp.interpolate import hermite_spline
+from pfmp import make_transition_model, PFMP
 from mujoco import mjx
 from typing import NamedTuple, Type
 from mujoco.viewer import launch_passive
 from pathlib import Path
-from typing import Sequence, Tuple, Any, Iterable
+from typing import Sequence, Tuple, Any
 from collections import OrderedDict
 from matplotlib.lines import Line2D
 
@@ -228,6 +227,10 @@ def save_trajs_npz_named(trajs: Any, path) -> None:
     """
     If `trajs` is a NamedTuple, save fields by name.
     """
+    # Ensure parent directory exists
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    
     arrays = {}
     for f in trajs._fields:
         arrays[f] = np.asarray(getattr(trajs, f))
@@ -523,15 +526,6 @@ def test_mjx():
     # t = 0
     x = x0
 
-import os
-def load_mj(name: str):
-    os.chdir("tests/mjx_mod/assets")
-    with open(f"{name}.xml", 'r') as f:
-        xml = f.read()
-
-    mj_model = mujoco.MjModel.from_xml_string(xml)
-    mj_data = mujoco.MjData(mj_model)
-    return (mj_model, mj_data)
 
 if __name__ == "__main__":
     # test_mjx()
@@ -542,8 +536,8 @@ if __name__ == "__main__":
     print(f"d_space: {d_space}")
     print(f"hl_space: {hl_space}")
     print(f"s_space: {s_space}")
-    # evaluate_mjx("experiments/spline_grid", "inverted_double_pendulum", k_space, d_space, hl_space, s_space)
-    # exit()
+    evaluate_mjx("experiments/spline_grid", "inverted_double_pendulum", k_space, d_space, hl_space, s_space)
+    exit()
 
 
     # Replay
@@ -590,6 +584,8 @@ if __name__ == "__main__":
     # evaluate_mjx(results_dir, name, [k], [deg], [[h,l]], [sigma])
 
     results_dir = "experiments/spline_grid"
+    if not os.path.exists(results_dir):
+        os.makedirs(results_dir)
     results_map = {}
 
     for filename in os.listdir(results_dir):
