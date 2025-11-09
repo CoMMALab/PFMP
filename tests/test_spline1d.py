@@ -113,8 +113,6 @@ def test_sis():
     plt.tight_layout()
     plt.show()
 
-
-
 def test_sir():
     model_t = make_transition_model(transition_fn, cost_fn, l = L)
     pfmp = PFMP(model_t)
@@ -172,26 +170,6 @@ def test_sir():
     ax.set_xlabel("Time step")
     ax.set_ylabel("Control (u)")
     ax.grid(axis='x', visible=True)
-    plt.tight_layout()
-    plt.show()
-
-def cl(t, x, freq=3.0, sharpness=20.0):
-    y1 = 1.0 - jnp.exp(-sharpness * jnp.sin(jnp.pi * freq * (t - x))**2)
-    y2 = 1.0 - jnp.exp(-sharpness * jnp.sin(jnp.pi * freq * (t + x))**2)
-    return y1 * y2  # Peak at diamond centers
-
-def test_soft_lattice():
-    t = jnp.linspace(-3, 3, 400)
-    x = jnp.linspace(-3, 3, 400)
-    T, X = jnp.meshgrid(t, x)
-
-    Z = cl(T, X, freq=0.33, sharpness=5.0)
-
-    plt.imshow(Z, extent=[-3, 3, -3, 3], origin='lower', cmap='viridis')
-    plt.colorbar(label="fence(t, x)")
-    plt.title("Smooth Chain-Link Fence Function")
-    plt.xlabel("t")
-    plt.ylabel("x")
     plt.tight_layout()
     plt.show()
 

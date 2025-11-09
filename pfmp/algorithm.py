@@ -1,7 +1,6 @@
 import jax
 import jax.numpy as jnp
 import genjax
-import numpy as np
 
 from functools import partial
 from genjax import gen, ChoiceMapBuilder as C
@@ -49,17 +48,6 @@ def get_field_info(x):
 
     raise TypeError(f"Unsupported state type: {type(x)}")
 
-
-
-def make_zoh_model(mpc_transition, mpc_cost):
-
-    @gen
-    def transition_model(x: PyTree, theta: PyTree, t: int) -> PyTree:
-        new_x = mpc_transition(x, theta, t) @ "MPC transition"
-        genjax.bernoulli(-mpc_cost(new_x, theta, t + 1)) @ "O"
-        return new_x
-
-    return transition_model
 
 def make_transition_model(
         mpc_proposal,
