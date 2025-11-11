@@ -1,6 +1,5 @@
 from typing import NamedTuple
-from pfmp import PFMP, make_transition_model
-from genjax import gen, normal
+from pfmp import PFMP
 import jax
 import jax.numpy as jnp
 import matplotlib
@@ -14,18 +13,18 @@ class ParParams(NamedTuple):
     du_stdev: float
     ddu_stdev: float
 
-@gen
-def transition_fn(x: jax.Array, u: jax.Array, theta: ParParams, t: int) -> jax.Array:
-    pred_u = normal(0., theta.u_stdev) @ "u"
-    pred_du = normal(0., theta.du_stdev) @ "du"
-    pred_ddu = normal(0., theta.ddu_stdev) @ "ddu"
-    # return jnp.array([pred_u])                   # linear
-    # return jnp.array([pred_u, pred_du])          # cubic
-    return jnp.array([pred_u, pred_du, pred_ddu])  # quintic
+def mpc_dynamics(x, u, theta, t):
+    return (u, u)
 
-@jax.jit
-def cost_fn(x: jax.Array, u: jax.Array, theta: ParParams, t: float) -> float:
-    return (jnp.sin(2*jnp.pi*t/H) - x[0]) ** 2
+def mpc_cost(x, u, theta, t):
+    return (jnp.sin(2*jnp.pi*t/0.8) - x[0]) ** 2
+
+def mpc_proposal(key, x, u, theta, t):
+    keys = jax.random.split(key, 3)
+    pred_u = jax.random.normal(keys[0]) * theta.u_stdev
+    pred_du = jax.random.normal(keys[1]) * theta.du_stdev
+    pred_ddu = jax.random.normal(keys[2]) * theta.ddu_stdev
+    return jnp.array([pred_u, pred_du, pred_ddu])  # quintic
 
 def init():
     # x0 = jnp.array([0.])          # linear
@@ -44,24 +43,33 @@ def init():
 K, H, L = 1000, 4, 100
 
 def test_sis():
-    model_t = make_transition_model(transition_fn, cost_fn, l = L)
-    pfmp = PFMP(model_t)
+    # model_t = make_transition_model(transition_fn, cost_fn, l = L)
+    # pfmp = PFMP(model_t)
+    # pfmp = Spline1DController()
+    # pfmp = PFMP(
+    #     mpc_dynamics, mpc_cost, mpc_proposal,
+    #     horizon=H, particles=K, steps_per_knot=L)
+    horizon = 0.8
+    particles = 1000
+    num_knots = 5
+
+    pfmp = PFMP(
+        mpc_dynamics, mpc_cost, mpc_proposal,
+        horizon=0.8, particles=K, num_knots=5)
     (x0, u0, theta) = init()
 
     key = jax.random.key(42)
-    j_run_sis = jax.jit(pfmp.run_sis, static_argnames=['h', 'k'])
     for i in range(5):
         t0 = time.time()
-        (trajs, scores) = jax.block_until_ready(j_run_sis(key, x0, u0, theta, H, K))
+        (trajs, scores) = pfmp.run_sis(key, x0, u0, theta)
         t1 = time.time()
         if i == 0:
             print(f"sample_forward (first run): {t1 - t0}")
         else:
             print(f"sample_forward (after jit): {t1 - t0}")
 
-
     # Unnormalized log-weights
-    log_w = scores - jax.scipy.special.logsumexp(scores)
+    log_w = jnp.sum(scores, axis=-1) - jax.scipy.special.logsumexp(jnp.sum(scores, axis=-1))
     p = jnp.exp(log_w)
 
     # Draw 10 weighted indices from categorical distribution
@@ -71,6 +79,7 @@ def test_sis():
     # Use those indices to grab trajectories
     # first_10 = trajs[:10,:,:,0]  # shape (10, 4, 200)
     first_10 = trajs[sampled_idxs, :, :, 0]  # shape (10, 4, 200)
+    print(first_10.shape)
 
     fig, ax = plt.subplots(figsize=(14, 6))
 
@@ -114,15 +123,18 @@ def test_sis():
     plt.show()
 
 def test_sir():
-    model_t = make_transition_model(transition_fn, cost_fn, l = L)
-    pfmp = PFMP(model_t)
+    # model_t = make_transition_model(transition_fn, cost_fn, l = L)
+    # pfmp = Spline1DController()
+    pfmp = PFMP(
+        mpc_dynamics, mpc_cost, mpc_proposal,
+        horizon=0.8, particles=K, num_knots=5)
     (x0, u0, theta) = init()
 
     key = jax.random.key(42)
-    j_run_sir = jax.jit(pfmp.run_sir, static_argnames=['h', 'k', 'rho'])
     for i in range(5):
         t0 = time.time()
-        (states, ancestors) = jax.block_until_ready(j_run_sir(key, x0, u0, theta, H, K, 0.8))
+        # (states, ancestors) = pfmp.run_sir(key, x0, u0, theta)
+        trajs, scores = pfmp.run_sir(key, x0, u0, theta)
         t1 = time.time()
         if i == 0:
             print(f"sample_forward (first run): {t1 - t0}")
@@ -130,7 +142,8 @@ def test_sir():
             print(f"sample_forward (after jit): {t1 - t0}")
 
     # first_10 = trajs.u[:10,:,:,0]  # shape (10, 4, 200)
-    first_10 = pfmp.choose_paths(states, ancestors, jnp.arange(10))[:,:,:,0]
+    # first_10 = pfmp.choose_paths(states, ancestors, jnp.arange(10))[:,:,:,0]
+    first_10 = trajs[:10,:,:,0]
 
     fig, ax = plt.subplots(figsize=(14, 6))
 
