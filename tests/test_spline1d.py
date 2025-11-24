@@ -1,5 +1,6 @@
 from typing import NamedTuple
 from pfmp import PFMP
+from pfmp.interpolate import Jet3
 import jax
 import jax.numpy as jnp
 import matplotlib
@@ -13,34 +14,40 @@ class ParParams(NamedTuple):
     du_stdev: float
     ddu_stdev: float
 
-def mpc_dynamics(x, u, theta, t):
-    return (u, u)
+def mpc_dynamics(x, u: jax.Array, theta, t):
+    return (u.u[0], u)
 
 def mpc_cost(x, u, theta, t):
-    return (jnp.sin(2*jnp.pi*t/0.8) - x[0]) ** 2
+    return (jnp.sin(2*jnp.pi*t/4.0) - x) ** 2
+
+terminal_cost = lambda _x, _th: 0.
 
 def mpc_proposal(key, x, u, theta, t):
     keys = jax.random.split(key, 3)
     pred_u = jax.random.normal(keys[0]) * theta.u_stdev
     pred_du = jax.random.normal(keys[1]) * theta.du_stdev
     pred_ddu = jax.random.normal(keys[2]) * theta.ddu_stdev
-    return jnp.array([pred_u, pred_du, pred_ddu])  # quintic
+    return Jet3(pred_u, pred_du, pred_ddu)
 
 def init():
     # x0 = jnp.array([0.])          # linear
     # x0 = jnp.array([0., 0.])      # cubic
-    x0 = jnp.array([0., 0., 0.])  # quintic
-    u0 = x0
+    # x0 = jnp.array([0., 0., 0.])  # quintic
+    x0 = 0.
+    u0 = Jet3(0., 0., 0.)
 
     theta = ParParams(
-        u_stdev = 0.5,
-        du_stdev = 0.5,
+        u_stdev = 1.0,
+        du_stdev = 2.0,
         ddu_stdev = 0.5
     )
 
     return (x0, u0, theta)
 
-K, H, L = 1000, 4, 100
+# K, H, L = 10000, 4, 100
+horizon = 4.0
+particles = 100000
+num_knots = 5
 
 def test_sis():
     # model_t = make_transition_model(transition_fn, cost_fn, l = L)
@@ -49,13 +56,10 @@ def test_sis():
     # pfmp = PFMP(
     #     mpc_dynamics, mpc_cost, mpc_proposal,
     #     horizon=H, particles=K, steps_per_knot=L)
-    horizon = 0.8
-    particles = 1000
-    num_knots = 5
 
     pfmp = PFMP(
-        mpc_dynamics, mpc_cost, mpc_proposal,
-        horizon=0.8, particles=K, num_knots=5)
+        mpc_dynamics, mpc_cost, terminal_cost, mpc_proposal,
+        horizon, num_knots, particles)
     (x0, u0, theta) = init()
 
     key = jax.random.key(42)
@@ -72,53 +76,61 @@ def test_sis():
     log_w = jnp.sum(scores, axis=-1) - jax.scipy.special.logsumexp(jnp.sum(scores, axis=-1))
     p = jnp.exp(log_w)
 
-    # Draw 10 weighted indices from categorical distribution
-    key = jax.random.key(0)
-    sampled_idxs = jax.random.choice(key, p.shape[0], shape=(10,), p=p)
+    # ------------------------
+    # 1. Sample trajectories
+    # ------------------------
+    nsamples = 10
+    idxs = jax.random.choice(key, p.shape[0], shape=(nsamples,), p=p)
+    U = trajs.u[idxs, ..., 0]        # (nsamples, nseg, seglen)
 
-    # Use those indices to grab trajectories
-    # first_10 = trajs[:10,:,:,0]  # shape (10, 4, 200)
-    first_10 = trajs[sampled_idxs, :, :, 0]  # shape (10, 4, 200)
-    print(first_10.shape)
+    ns, nseg, seglen = U.shape
+    assert nseg == num_knots - 1, "Inconsistent num_knots vs trajectory shape"
 
-    fig, ax = plt.subplots(figsize=(14, 6))
-
-    segment_length = first_10.shape[-1]  # 200
-    num_segments = first_10.shape[1]     # 4
-    num_samples = first_10.shape[0]      # 10
-    total_length = segment_length * num_segments
-
-    # === 1. Define a grid over time and control values ===
-    t_grid = jnp.linspace(0, total_length - 1, 800)
+    # ------------------------
+    # 2. Cost background grid
+    # ------------------------
+    t_grid = jnp.linspace(0, horizon, 800)
     u_grid = jnp.linspace(-2, 2, 200)
-    T, U = jnp.meshgrid(t_grid, u_grid)
 
-    # === 2. Evaluate cost_fn: cost = -u / 20 ===
-    cost_grid = (jnp.sin(2 * jnp.pi * T / (H*L)) - U) ** 2  # shape (200, 800)
+    T, Umesh = jnp.meshgrid(t_grid, u_grid)
+    cost_grid = mpc_cost(x=Umesh, u=None, theta=None, t=T)
 
-    # === 3. Plot cost background as colormap ===
+    # ------------------------
+    # 3. Plot cost heatmap
+    # ------------------------
+    fig, ax = plt.subplots(figsize=(14, 6))
     ax.imshow(
         cost_grid,
-        extent=[0, total_length, u_grid[0], u_grid[-1]],
+        extent=[0, horizon, u_grid[0], u_grid[-1]],
         origin='lower',
         aspect='auto',
         cmap='Greys_r',
         alpha=1.0
     )
 
-    # === 4. Plot interpolated control trajectories ===
-    for i in range(num_samples):
-        for j in range(num_segments):
-            t = jnp.arange(segment_length) + j * segment_length
-            y = first_10[i, j]
-            ax.plot(t, y, color="magenta", alpha=0.5, ls="dotted", lw=2)
-            ax.scatter(t[0], y[0], color="magenta", s=100)
+    # ------------------------
+    # 4. Plot sampled spline controls
+    # ------------------------
+    # Each Hermite segment spans dt = horizon / (num_knots - 1)
+    dt = pfmp.dt
 
-    ax.set_title("Hermite-Interpolated Control with Cost Gradient (-u / 20)")
-    ax.set_xticks([t*L for t in range(H+1)])
-    ax.set_xlabel("Time step")
-    ax.set_ylabel("Control (u)")
-    ax.grid(axis='x', visible=True)
+    nseg = num_knots - 1
+    dt = horizon / nseg               # physical segment duration
+    sample_dt = dt / seglen           # time between discrete samples
+
+    for i in range(ns):
+        for j in range(nseg):
+            # Rescaled time positions inside the horizon
+            t_local = j * dt + jnp.arange(seglen) * sample_dt
+            y_local = U[i, j]
+            ax.plot(t_local, y_local, color="magenta",
+                    alpha=0.5, ls="dotted", lw=2)
+            ax.scatter(t_local[0], y_local[0], color="magenta", s=40)
+
+    ax.set_title("Sampled Control Trajectories with MPC Cost Background")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Control u")
+    ax.grid(axis="x", visible=True)
     plt.tight_layout()
     plt.show()
 
@@ -126,8 +138,8 @@ def test_sir():
     # model_t = make_transition_model(transition_fn, cost_fn, l = L)
     # pfmp = Spline1DController()
     pfmp = PFMP(
-        mpc_dynamics, mpc_cost, mpc_proposal,
-        horizon=0.8, particles=K, num_knots=5)
+        mpc_dynamics, mpc_cost, terminal_cost, mpc_proposal,
+        horizon, num_knots, particles)
     (x0, u0, theta) = init()
 
     key = jax.random.key(42)
@@ -143,49 +155,57 @@ def test_sir():
 
     # first_10 = trajs.u[:10,:,:,0]  # shape (10, 4, 200)
     # first_10 = pfmp.choose_paths(states, ancestors, jnp.arange(10))[:,:,:,0]
-    first_10 = trajs[:10,:,:,0]
+    U = trajs.u[:10,:,:,0]
+    ns, nseg, seglen = U.shape
+    assert nseg == num_knots - 1, "Inconsistent num_knots vs trajectory shape"
 
-    fig, ax = plt.subplots(figsize=(14, 6))
-
-    segment_length = first_10.shape[-1]  # 200
-    num_segments = first_10.shape[1]     # 4
-    num_samples = first_10.shape[0]      # 10
-    total_length = segment_length * num_segments
-
-    # === 1. Define a grid over time and control values ===
-    t_grid = jnp.linspace(0, total_length - 1, 800)
+    # ------------------------
+    # 2. Cost background grid
+    # ------------------------
+    t_grid = jnp.linspace(0, horizon, 800)
     u_grid = jnp.linspace(-2, 2, 200)
-    T, U = jnp.meshgrid(t_grid, u_grid)
 
-    # === 2. Evaluate cost_fn: cost = -u / 20 ===
-    cost_grid = (jnp.sin(2 * jnp.pi * T / (H*L)) - U) ** 2  # shape (200, 800)
+    T, Umesh = jnp.meshgrid(t_grid, u_grid)
+    cost_grid = mpc_cost(x=Umesh, u=None, theta=None, t=T)
 
-    # === 3. Plot cost background as colormap ===
+    # ------------------------
+    # 3. Plot cost heatmap
+    # ------------------------
+    fig, ax = plt.subplots(figsize=(14, 6))
     ax.imshow(
         cost_grid,
-        extent=[0, total_length, u_grid[0], u_grid[-1]],
+        extent=[0, horizon, u_grid[0], u_grid[-1]],
         origin='lower',
         aspect='auto',
         cmap='Greys_r',
         alpha=1.0
     )
 
-    # === 4. Plot interpolated control trajectories ===
-    for i in range(num_samples):
-        for j in range(num_segments):
-            t = jnp.arange(segment_length) + j * segment_length
-            y = first_10[i, j]
-            ax.plot(t, y, color="magenta", alpha=0.5, ls="dotted", lw=2)
-            ax.scatter(t[0], y[0], color="magenta", s=100)
+    # ------------------------
+    # 4. Plot sampled spline controls
+    # ------------------------
+    # Each Hermite segment spans dt = horizon / (num_knots - 1)
+    dt = pfmp.dt
 
-    ax.set_title("Hermite-Interpolated Control with Cost Gradient (-u / 20)")
-    ax.set_xticks([t*L for t in range(H+1)])
-    ax.set_xlabel("Time step")
-    ax.set_ylabel("Control (u)")
-    ax.grid(axis='x', visible=True)
+    nseg = num_knots - 1
+    dt = horizon / nseg               # physical segment duration
+    sample_dt = dt / seglen           # time between discrete samples
+
+    for i in range(ns):
+        for j in range(nseg):
+            # Rescaled time positions inside the horizon
+            t_local = j * dt + jnp.arange(seglen) * sample_dt
+            y_local = U[i, j]
+            ax.plot(t_local, y_local, color="magenta",
+                    alpha=0.5, ls="dotted", lw=2)
+            ax.scatter(t_local[0], y_local[0], color="magenta", s=40)
+
+    ax.set_title("Sampled Control Trajectories with MPC Cost Background")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Control u")
+    ax.grid(axis="x", visible=True)
     plt.tight_layout()
     plt.show()
-
 
 if __name__ == "__main__":
     test_sis()

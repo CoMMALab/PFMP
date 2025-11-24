@@ -1,26 +1,18 @@
-from typing import NamedTuple
-from pfmp import PFMP, make_transition_model
-from genjax import gen, normal
 import jax
 import jax.numpy as jnp
-import matplotlib
+from typing import NamedTuple
+from pfmp import PFMP
+from pfmp.interpolate import Jet2
 import matplotlib.pyplot as plt
-import time
-matplotlib.use('Qt5Agg')
 
 
-class StateTracker(NamedTuple):
-    delta: jax.Array
-    location: jax.Array
-
-class ObstacleGridParams(NamedTuple):
-    goal: jax.Array
-    obstacles: jax.Array
-    heading_nominal: jax.Array
-    heading_stdev: float
-    speed: float
-    collision_buffer: float
-    collision_multiplier: float
+class Params(NamedTuple):
+    goal: jax.Array           # Desired position
+    obstacles: jax.Array      # ObstacleGrid
+    L: float                  # wheelbase (m)
+    v: float                  # forward speed (m/s)
+    du_stdev: float           # tangent noise
+    u_stdev: float            # point noise (local jitter)
 
 def generate_obstacle_grid(num_x: int, num_y: int, box_size: float, gap: float):
     """ Generate a regular grid of AABB obstacles.
@@ -59,68 +51,52 @@ def sdf_aabb(pos: jax.Array, bounds: jax.Array) -> float:
 def hinge_loss(sdf: float, epsilon: float) -> float:
     return jnp.where(sdf < epsilon, 0.5 * (epsilon - sdf) ** 2, 0.0)
 
-# @gen
-# def proposal_fn(state: jax.Array, u: jax.Array, th: ObstacleGridParams, t: int) -> jax.Array:
-#     delta = normal(0., th.heading_stdev) @ "delta"
-#     return jnp.array([delta])
-
-# def dynamics_fn(x: jax.Array, u: jax.Array, th: ObstacleGridParams, t: float) -> tuple[jax.Array, StateTracker]:
-#     delta = u[0]
-#     heading = th.heading_nominal[t.astype(int)] + delta
-#     direction = jnp.array([jnp.cos(heading), jnp.sin(heading)])
-#     x += th.speed * direction
-#     y = StateTracker(
-#         delta = heading - th.heading_nominal[t.astype(int)],
-#         location = x
-#     )
-#     return x, y
-@gen
-def proposal_fn(state: jax.Array, u: jax.Array, th: ObstacleGridParams, t: int) -> jax.Array:
-    # Sample a heading offset
-    delta = normal(0., th.heading_stdev) @ "delta"
-    theta = th.heading_nominal[t] + delta
-
-    # Direction unit vector
-    direction = jnp.array([jnp.cos(theta), jnp.sin(theta)])  # (2,)
-
-    # Position = surface point
-    pos = state + th.speed * direction  # (2,)
-    # Velocity = constant radial speed
-    vel = th.speed * direction  # (2,)
-
-    # Package as 2×2 array
-    return jnp.stack([pos, vel], axis=0)  # shape (2,2)
-
-
-def dynamics_fn(_: jax.Array, u: jax.Array, th: ObstacleGridParams, t: float) -> tuple[jax.Array, StateTracker]:
-    # Just copy the proposal’s position
-    pos = u[0]   # (2,)
-    vel = u[1]   # (2,)
-
-    y = StateTracker(
-        delta = jnp.arctan2(vel[1], vel[0]) - th.heading_nominal[t.astype(int)],
-        location = pos
-    )
-    # Return 2×2 array [[x,y],[vx,vy]]
-    return pos, y
-
-@jax.jit
-def cost_fn(y: StateTracker, u, th, t: int) -> float:
-    loc = y.location
+def cost_fn(x: jax.Array, u: jax.Array, th: Params, t: float) -> float:
+    loc = x[:2]
     sdf_vals = jax.vmap(lambda bounds: sdf_aabb(loc, bounds))(th.obstacles)
     sdf_val = jnp.min(sdf_vals)
-    obstacle_loss = th.collision_multiplier * hinge_loss(sdf_val, th.collision_buffer)
+    obstacle_loss = 100. * hinge_loss(sdf_val, 0.25)
     # this is in-case `u.collision_multiplier == jnp.inf`
     obstacle_loss = jnp.nan_to_num(obstacle_loss, nan=0.0, posinf=jnp.inf, neginf=0.0)
-    goal_loss = t * jnp.linalg.norm(loc - th.goal)
+    goal_loss = jnp.linalg.norm(loc - th.goal) / 10.
     return obstacle_loss**2 + goal_loss**2
 
-def plot_goal(goal):
-    plt.plot(goal[0], goal[1], marker='*', markersize=30, c='green')
+def terminal_cost(x, th) -> float:
+    loc = x[:2]
+    return 10 * jnp.linalg.norm(loc - th.goal) ** 2
 
-def plot_obstacles(obstacles, color='black'):
+def dynamics(x: jax.Array, u: jax.Array, theta: Params, t):
+    """
+    x: [px, py, theta]
+    j: Jet2(u, du) where u is steering angle δ
+    """
+    px, py, th = x
+    L, v = theta.L, theta.v
+    
+    px_next = px + v * jnp.cos(th) * 0.01
+    py_next = py + v * jnp.sin(th) * 0.01
+    th_next = th + (v / L) * jnp.tan(u) * 0.01
+
+    th_next = jnp.mod(th_next + jnp.pi, 2 * jnp.pi) - jnp.pi
+
+    x_next = jnp.array([px_next, py_next, th_next])
+    return (x_next, x_next)
+
+def proposal(key, _x, _u: float, theta: Params, t):
+    """
+    key: PRNGKey
+    x: state (ignored)
+    u = current steering angle and rate
+    theta: Params
+    """
+
+    u_next = jax.random.normal(key) * theta.u_stdev
+    u_bound = 0.8
+    u_next = jnp.clip(u_next, -u_bound, u_bound)
+    return u_next
+
+def plot_obstacles(ax, obstacles, color='black'):
     """Plot a list of AABB obstacles."""
-    ax = plt.gca()
     for obs in obstacles:
         xmin, xmax, ymin, ymax = obs
         width = xmax - xmin
@@ -129,216 +105,95 @@ def plot_obstacles(obstacles, color='black'):
                              edgecolor=color, facecolor='black', linewidth=1)
         ax.add_patch(rect)
 
-def plot_locations(locs):
-    K = locs.shape[0]
-    for i in range(K):
-        plt.plot(locs[i,:,0], locs[i,:,1], linestyle='--', color='black', alpha=0.3)
-        plt.scatter(locs[i,:,0], locs[i,:,1], color='black', s=10)
-
-def init(H: int):
-    x0 = jnp.array([0., 0.])
-
-    th = ObstacleGridParams(
-        goal = jnp.array([1.25, 1.25]),
-        obstacles = generate_obstacle_grid(5, 5, 0.1, 0.1) + 0.2,
-        heading_nominal = jnp.full(H, jnp.pi/4),
-        heading_stdev = 1.0,
-        speed = 0.05 * L,
-        # collision_buffer = 0.03,
-        collision_buffer = 0.075,
-        collision_multiplier = 2000.
+if __name__ == "__main__":
+    horizon = 10
+    num_knots = int(2*horizon)
+    particles = 128
+    pfmp = PFMP(dynamics, cost_fn, terminal_cost, proposal,
+                horizon, num_knots, particles,
+                ess_resample_thresh=0.5)
+    x0 = jnp.zeros(3)
+    # u0 = Jet2(0., 0.)
+    u0 = 0.0
+    theta = Params(
+        goal = jnp.array([12.0, 12.0]),
+        obstacles = generate_obstacle_grid(5, 5, 1.0, 1.0) + 1.0,
+        L=0.3,          # typical wheelbase for normalized bicycle model
+        v=2.0,          # moderate forward speed (m/s)
+        du_stdev=0.1,  # tangent noise — gives gentle arc variation
+        u_stdev=0.2    # tiny point jitter — stabilizes proposal
     )
 
-    return (x0, th)
+    key = jax.random.key(1)
+    trajs, scores = pfmp.run_sir(key, x0, u0, theta)
+    print(scores.shape)
+    print(scores[:10,-1])
+    # print(final_costs)
+    # exit()
+    trajs = trajs.reshape(particles, -1, 3)
+    # for i in range(len(trajs)):
+    #     plt.plot(trajs[i,:,0], trajs[i,:,1], c="magenta", alpha=0.5)
 
-# K = num particles, H = horizon, L = grid sample resolution
-K, H, L = 100000, 8, 5
-RHO = 0.8
+    # plt.show()
+    import matplotlib.patches as patches
+    import matplotlib.transforms as transforms
 
-def test_pfmp():
-    model = make_transition_model(proposal_fn, cost_fn, dynamics_fn, l=L)
-    pfmp = PFMP(model)
-    (x0, th) = init(H)
-    u0 = jnp.array([[0.,0.], [0.,0.]])
+    car_length = theta.L
+    car_width  = theta.L/2
 
-    key = jax.random.key(42)
-    for i in range(5):
-        t0 = time.time()
-        (key, subkey) = jax.random.split(key)
-        (states, ancestors) = pfmp.run_sir(subkey, x0, u0, th, H, K, RHO)
-        t1 = time.time()
-        if i == 0:
-            print(f"sample_forward (first run): {t1 - t0}")
-        else:
-            print(f"sample_forward (after jit): {t1 - t0}")
+    ax = plt.gca()
 
-    # print(states.delta.shape)
-    # print(states.location.shape)
+    xs = jnp.linspace(0, 12, 200)
+    ys = jnp.linspace(0, 12, 200)
+    X, Y = jnp.meshgrid(xs, ys)
 
-    assert states.delta.shape == (H,K,L)
-    assert states.location.shape == (H,K,L,2)
-    assert ancestors.shape == (H,K)
+    # Flatten for vectorization
+    points = jnp.stack([X.ravel(), Y.ravel()], axis=1)
 
-    (key, subkey) = jax.random.split(key)
-    n_samples = 100
+    # Wrap cost_fn so it only depends on position
+    def cost_at_loc(loc):
+        # Build a dummy x and u consistent with your system
+        x = loc  # fill in based on your state dimension
+        u = jnp.zeros(1)                          # fill in based on your control dimension
+        return cost_fn(x, u, theta, t=0.0)
 
-    trajs = pfmp.choose_paths(states, ancestors, jnp.arange(n_samples))
-    # mat_costs = PFMP.project_costs(cost_fn, trajs, th)
+    cost_vmap = jax.vmap(cost_at_loc)
+    Z = cost_vmap(points).reshape(X.shape)
 
-    # total_costs = mat_costs.reshape(n_samples, -1).sum(axis=1)
-    # map_idx = jnp.argmin(total_costs)
-    # map_traj = jax.tree.map(lambda x: x[map_idx], trajs)
-    # map_cost = total_costs[map_idx]
-    # print(f"MAP Trajectory: {map_traj}")
-    # print(f"MAP cost: {map_cost}")
+    ax.contourf(X, Y, Z, levels=50)
 
-    # assert map_cost == jnp.sum(PFMP.project_cost(cost_fn, map_traj, th))
-    # trajs = jax.tree.map(lambda x: x[jnp.array([map_idx])], trajs)
+    plot_obstacles(ax, theta.obstacles)
 
-    plot_goal(th.goal)
-    plot_obstacles(th.obstacles)
-    # print(trajs.location.shape)
-    locs = trajs.location.reshape(n_samples,-1,2)
-    print(locs.shape)
-    plot_locations(locs)
+    interval_len = horizon / (num_knots - 1)
+    steps_per_knot = round(interval_len / pfmp.dt)
+    best_idx = jnp.argmax(jnp.sum(scores, axis=-1))
+    for i in range(20):
+        plt.plot(trajs[i,:,0], trajs[i,:,1], c="magenta", alpha=0.5)
 
+        for t in range(0, trajs.shape[1], steps_per_knot):  # every 5 steps
+            x, y, th = trajs[i, t]
+
+            # Create a rectangle centered at (0,0)
+            rect = patches.Rectangle(
+                (-car_length/2, -car_width/2),  # center the box
+                car_length,
+                car_width,
+                facecolor="cyan",
+                edgecolor="black",
+                alpha=1.0,
+                zorder=5
+            )
+
+            # Build the transform: rotate, then translate
+            trans = transforms.Affine2D()
+            trans.rotate(th)
+            trans.translate(x, y)
+
+            rect.set_transform(trans + ax.transData)
+            ax.add_patch(rect)
+    plt.plot(trajs[best_idx,:,0], trajs[best_idx,:,1], c="gold", lw=3, alpha=1)
+
+    plt.axis("equal")
     plt.show()
 
-def test_mppi():
-    model = make_transition_model(proposal_fn, cost_fn, dynamics_fn, l=L)
-    mppi = PFMP(model)
-    (x0, th) = init(H)
-    u0 = jnp.array([[0.,0.], [0.,0.]])
 
-    n_iters = 30
-    init_stdev = 0.05
-
-    # MPPI does better with a higher multiplier
-    th = th._replace(collision_multiplier = 5000.)
-    th = th._replace(heading_stdev = init_stdev)
-
-    key = jax.random.key(42)
-    t0 = time.time()
-    for i in range(n_iters):
-        (key, subkey) = jax.random.split(key)
-        if i == 2:
-            t0 = time.time()
-        (trajs, log_ws) = mppi.run_sis(
-            subkey, x0, u0, th, H, K
-        )
-        trajs = jax.tree.map(lambda x: x[:,:,0], trajs)
-        t1 = time.time()
-        if i == 0:
-            print(f"sample_forward (first run): {t1 - t0}")
-        else:
-            print(f"sample_forward (after jit): {t1 - t0}")
-        ws = jnp.exp(log_ws - jnp.max(log_ws))
-        ps = ws / jnp.sum(ws)
-        expected = jax.tree.map(lambda field: jnp.tensordot(ps, field, axes=([0], [0])).squeeze(), trajs)
-        th = th._replace(
-            heading_nominal = th.heading_nominal + expected.delta,
-            heading_stdev = th.heading_stdev - (init_stdev - 1e-3)/n_iters  # annealing
-        )
-        print(th.heading_stdev)
-
-    print()
-
-    print(trajs.delta.shape)
-    assert trajs.delta.shape == (K,H)
-    assert trajs.location.shape == (K,H,2)
-
-    traj = jax.tree.map(lambda x: x[0], trajs)
-
-    assert traj.delta.shape == (H,)
-    assert traj.location.shape == (H,2)
-
-    l = 10
-    trajs = jax.tree.map(lambda x: x[:1], trajs)
-    # trajs = jax.tree.map(lambda head, tail: jnp.concat((jnp.broadcast_to(head, (l,1) + jnp.shape(head)), tail), axis=1), x0, trajs)
-
-    plt.axis('equal')
-    plt.xlabel('x')
-    plt.ylabel('y')
-    plt.title('Obstacle Avoidance (MPPI)')
-    plt.grid(True)
-
-    plot_goal(th.goal)
-    plot_obstacles(th.obstacles)
-    locs = trajs.location.reshape(1,-1,2)
-    plot_locations(locs)
-
-    plt.show()
-
-def test_cem():
-    cem = PFMP(transition_fn, cost_fn)
-    (x0, u) = init(H)
-
-    # CEM does better with a higher multiplier
-    u = u._replace(collision_multiplier = 5000.)
-
-    key = jax.random.key(42)
-    j_sample_forward = jax.jit(cem.sample_forward_weighted, static_argnames=['block_shape'])
-    t0 = time.time()
-    for i in range(30):
-        (key, subkey) = jax.random.split(key)
-        if i == 2:
-            t0 = time.time()
-        (trajs, log_ws) = jax.block_until_ready(
-            j_sample_forward(subkey, (H, K), x0, u)
-        )
-        t1 = time.time()
-        if i == 0:
-            print(f"sample_forward (first run): {t1 - t0}")
-        else:
-            print(f"sample_forward (after jit): {t1 - t0}")
-
-        l = 10
-        elite_indices = jnp.argsort(-log_ws)[:l]
-        elite_choices = jax.random.randint(key, shape=(K,), minval=0, maxval=l)
-        resampled_indices = elite_indices[elite_choices]  # shape (K,)
-        resampled_trajs = jax.tree.map(lambda x: x[resampled_indices], trajs)
-        expected = jax.tree.map(lambda field: jnp.mean(field, axis=0), resampled_trajs)
-
-        # Update control
-        u = u._replace(
-            heading_nominal = u.heading_nominal + expected.delta,
-            heading_stdev = u.heading_stdev - 0.49 / 30  # annealing
-        )
-
-    print()
-
-    assert trajs.delta.shape == (K,H)
-    assert trajs.location.shape == (K,H,2)
-
-    traj = jax.tree.map(lambda x: x[0], trajs)
-
-    assert traj.delta.shape == (H,)
-    assert traj.location.shape == (H,2)
-
-    l = 10
-    trajs = jax.tree.map(lambda x: x[:l], trajs)
-    trajs = jax.tree.map(lambda head, tail: jnp.concat((jnp.broadcast_to(head, (l,1) + jnp.shape(head)), tail), axis=1), x0, trajs)
-
-    plt.axis('equal')
-    plt.xlabel('x')
-    plt.ylabel('y')
-    plt.title('Obstacle Avoidance (CEM)')
-    plt.grid(True)
-
-    plot_goal(th.goal)
-    plot_obstacles(th.obstacles)
-    plot_locations(trajs.location)
-
-    plt.show()
-
-def test_ps():
-    pass
-
-def test_dial_mpc():
-    pass
-
-if __name__ == "__main__":
-    test_pfmp()
-    # print("done")
-    # test_mppi()
-    # test_cem()
