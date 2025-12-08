@@ -6,6 +6,7 @@ from jaxtyping import PyTree, PRNGKeyArray
 from typing import NamedTuple, Callable
 from dataclasses import is_dataclass, fields
 from .interpolate import hermite_interp1d, Jet1, Jet2, Jet3
+from interpax import interp1d
 
 
 DEFAULT_MUJOCO_DT = 0.01
@@ -54,7 +55,7 @@ class PFMP(NamedTuple):
     mpc_dynamics: Callable
     mpc_running_cost: Callable
     mpc_terminal_cost: Callable
-    # mpc_init: Callable  # TODO: finish me!
+    mpc_init: Callable
     mpc_proposal: Callable
 
     horizon: int
@@ -63,8 +64,11 @@ class PFMP(NamedTuple):
     ess_resample_thresh: float = 0.5
     dt: float = DEFAULT_MUJOCO_DT
 
-    def tk(self):
-        return jnp.linspace(0., self.horizon, self.num_knots)
+    def tk(self, endpoint: bool = True):
+        if endpoint:
+            return jnp.linspace(0., self.horizon, self.num_knots)
+        else:
+            return jnp.linspace(0., self.horizon, self.num_knots)[:-1]
 
     # def interpolate_step(
     #     self, x: PyTree, u: JetType,
@@ -76,13 +80,15 @@ class PFMP(NamedTuple):
     #     return x_next, c_next
 
     @partial(jax.jit, static_argnames=['self'])
-    def transition_model(self, key, x0: PyTree, u0: jax.Array, theta: PyTree, t: int) -> PyTree:
+    def transition_model(self, key, x0: PyTree, u0: jax.Array, theta: PyTree, t0: float) -> PyTree:
         step_len = self.horizon / (self.num_knots - 1)
-        steps_per_knot = round(step_len / self.dt)
-        t0 = t.astype(float); t1 = t0 + step_len
+        steps_per_knot = int(step_len / self.dt)
+        # step_len = 0.33
+        # steps_per_knot = 33
+        t1 = t0 + step_len
 
         # Propose new spline knot
-        u1 = self.mpc_proposal(key, x0, u0, theta, t)
+        u1 = self.mpc_proposal(key, x0, u0, theta, t0)
 
         # Interpolate `u` over the spline
         if isinstance(u0, (Jet1, jax.Array)):
@@ -91,12 +97,16 @@ class PFMP(NamedTuple):
             nout = 2
         elif isinstance(u0, Jet3):
             nout = 3
-        t_grid, us = hermite_interp1d(
+        tq, us = hermite_interp1d(
             t0, t1,
             u0, u1,
-            num=steps_per_knot,
+            num=steps_per_knot+1,
             nout=nout
         )
+        # tq = jnp.linspace(t0, t1, steps_per_knot, endpoint=False)
+        # us = interp1d(tq, jnp.array([t0, t1]), jnp.array([u0, u1]), method="cubic")
+        # print(us.shape)
+        # us = us[:,0]
 
         def interpolate_step(
             carry: tuple[jax.Array, float, float],
@@ -109,30 +119,31 @@ class PFMP(NamedTuple):
             return (x_next, c + c_next), y
 
         # Scan over the spline and numerically integrate cost
-        (x1, cost), ys = jax.lax.scan(interpolate_step, (x0, 0.0), (us, t_grid))
-        return (x1, u1), (ys, cost)
+        (x1, cost), ys = jax.lax.scan(interpolate_step, (x0, 0.0), (us[:-1], tq[:-1]))
+        return (x1, u1), (u1, cost)
 
     @partial(jax.jit, static_argnames=['self'])
     def run_sis(
         self,
         key,
         x0: PyTree,
-        u0: PyTree,
         theta: PyTree
     ) -> tuple[jax.Array, jax.Array]:
-        # # TODO: finish me
-        # u0s = jax.vmap(self.mpc_init)(key, theta)
-        keys = jax.random.split(key, (self.particles, self.num_knots - 1))
-        (final_xs, _), (ys, costs) = jax.vmap(
-            lambda particle_keys: jax.lax.scan(
+        key1, key2 = jax.random.split(key)
+        keys1 = jax.random.split(key1, (self.particles,))
+        u0s = jax.vmap(self.mpc_init, in_axes=(0,None,None))(keys1, x0, theta)
+        keys2 = jax.random.split(key2, (self.particles, self.num_knots - 1))
+        (final_xs, _), (us, costs) = jax.vmap(
+            lambda particle_keys, u0: jax.lax.scan(
                 lambda carry, inp: self.transition_model(inp[0], carry[0], carry[1], theta, inp[1]),
                 (x0, u0),
-                (particle_keys, jnp.linspace(0, self.horizon, self.num_knots)[:-1])
+                (particle_keys, self.tk(endpoint=False))
             )
-        )(keys)
+        )(keys2, u0s)
         final_costs = jax.vmap(self.mpc_terminal_cost, in_axes=(0,None))(final_xs, theta)
+        trajs = jax.tree.map(lambda head, tail: jnp.concat([head[:,None], tail], axis=1), u0s, us)
         costs = jnp.concatenate((costs, final_costs[:,None]), axis=-1)
-        return ys, -costs
+        return trajs, costs
 
     def sample_resample_step(
         self,
@@ -142,7 +153,7 @@ class PFMP(NamedTuple):
         (log_ws, xs, us, theta) = carry
         (step_keys, resample_key, t) = inp
 
-        (new_xs, new_us), (interp_ys, costs) = jax.vmap(
+        (new_xs, new_us), (_, costs) = jax.vmap(
             lambda key, xs, us: self.transition_model(key, xs, us, theta, t)
         )(step_keys, xs, us)
 
@@ -165,47 +176,49 @@ class PFMP(NamedTuple):
 
         resampled_xs = jax.tree.map(lambda x: x[parents], new_xs)
         resampled_us = jax.tree.map(lambda u: u[parents], new_us)
-        resampled_ys = jax.tree.map(lambda x: x[parents], interp_ys)
+        # resampled_ys = jax.tree.map(lambda x: x[parents], interp_ys)
 
-        return (resampled_log_ws, resampled_xs, resampled_us, theta), (resampled_ys, parents, costs)
+        return (resampled_log_ws, resampled_xs, resampled_us, theta), (resampled_us, parents, costs)
 
     @partial(jax.jit, static_argnames=['self'])
     def run_sir(
         self,
         key: PRNGKeyArray,
-        x0: PyTree, u0: jax.Array, theta: PyTree
+        x0: PyTree, theta: PyTree
     ) -> tuple[PyTree[jax.Array], jax.Array]:
+        key1, key2 = jax.random.split(key)
+        keys = jax.random.split(key1, (self.particles,))
         num_intervals = self.num_knots - 1
-        step_keys = jax.random.split(key, num_intervals * self.particles).reshape(num_intervals, self.particles)
-        resample_keys = jax.random.split(key, num_intervals)
+        step_keys = jax.random.split(key2, num_intervals * self.particles).reshape(num_intervals, self.particles)
+        resample_keys = jax.random.split(key2, num_intervals)
         x0s = jax.tree.map(lambda x: jnp.repeat(x[None], self.particles, axis=0), x0)
-        u0s = jax.tree.map(lambda u: jnp.repeat(u[None], self.particles, axis=0), u0)
-        (_, final_xs, _, _), (states, ancestors, costs) = jax.lax.scan(
+        u0s = jax.vmap(self.mpc_init, in_axes=(0,None,None))(keys, x0, theta)
+        (_, final_xs, _, _), (us, ancestors, costs) = jax.lax.scan(
             lambda carry, inp: self.sample_resample_step(carry, inp),
             (jnp.zeros(self.particles), x0s, u0s, theta),
-            (step_keys, resample_keys, jnp.linspace(0, self.horizon, self.num_knots)[:-1])
+            (step_keys, resample_keys, self.tk(endpoint=False))
         )
+        states = jnp.concat([u0s[None], us], axis=0)
         trajs = self.choose_paths(states, ancestors, jnp.arange(self.particles))
         final_costs = jax.vmap(self.mpc_terminal_cost, in_axes=(0,None))(final_xs, theta)
         costs = jnp.concatenate((costs.T, final_costs[:,None]), axis=-1)
-        return trajs, -costs
+        return trajs, costs
 
     @staticmethod
     @jax.jit
     def choose_path(states, ancestors, index):
-        num_knots = ancestors.shape[0]
+        final_idx = ancestors.shape[0]
 
         # names + accessor + builder from the *instance*
         field_names, accessor, builder = get_field_info(states)
 
         def body(idx, tau):
-            # pull out each leaf at (tau, idx)
             vals = [accessor(states, name)[tau, idx] for name in field_names]
             state = builder(vals)  # rebuild in the original container type
-            return ancestors[tau, idx], state
+            return ancestors[tau-1, idx], state
 
-        times = jnp.arange(num_knots - 1, -1, -1)
-        _, traj_back = jax.lax.scan(body, index, times)
+        back_indices = jnp.arange(final_idx, -1, -1)
+        _, traj_back = jax.lax.scan(body, index, back_indices)
         return jax.tree.map(lambda x: x[::-1], traj_back)
 
     @staticmethod

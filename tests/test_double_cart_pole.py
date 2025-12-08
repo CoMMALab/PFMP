@@ -4,10 +4,14 @@ import jax
 import jax.numpy as jnp
 import mujoco
 
-from hydrax.algs import PredictiveSampling
+from hydrax.algs import PredictiveSampling, MPPI
 from hydrax.simulation.deterministic import run_interactive
 from hydrax.tasks.double_cart_pole import DoubleCartPole
 from typing import NamedTuple
+
+import pfmp
+import mujoco.mjx as mjx
+
 
 task = DoubleCartPole()
 
@@ -23,7 +27,9 @@ subparsers = parser.add_subparsers(
     dest="algorithm", help="Sampling algorithm (choose one)", required=True
 )
 subparsers.add_parser("ps", help="Predictive Sampling")
-subparsers.add_parser("pfmp", help="Particle Filter Motion Planning")
+subparsers.add_parser("mppi", help="Model Predictive Path Integral")
+subparsers.add_parser("sis", help="Particle Filter Motion Planning (SIS)")
+subparsers.add_parser("sir", help="Particle Filter Motion Planning (SIR)")
 args = parser.parse_args()
 
 if args.algorithm == "ps":
@@ -31,32 +37,30 @@ if args.algorithm == "ps":
         task,
         num_samples=1024,
         noise_level=0.3,
-        plan_horizon=1.0,
-        spline_type="cubic",
-        num_knots=4,
+        plan_horizon=2.0,
+        spline_type="linear",
+        num_knots=8,
     )
-elif args.algorithm == "pfmp":
-    import pfmp
-    import mujoco.mjx as mjx
-
-    horizon = 1.0
-    num_knots = 4
+    theta = None
+elif args.algorithm == "mppi":
+    ctrl = MPPI(
+        task,
+        num_samples=1024,
+        noise_level=0.3,
+        temperature=0.1,
+        spline_type="linear",
+        plan_horizon=2.0,
+        num_knots=8,
+    )
+    theta = None
+elif args.algorithm == "sis" or args.algorithm == "sir":
+    horizon = 2.0
+    num_knots = 8
 
     class CartPoleParams(NamedTuple):
         mjx_model: mjx.Model
         mean: jax.Array
         coarse_control: float
-
-    u_min = jnp.where(
-        mj_model.actuator_ctrllimited,
-        mj_model.actuator_ctrlrange[:, 0],
-        -jnp.inf,
-    )
-    u_max = jnp.where(
-        mj_model.actuator_ctrllimited,
-        mj_model.actuator_ctrlrange[:, 1],
-        jnp.inf,
-    )
 
     # Coarse-and-fine proposal
     # def proposal(key, x: mjx.Data, u: jax.Array, th: CartPoleParams, t: int) -> jax.Array:
@@ -87,15 +91,20 @@ elif args.algorithm == "pfmp":
         return x, j
 
     # Cost from Hydrax
-    running_cost = lambda x, j, th, _t: task.running_cost(x, j) * th.mjx_model.opt.timestep
-    terminal_cost = lambda x, th: 0.0 # task.terminal_cost(x)
+    running_cost = lambda x, j, th, _t: task.running_cost(x, j) * 0.01
+    terminal_cost = lambda x, th: task.terminal_cost(x)
+
+    def init(key, x, th):
+        u = jax.random.normal(key) * th.coarse_control + th.mean[0]
+        u = jnp.clip(u, task.u_min, task.u_max)
+        return u
 
     # Linear Proposal
     def proposal(key, x: mjx.Data, u: jax.Array, th: CartPoleParams, t: float) -> jax.Array:
         step_len = horizon / (num_knots - 1)
-        idx = (jnp.round(t / step_len)).astype(int)
-        u = jax.random.normal(key) * th.coarse_control + th.mean[idx+1]
-        u = jnp.clip(u, u_min, u_max)
+        idx = (jnp.round(t / step_len)).astype(int) + 1
+        u = jax.random.normal(key) * th.coarse_control + th.mean[idx]
+        u = jnp.clip(u, task.u_min, task.u_max)
         return u
 
     theta = CartPoleParams(
@@ -105,36 +114,21 @@ elif args.algorithm == "pfmp":
     )
 
     ctrl = pfmp.PFMP(
-        dynamics, running_cost, terminal_cost, proposal,
-        horizon=horizon, num_knots=num_knots, particles=4096, dt=mj_model.opt.timestep,
+        dynamics, running_cost, terminal_cost, init, proposal,
+        horizon=horizon, num_knots=num_knots, particles=1024, dt=mj_model.opt.timestep,
         ess_resample_thresh=0.5
         )
 
-    u0 = jnp.ones(mj_model.nu)
-    # u0 = jnp.zeros(mj_model.nu)
-    # u0 = Jet2(jnp.zeros(mj_model.nu,), jnp.zeros(mj_model.nu,))
-
-    pfmp.run_interactive(
-        ctrl,
-        u0,
-        theta,
-        mj_model,
-        mj_data,
-        frequency=50,
-        fixed_camera_id=0,
-        method="sir",
-        record_video=True
-    )
-    exit()
-
 # Run the interactive simulation
-run_interactive(
+pfmp.run_interactive(
     ctrl,
+    theta,
     mj_model,
     mj_data,
     frequency=50,
     fixed_camera_id=0,
-    show_traces=False,
-    max_traces=1,
-    record_video=True
+    method=args.algorithm,
+    record_video=False,
+    record_traj=True,
+    max_step=1000
 )

@@ -3,10 +3,9 @@ import time
 import jax
 import jax.numpy as jnp
 import mujoco
+import mujoco.viewer
 import numpy as np
-import matplotlib.pyplot as plt
 from mujoco import mjx
-# from pfmp.interpolate import hermite_spline
 from pfmp.interpolate import Jet2, hermite_spline
 
 import os
@@ -166,9 +165,72 @@ class VideoRecorder:
             return False
 
 
+import json
+
+class Trajectory:
+    def __init__(self, output_dir: str = "recordings"):
+        self.output_dir = output_dir
+        self.ctrl = None
+        self.cost = None
+        self.qpos = None
+        self.qvel = None
+
+    def push(self, ctrl: np.ndarray, cost: np.ndarray, qpos: np.ndarray, qvel: np.ndarray):
+        if self.ctrl is None:
+            assert self.cost is None
+            assert self.qpos is None
+            assert self.qvel is None
+            self.ctrl = ctrl[None]
+            self.cost = cost[None]
+            self.qpos = qpos[None]
+            self.qvel = qvel[None]
+        else:
+            self.ctrl = np.concat([self.ctrl, ctrl[None]])
+            self.cost = np.concat([self.cost, cost[None]])
+            self.qpos = np.concat([self.qpos, qpos[None]])
+            self.qvel = np.concat([self.qvel, qvel[None]])
+
+    def save(self):
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+
+        # Generate output path with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.video_path = os.path.join(
+            self.output_dir, f"trajs_{timestamp}.json"
+        )
+
+        data = {
+            "ctrl": self.ctrl.tolist(),
+            "cost": self.cost.tolist(),
+            "qpos": self.qpos.tolist(),
+            "qvel": self.qvel.tolist()
+        }
+
+        with open(self.video_path, "w") as f:
+            json.dump(data, f)
+
+    @classmethod
+    def load(cls, filename):
+        self = cls()
+        with open(filename, "r") as f:
+            data = json.load(f)
+        self.ctrl = np.array(data["ctrl"])
+        self.cost = np.array(data["cost"])
+        self.qpos = np.array(data["qpos"])
+        self.qvel = np.array(data["qvel"])
+        return self
+
+def ps_update(theta, trajs, costs):
+    # Different from Hydrax (and more like Dynamic Expectation Maximization),
+    # the model params `theta` are updated separately from the SMC kernel
+    best_idx = jnp.argmin(jnp.sum(costs, axis=1))  # Predictive Sampling
+    new_mean = trajs[best_idx]
+    theta = theta._replace(mean = new_mean)
+    return theta, costs[:,best_idx]
+
 def run_interactive(  # noqa: PLR0912, PLR0915
     controller,
-    u0,     # initial control
     theta,  # (mean, mjx_model)
     mj_model: mujoco.MjModel,
     mj_data: mujoco.MjData,
@@ -176,7 +238,9 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     initial_knots: jax.Array = None,
     fixed_camera_id: int = None,
     method = "sir",
-    record_video: bool = False
+    record_video: bool = False,
+    record_traj: bool = False,
+    max_step: int = int(1e6)
 ) -> None:
     """Run an interactive simulation with the MPC controller.
 
@@ -200,14 +264,28 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     """
     if method == "sis":
         replan = controller.run_sis
+        interp = hermite_spline
+        family = "pfmp"
     elif method == "sir":
         replan = controller.run_sir
+        interp = hermite_spline
+        family = "pfmp"
+    elif method == "ps" or method == "cem" or method == "mppi":
+        replan = jax.jit(controller.optimize)
+        interp = jax.jit(controller.interp_func)
+        family = "hydrax"
+        assert theta is None
 
     # Report the planning horizon in seconds for debugging
-    ctrl_steps = round(controller.horizon / controller.dt)
+    if family == "pfmp":
+        ctrl_steps = round(controller.horizon / controller.dt)
+        horizon = controller.horizon
+    else:
+        ctrl_steps = controller.ctrl_steps
+        horizon = controller.plan_horizon
     print(
         f"Planning with {ctrl_steps} steps "
-        f"over a {controller.horizon} second horizon "
+        f"over a {horizon} second horizon "
         f"with {controller.num_knots} knots."
     )
 
@@ -222,7 +300,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
         f"simulating at {1.0 / mj_model.opt.timestep} Hz"
     )
 
-    key = jax.random.key(42)
+    key = jax.random.key(0)
 
     # Initialize the controller
     mjx_data = mjx.put_data(mj_model, mj_data)
@@ -234,26 +312,30 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     print("Jitting the controller...")
     st = time.time()
 
-    def ps_update(theta, trajs, scores):
-        # Different from Hydrax (and more like Dynamic Expectation Maximization),
-        # the model params `theta` are updated separately from the SMC kernel
-        best_idx = jnp.argmax(jnp.sum(scores, axis=-1))  # Predictive Sampling
-        new_mean = jax.tree.map(lambda field: field[best_idx,:,-1], trajs)
-        theta = theta._replace(mean = jnp.concat([theta.mean[0,None], new_mean[:,None]]))
-        return theta
+    if family == "pfmp":
+        init_shape = theta.mean.shape
+        print(f"init shape: {init_shape}")
+        key, subkey = jax.random.split(key)
+        (trajs, costs) = replan(subkey, mjx_data, theta)
+        assert theta.mean.shape == init_shape
+        theta, _ = ps_update(theta, trajs, costs)
+        print(theta.mean.shape)
+        assert theta.mean.shape == init_shape
+        key, subkey = jax.random.split(key)
+        (trajs, costs) = replan(subkey, mjx_data, theta)
+        theta, _ = ps_update(theta, trajs, costs)
+        assert theta.mean.shape == init_shape
+    else:
+        policy_params = controller.init_params(initial_knots=initial_knots)
+        policy_params, rollouts = replan(mjx_data, policy_params)
+        policy_params, rollouts = replan(mjx_data, policy_params)
 
-    init_shape = theta.mean.shape
-    print(f"init shape: {init_shape}")
-    key, subkey = jax.random.split(key)
-    (trajs, scores) = replan(subkey, mjx_data, u0, theta)
-    assert theta.mean.shape == init_shape
-    theta = ps_update(theta, trajs, scores)
-    print(theta.mean.shape)
-    assert theta.mean.shape == init_shape
-    key, subkey = jax.random.split(key)
-    (trajs, scores) = replan(subkey, mjx_data, u0, theta)
-    theta = ps_update(theta, trajs, scores)
-    assert theta.mean.shape == init_shape
+        tq = jnp.arange(0, sim_steps_per_replan) * mj_model.opt.timestep
+        tk = policy_params.tk
+        knots = policy_params.mean[None, ...]
+        _ = interp(tq, tk, knots)
+        _ = interp(tq, tk, knots)
+
     print(f"Time to jit: {time.time() - st:.3f} seconds")
 
     recorder = None
@@ -274,7 +356,11 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             record_video = False
         renderer = mujoco.Renderer(mj_model, height=height, width=width)
 
+    if record_traj:
+        traj = Trajectory()
+
     # Start the simulation
+    step = 0
     with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
         if fixed_camera_id is not None:
             # Set the custom camera
@@ -282,7 +368,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             viewer.cam.type = 2
 
         # t_init = mj_data.time
-        while viewer.is_running():
+        while viewer.is_running() and step < max_step:
             start_time = time.time()
 
             # Set the start state for the controller
@@ -296,27 +382,44 @@ def run_interactive(  # noqa: PLR0912, PLR0915
 
             # Do a replanning step
             plan_start = time.time()
-            # policy_params, rollouts = jit_optimize(mjx_data, policy_params)
-            (key, subkey) = jax.random.split(key)
-            (trajs, scores) = replan(subkey, mjx_data, u0, theta)
-            theta = ps_update(theta, trajs, scores)
+
+            # Replan
+            if family == "pfmp":
+                (key, subkey) = jax.random.split(key)
+                (trajs, costs) = replan(subkey, mjx_data, theta)
+                theta, _ = ps_update(theta, trajs, costs)
+            else:
+                policy_params, rollouts = replan(mjx_data, policy_params)
             plan_time = time.time() - plan_start
 
             # query the control spline at the sim frequency
             # (we assume the sim freq is the same as the low-level ctrl freq)
             sim_dt = mj_model.opt.timestep
 
-            # knots = jnp.concat([u0, theta.mean])
-            knots = theta.mean
-            tk = controller.tk()
-            tq = jnp.arange(0, sim_steps_per_replan) * sim_dt
-            us = hermite_spline(tq, tk, knots)
+            # theta.mean = jnp.concat([u0, theta.mean])
+            if family == "pfmp":
+                tk = controller.tk()
+                tq = jnp.arange(0, sim_steps_per_replan) * sim_dt
+                us = hermite_spline(tq, tk, theta.mean)
+            else:
+                t_curr = mj_data.time
+                tq = jnp.arange(0, sim_steps_per_replan) * sim_dt + t_curr
+                tk = policy_params.tk
+                knots = policy_params.mean[None, ...]
+                us = np.asarray(interp(tq, tk, knots))[0]  # (ss, nu)
 
             # simulate the system between spline replanning steps
             for i in range(sim_steps_per_replan):
                 mj_data.ctrl[:] = np.array(us[i])
                 mujoco.mj_step(mj_model, mj_data)
                 viewer.sync()
+                if record_traj:
+                    if family == "pfmp":
+                        cost = controller.mpc_running_cost(mj_data, mj_data.ctrl, theta, mj_data.time)
+                    else:
+                        cost = controller.task.running_cost(mj_data, mj_data.ctrl) * mj_model.opt.timestep
+                    traj.push(mj_data.ctrl, cost, mj_data.qpos, mj_data.qvel)
+                step += 1
 
             # Capture frame if recording
             if record_video and recorder.is_recording:
@@ -336,16 +439,20 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                 end="\r",
             )
 
-            # Update the mean based on elapsed offset
-            new_tk = controller.tk() + sim_steps_per_replan * controller.dt
-            if isinstance(knots, Jet2):
-                nout = 2
-            else:
-                nout = 1
-            new_mean = hermite_spline(new_tk, tk, knots, nout=nout)
-            theta = theta._replace(mean=new_mean[:,None])
-            u0 = theta.mean[0]
-            assert theta.mean.shape == init_shape
+            if family == "pfmp":
+                tk = controller.tk()
+                new_tk = tk + sim_steps_per_replan * mj_model.opt.timestep
+                if isinstance(theta.mean, Jet2):
+                    nout = 2
+                else:
+                    nout = 1
+                new_mean = hermite_spline(new_tk, tk, theta.mean, nout=nout)
+                if new_mean.shape != init_shape:
+                    # 1D array
+                    theta = theta._replace(mean=new_mean[:,None])
+                else:
+                    theta = theta._replace(mean=new_mean)
+                assert theta.mean.shape == init_shape
 
     # Preserve the last printout
     print("")
@@ -353,3 +460,6 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     # Close the video recorder if recording was enabled
     if record_video and recorder is not None:
         recorder.stop()
+
+    if record_traj:
+        traj.save()

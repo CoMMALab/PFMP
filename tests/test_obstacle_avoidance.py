@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from typing import NamedTuple
 from pfmp import PFMP
-from pfmp.interpolate import Jet2
+from pfmp.interpolate import Jet2, hermite_spline
 import matplotlib.pyplot as plt
 
 
@@ -82,6 +82,11 @@ def dynamics(x: jax.Array, u: jax.Array, theta: Params, t):
     x_next = jnp.array([px_next, py_next, th_next])
     return (x_next, x_next)
 
+def init(key, x, theta):
+    u_next = jax.random.normal(key) * theta.u_stdev
+    u_bound = 0.8
+    return jnp.clip(u_next, -u_bound, u_bound)
+
 def proposal(key, _x, _u: float, theta: Params, t):
     """
     key: PRNGKey
@@ -109,10 +114,10 @@ if __name__ == "__main__":
     horizon = 10
     num_knots = int(2*horizon)
     particles = 128
-    pfmp = PFMP(dynamics, cost_fn, terminal_cost, proposal,
+    pfmp = PFMP(dynamics, cost_fn, terminal_cost, init, proposal,
                 horizon, num_knots, particles,
                 ess_resample_thresh=0.5)
-    x0 = jnp.zeros(3)
+    x0 = jnp.array([0,0,jnp.pi/4])
     # u0 = Jet2(0., 0.)
     u0 = 0.0
     theta = Params(
@@ -125,12 +130,15 @@ if __name__ == "__main__":
     )
 
     key = jax.random.key(1)
-    trajs, scores = pfmp.run_sir(key, x0, u0, theta)
+    traj, scores = pfmp.run_sir(key, x0, theta)
     print(scores.shape)
     print(scores[:10,-1])
     # print(final_costs)
     # exit()
-    trajs = trajs.reshape(particles, -1, 3)
+    tq = jnp.arange(0, horizon, pfmp.dt)
+    # print(trajs.shape)
+    # trajs = hermite_spline(tq, pfmp.tk(), trajs)
+    # print(trajs.shape)
     # for i in range(len(trajs)):
     #     plt.plot(trajs[i,:,0], trajs[i,:,1], c="magenta", alpha=0.5)
 
@@ -167,11 +175,14 @@ if __name__ == "__main__":
     interval_len = horizon / (num_knots - 1)
     steps_per_knot = round(interval_len / pfmp.dt)
     best_idx = jnp.argmax(jnp.sum(scores, axis=-1))
+    tq = jnp.linspace(0,pfmp.horizon,int(pfmp.horizon/pfmp.dt))
     for i in range(20):
-        plt.plot(trajs[i,:,0], trajs[i,:,1], c="magenta", alpha=0.5)
+        us = hermite_spline(tq, pfmp.tk(), traj[i])
+        _, xy = jax.lax.scan(lambda x, ut: dynamics(x, ut[0], theta, ut[1]), x0, (us, tq))
+        plt.plot(xy[:,0], xy[:,1], c="magenta", alpha=0.5)
 
-        for t in range(0, trajs.shape[1], steps_per_knot):  # every 5 steps
-            x, y, th = trajs[i, t]
+        for t in range(0, xy.shape[0], steps_per_knot):  # every 5 steps
+            x, y, th = xy[t]
 
             # Create a rectangle centered at (0,0)
             rect = patches.Rectangle(
@@ -191,7 +202,9 @@ if __name__ == "__main__":
 
             rect.set_transform(trans + ax.transData)
             ax.add_patch(rect)
-    plt.plot(trajs[best_idx,:,0], trajs[best_idx,:,1], c="gold", lw=3, alpha=1)
+    us = hermite_spline(tq, pfmp.tk(), traj[best_idx])
+    _, best_xy = jax.lax.scan(lambda x, ut: dynamics(x, ut[0], theta, ut[1]), x0, (us, tq))
+    plt.plot(best_xy[:,0], best_xy[:,1], c="gold", lw=3, alpha=1)
 
     plt.axis("equal")
     plt.show()

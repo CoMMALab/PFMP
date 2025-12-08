@@ -22,27 +22,19 @@ def mpc_cost(x, u, theta, t):
 
 terminal_cost = lambda _x, _th: 0.
 
-def mpc_proposal(key, x, u, theta, t):
+def mpc_init(key, x, theta):
     keys = jax.random.split(key, 3)
     pred_u = jax.random.normal(keys[0]) * theta.u_stdev
     pred_du = jax.random.normal(keys[1]) * theta.du_stdev
     pred_ddu = jax.random.normal(keys[2]) * theta.ddu_stdev
     return Jet3(pred_u, pred_du, pred_ddu)
 
-def init():
-    # x0 = jnp.array([0.])          # linear
-    # x0 = jnp.array([0., 0.])      # cubic
-    # x0 = jnp.array([0., 0., 0.])  # quintic
-    x0 = 0.
-    u0 = Jet3(0., 0., 0.)
-
-    theta = ParParams(
-        u_stdev = 1.0,
-        du_stdev = 2.0,
-        ddu_stdev = 0.5
-    )
-
-    return (x0, u0, theta)
+def mpc_proposal(key, x, u, theta, t):
+    keys = jax.random.split(key, 3)
+    pred_u = jax.random.normal(keys[0]) * theta.u_stdev
+    pred_du = jax.random.normal(keys[1]) * theta.du_stdev
+    pred_ddu = jax.random.normal(keys[2]) * theta.ddu_stdev
+    return Jet3(pred_u, pred_du, pred_ddu)
 
 # K, H, L = 10000, 4, 100
 horizon = 4.0
@@ -58,14 +50,20 @@ def test_sis():
     #     horizon=H, particles=K, steps_per_knot=L)
 
     pfmp = PFMP(
-        mpc_dynamics, mpc_cost, terminal_cost, mpc_proposal,
+        mpc_dynamics, mpc_cost, terminal_cost, mpc_init, mpc_proposal,
         horizon, num_knots, particles)
-    (x0, u0, theta) = init()
+
+    x0 = 0.
+    theta = ParParams(
+        u_stdev = 1.0,
+        du_stdev = 2.0,
+        ddu_stdev = 0.5
+    )
 
     key = jax.random.key(42)
     for i in range(5):
         t0 = time.time()
-        (trajs, scores) = pfmp.run_sis(key, x0, u0, theta)
+        (trajs, scores) = pfmp.run_sis(key, x0, theta)
         t1 = time.time()
         if i == 0:
             print(f"sample_forward (first run): {t1 - t0}")
@@ -81,9 +79,9 @@ def test_sis():
     # ------------------------
     nsamples = 10
     idxs = jax.random.choice(key, p.shape[0], shape=(nsamples,), p=p)
-    U = trajs.u[idxs, ..., 0]        # (nsamples, nseg, seglen)
+    U = trajs.u[idxs, ...]        # (nsamples, nseg, seglen)
 
-    ns, nseg, seglen = U.shape
+    ns, nseg = U.shape
     assert nseg == num_knots - 1, "Inconsistent num_knots vs trajectory shape"
 
     # ------------------------
