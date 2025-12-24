@@ -1,20 +1,20 @@
 import jax
 import jax.numpy as jnp
-import genjax
 
 from functools import partial
-from genjax import gen, ChoiceMapBuilder as C
 from jaxtyping import PyTree, PRNGKeyArray
 from typing import NamedTuple, Callable
 from dataclasses import is_dataclass, fields
-from .interpolate import hermite_spline
+from .interpolate import hermite_interp1d, Jet1, Jet2, Jet3
 
+
+DEFAULT_MUJOCO_DT = 0.01
 
 def get_field_info(x):
     """
     Return:
       - field_names: tuple of keys
-      - accessor(obj, key) -> leaf array (indexable by [tau, idx] for arrays with (H,K,...))
+      - accessor(obj, key) -> leaf array (indexable by [tau, idx] for arrays with (horizon,particles,...))
       - builder(vals) -> reconstructs the same container type as `x`
     """
     # dataclass
@@ -32,10 +32,10 @@ def get_field_info(x):
         builder  = lambda vals: type(x)(**{n: v for n, v in zip(names, vals)})
         return names, accessor, builder
 
-    # jax.Array -> treat as ONE field: the whole array (H, K, ...)
+    # jax.Array -> treat as ONE field: the whole array (horizon, particles, ...)
     if jax.Array and isinstance(x, jax.Array):
         names = ("__array__",)
-        accessor = lambda obj, _k: obj               # shape (H, K, ...)
+        accessor = lambda obj, _k: obj               # shape (horizon, particles, ...)
         builder  = lambda vals: vals[0]              # just return the array leaf
         return names, accessor, builder
 
@@ -48,136 +48,118 @@ def get_field_info(x):
 
     raise TypeError(f"Unsupported state type: {type(x)}")
 
+# Predictive Sampling for PFMP
+def ps_update(theta: PyTree, trajs: jax.Array, costs: jax.Array):
+    best_idx = jnp.argmin(jnp.sum(costs, axis=1))
+    new_mean = trajs[best_idx]
+    theta = theta._replace(mean = new_mean)
+    return theta, costs[:,best_idx]
 
-def make_transition_model(
-        mpc_proposal,
-        mpc_cost,
-        mpc_dynamics = lambda x, u, _th, _t: (x, u),
-        l: int = 1
-    ):
+class PFMP(NamedTuple):
+    """ Particle Filtering Motion Planning (PFMP) """
 
-    @gen
-    def mpc_hermite_spline(x0: PyTree, u0: jax.Array, theta: PyTree, t: int) -> PyTree:
-        # Propose new Hermite spline model predictive control point `u` from a generative function
-        u1 = mpc_proposal(x0, u0, theta, t) @ 'u'
+    mpc_dynamics: Callable
+    mpc_running_cost: Callable
+    mpc_terminal_cost: Callable
+    mpc_init: Callable
+    mpc_proposal: Callable
 
-        t0, t1 = t.astype(float), (t + 1).astype(float)
-        nderivs = int(u0.shape[0])  # number of constraints (1,2,3)
-        D = int(u0.size // nderivs)
-        J0 = jnp.reshape(u0, (nderivs, D))
-        J1 = jnp.reshape(u1, (nderivs, D))
+    horizon: int
+    num_knots: int
+    particles: int
+    ess_resample_thresh: float = 0.5
+    dt: float = DEFAULT_MUJOCO_DT
+
+    def tk(self, endpoint: bool = True):
+        if endpoint:
+            return jnp.linspace(0., self.horizon, self.num_knots)
+        else:
+            return jnp.linspace(0., self.horizon, self.num_knots)[:-1]
+
+    @partial(jax.jit, static_argnames=['self'])
+    def transition_model(self, key, x0: PyTree, u0: jax.Array, theta: PyTree, t0: float) -> PyTree:
+        step_len = self.horizon / (self.num_knots - 1)
+        steps_per_knot = int(step_len / self.dt)
+        t1 = t0 + step_len
+
+        # Propose new spline knot
+        u1 = self.mpc_proposal(key, x0, u0, theta, t0)
 
         # Interpolate `u` over the spline
-
-        # TODO: deprecate old spline
-        Js = hermite_spline(
-            J0, J1,
+        if isinstance(u0, (Jet1, jax.Array)):
+            nout = 1
+        elif isinstance(u0, Jet2):
+            nout = 2
+        elif isinstance(u0, Jet3):
+            nout = 3
+        tq, us = hermite_interp1d(
             t0, t1,
-            num_points = l + 1
+            u0, u1,
+            num=steps_per_knot+1,
+            nout=nout
         )
-        t_grid = jnp.linspace(t0, t1, l + 1, dtype=J0.dtype)
-
-        # TODO: use new spline
-        # t_grid, Js = hermite_interp1d(
-        #     t0, t1,
-        #     J0, J1,
-        #     ord=2*nderivs-1,
-        #     num=l+1,
-        #     nout=nderivs
-        # )
-
-        # (nderivs, l+1, D) -> (l+1, nderivs, D)
-        us = jnp.permute_dims(Js, (1, 0, 2)).squeeze()
 
         def interpolate_step(
             carry: tuple[jax.Array, float, float],
             inps: tuple[jax.Array, float]
         ) -> tuple[tuple[jax.Array, float, float], None]:
-            xi, c = carry
-            ui, si = inps
-            (xi_next, tracker) = mpc_dynamics(xi, ui, theta, si)
-            ci = mpc_cost(tracker, ui, theta, si)
-            return (xi_next, c + ci), tracker
+            x, c = carry
+            u, s = inps
+            (x_next, y) = self.mpc_dynamics(x, u, theta, s)  # should be probabilistic
+            c_next = self.mpc_running_cost(x_next, u, theta, s)
+            return (x_next, c + c_next), y
 
         # Scan over the spline and numerically integrate cost
-        (x1, cost), trackers = jax.lax.scan(interpolate_step, (x0, 0.0), (us[1:], t_grid[1:]))
+        (x1, cost), ys = jax.lax.scan(interpolate_step, (x0, 0.0), (us[:-1], tq[:-1]))
+        return (x1, u1), (u1, cost)
 
-        # `u` are optimal with transient probability
-        # equal to exponential negative cost
-        genjax.bernoulli(probs=jnp.exp(-cost)) @ 'O'
-
-        return x1, (u1, trackers)
-
-    return mpc_hermite_spline
-
-
-class PFMP(NamedTuple):
-    """
-    Particle Filtering for Model Predictive Control (PFMPC)
-    """
-
-    transition_model: Callable[[PyTree,PyTree,int,int],PyTree]
-    cond_O1 = C.n().at['O'].set(True)  # Optimality Condition
-
-    @jax.jit
-    def generate_cond_O1(self, theta, carry, inp) -> tuple[PyTree, float]:
-        (x, u, score) = carry
-        (key, t) = inp
-        trace, dscore = self.transition_model.generate(key, self.cond_O1, (x, u, theta, t))
-        return (trace.retval[0], trace.retval[1][0], score + dscore), trace.retval[1][1]
-
-    @jax.jit
-    def unfold_cond_O1(self, keys, x0, u0, theta):
-        h = jnp.shape(keys)[0]
-        (carry_out, trackers) = jax.lax.scan(
-            lambda carry, inp: self.generate_cond_O1(theta, carry, inp),
-            (x0, u0, 0.0),
-            (keys, jnp.arange(h))
-        )
-        return trackers, carry_out[2]
-
-    @partial(jax.jit, static_argnames=['h', 'k'])
+    @partial(jax.jit, static_argnames=['self'])
     def run_sis(
         self,
         key,
         x0: PyTree,
-        u0: PyTree,
-        theta: PyTree,
-        h: int,
-        k: int
+        theta: PyTree
     ) -> tuple[jax.Array, jax.Array]:
-        generate_keys = jax.random.split(key, h * k).reshape(k, h)
-        k_trackers, k_scores = jax.vmap(
-            lambda key: self.unfold_cond_O1(key, x0, u0, theta)
-        )(generate_keys)
-        return k_trackers, k_scores
+        key1, key2 = jax.random.split(key)
+        keys1 = jax.random.split(key1, (self.particles,))
+        u0s = jax.vmap(self.mpc_init, in_axes=(0,None,None))(keys1, x0, theta)
+        keys2 = jax.random.split(key2, (self.particles, self.num_knots - 1))
+        (final_xs, _), (us, costs) = jax.vmap(
+            lambda particle_keys, u0: jax.lax.scan(
+                lambda carry, inp: self.transition_model(inp[0], carry[0], carry[1], theta, inp[1]),
+                (x0, u0),
+                (particle_keys, self.tk(endpoint=False))
+            )
+        )(keys2, u0s)
+        final_costs = jax.vmap(self.mpc_terminal_cost, in_axes=(0,None))(final_xs, theta)
+        trajs = jax.tree.map(lambda head, tail: jnp.concat([head[:,None], tail], axis=1), u0s, us)
+        costs = jnp.concatenate((costs, final_costs[:,None]), axis=-1)
+        return trajs, costs
 
     def sample_resample_step(
         self,
         carry: tuple[jax.Array, PyTree[jax.Array], PyTree],
-        inp: tuple[PRNGKeyArray, PRNGKeyArray, int, float],
-        rho: float
+        inp: tuple[PRNGKeyArray, PRNGKeyArray, int, float]
     ) -> tuple[jax.Array, PyTree[jax.Array], PyTree]:
         (log_ws, xs, us, theta) = carry
-        (generate_keys, resample_key, t) = inp
-        k = log_ws.shape[0]
+        (step_keys, resample_key, t) = inp
 
-        (new_xs, new_us, new_log_ws), new_trackers = jax.vmap(
-            lambda xs, us, log_ws, key: self.generate_cond_O1(theta, (xs, us, log_ws), (key, t))
-        )(xs, us, log_ws, generate_keys)
-        # (new_xs, new_log_ws), new_us = jax.vmap(self.generate_cond_O1, in_axes=[0, (0,)])(xs, us, log_ws, generate_keys)
+        (new_xs, new_us), (_, costs) = jax.vmap(
+            lambda key, xs, us: self.transition_model(key, xs, us, theta, t)
+        )(step_keys, xs, us)
 
+        new_log_ws = log_ws - costs
         ws = jnp.exp(new_log_ws - jnp.max(new_log_ws))
         ps = ws / jnp.sum(ws)
         ess = 1 / jnp.sum(ps ** 2)
-        should_resample = ess < rho * k
+        should_resample = ess < self.ess_resample_thresh * self.particles
 
         def do_resample(_):
-            parents = jax.random.choice(resample_key, k, shape=(k,), p=ps, replace=True)
-            return parents, jnp.zeros(k)
+            parents = jax.random.choice(resample_key, self.particles, shape=(self.particles,), p=ps, replace=True)
+            return parents, jnp.zeros(self.particles)
 
         def dont_resample(_):
-            return jnp.arange(k), new_log_ws
+            return jnp.arange(self.particles), new_log_ws
 
         parents, resampled_log_ws = jax.lax.cond(
             should_resample, do_resample, dont_resample, operand=None
@@ -185,61 +167,67 @@ class PFMP(NamedTuple):
 
         resampled_xs = jax.tree.map(lambda x: x[parents], new_xs)
         resampled_us = jax.tree.map(lambda u: u[parents], new_us)
-        resampled_trackers = jax.tree.map(lambda x: x[parents], new_trackers)
+        # resampled_ys = jax.tree.map(lambda x: x[parents], interp_ys)
 
-        return (resampled_log_ws, resampled_xs, resampled_us, theta), (resampled_trackers, parents)
+        return (resampled_log_ws, resampled_xs, resampled_us, theta), (resampled_us, parents, costs)
 
-    @partial(jax.jit, static_argnames=['h', 'k', 'rho'])
+    @partial(jax.jit, static_argnames=['self'])
     def run_sir(
         self,
         key: PRNGKeyArray,
-        x0: PyTree, u0: jax.Array, theta: PyTree,
-        h: int, k: int, rho: float
+        x0: PyTree, theta: PyTree
     ) -> tuple[PyTree[jax.Array], jax.Array]:
-        generate_keys = jax.random.split(key, h * k).reshape(h, k)
-        resample_keys = jax.random.split(key, h)
-        x0s = jax.tree.map(lambda x: jnp.repeat(x[None], k, axis=0), x0)
-        u0s = jax.tree.map(lambda u: jnp.repeat(u[None], k, axis=0), u0)
-        return jax.lax.scan(
-            lambda carry, inp: self.sample_resample_step(carry, inp, rho),
-            (jnp.zeros(k), x0s, u0s, theta),
-            (generate_keys, resample_keys, jnp.arange(h))
-        )[1]
+        key1, key2 = jax.random.split(key)
+        keys = jax.random.split(key1, (self.particles,))
+        num_intervals = self.num_knots - 1
+        step_keys = jax.random.split(key2, num_intervals * self.particles).reshape(num_intervals, self.particles)
+        resample_keys = jax.random.split(key2, num_intervals)
+        x0s = jax.tree.map(lambda x: jnp.repeat(x[None], self.particles, axis=0), x0)
+        u0s = jax.vmap(self.mpc_init, in_axes=(0,None,None))(keys, x0, theta)
+        (_, final_xs, _, _), (us, ancestors, costs) = jax.lax.scan(
+            lambda carry, inp: self.sample_resample_step(carry, inp),
+            (jnp.zeros(self.particles), x0s, u0s, theta),
+            (step_keys, resample_keys, self.tk(endpoint=False))
+        )
+        states = jnp.concat([u0s[None], us], axis=0)
+        trajs = self.choose_paths(states, ancestors, jnp.arange(self.particles))
+        final_costs = jax.vmap(self.mpc_terminal_cost, in_axes=(0,None))(final_xs, theta)
+        costs = jnp.concatenate((costs.T, final_costs[:,None]), axis=-1)
+        return trajs, costs
 
     @staticmethod
     @jax.jit
     def choose_path(states, ancestors, index):
-        h = ancestors.shape[0]
+        final_idx = ancestors.shape[0]
 
         # names + accessor + builder from the *instance*
         field_names, accessor, builder = get_field_info(states)
 
         def body(idx, tau):
-            # pull out each leaf at (tau, idx)
             vals = [accessor(states, name)[tau, idx] for name in field_names]
             state = builder(vals)  # rebuild in the original container type
-            return ancestors[tau, idx], state
+            return ancestors[tau-1, idx], state
 
-        times = jnp.arange(h - 1, -1, -1)
-        _, traj_back = jax.lax.scan(body, index, times)
-        return jax.tree_map(lambda x: x[::-1], traj_back)
+        back_indices = jnp.arange(final_idx, -1, -1)
+        _, traj_back = jax.lax.scan(body, index, back_indices)
+        return jax.tree.map(lambda x: x[::-1], traj_back)
 
     @staticmethod
     @jax.jit
     def choose_paths(
-        states: PyTree[jax.Array],  # (H,K,...)
-        ancestors: jax.Array,       # (H,K)
-        indices: jax.Array          # (N,) where K >= N
-    ) -> PyTree[jax.Array]:         # (N,H,...)
+        states: PyTree[jax.Array],  # (num_knots,particles,...)
+        ancestors: jax.Array,       # (num_knots,particles)
+        indices: jax.Array          # (N,) where self.particles >= N
+    ) -> PyTree[jax.Array]:         # (N,horizon,...)
         """
-        Trace back the trajectories for N particles among K, for finite horizon H.
+        Trace back the trajectories for N self.particles among self.particles, for finite horizon horizon.
 
         Args:
-            states: PyTree with leaves of shape (H, K, ...) representing the full simulation state at each time step.
-            ancestors: (H, K) int32 array specifying indices for `states` that were resampled.
-            indices: jax.Array, array of indices for the final L particles at time H.
+            states: PyTree with leaves of shape (horizon, self.particles, ...) representing the full simulation state at each time step.
+            ancestors: (horizon, self.particles) int32 array specifying indices for `states` that were resampled.
+            indices: jax.Array, array of indices for the final N particles at time horizon.
 
         Returns:
-            NamedTuple: containing fields with shape (L, H, ...), representing N reconstructed trajectories.
+            NamedTuple: containing fields with shape (N, horizon, ...), representing N reconstructed trajectories.
         """
         return jax.vmap(PFMP.choose_path, in_axes=(None, None, 0))(states, ancestors, indices)

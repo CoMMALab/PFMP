@@ -12,10 +12,10 @@ authors = [
 ]
 dependencies = [
     "jax[cuda12]",
-    "genjax",
     "mujoco",
     "mujoco-mjx",
-    "warp-lang"
+    "warp-lang",
+    "hydrax @ git+https://github.com/vincekurtz/hydrax.git@main"
 ]
 
 [tool.setuptools.packages.find]
@@ -32,6 +32,5 @@ test = [
     "jaxls",
     "jaxlie",
     "pyroki @ git+https://github.com/chungmin99/pyroki.git@main",
-    # "hydrax @ git+https://github.com/vincekurtz/hydrax.git"
     # "dial-mpc @ git+https://github.com/LeCAR-Lab/dial-mpc.git",
 ]

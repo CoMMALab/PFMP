@@ -19,7 +19,7 @@ from jax.scipy.spatial.transform import Rotation
 from mujoco import mjx
 from typing import NamedTuple, Tuple
 from mujoco.viewer import launch_passive
-from pfmp import PFMP, make_transition_model
+from pfmp import PFMP #, make_transition_model
 
 
 # ===============================
@@ -270,14 +270,22 @@ def init_mjx(mj_model, mj_data):
 
 HEIGHT = 0.06
 
-@gen
-def proposal_fn(x: mjx.Data, u: jax.Array, th: ParParams, t: int) -> jax.Array:
+# @gen
+# def proposal_fn(x: mjx.Data, u: jax.Array, th: ParParams, t: int) -> jax.Array:
+#     nu = u.shape[1]  # eg. Cartesian 2D/3D 
+#     pred_x = mv_normal(x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET+2], jnp.eye(nu) * theta.u_stdev) @ "u"
+#     pred_v = mv_normal(u[1], jnp.eye(nu) * th.du_stdev) @ "du"
+#     return jnp.array([pred_x, pred_v])  # cubic
+
+def proposal_fn(key, x, u, th, t):
     nu = u.shape[1]  # eg. Cartesian 2D/3D 
-    pred_x = mv_normal(x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET+2], jnp.eye(nu) * theta.u_stdev) @ "u"
-    pred_v = mv_normal(u[1], jnp.eye(nu) * th.du_stdev) @ "du"
+    key1, key2 = jax.random.split(key)
+    pred_x = jax.random.normal(key1, (nu,)) * jnp.sqrt(th.u_stdev) + x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET+2]
+    pred_v = jax.random.normal(key2, (nu,)) * jnp.sqrt(th.du_stdev) + u[1]
+    # pred_x = mv_normal(x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET+2], jnp.eye(nu) * theta.u_stdev)
+    # pred_v = mv_normal(u[1], jnp.eye(nu) * th.du_stdev) @ "du"
     return jnp.array([pred_x, pred_v])  # cubic
 
-@jax.jit
 def dynamics_fn(x, u, th, t) -> Tuple[jax.Array,jax.Array]:
     target_xyz = jnp.array([u[0,0], u[0,1], HEIGHT])
     target_R = jnp.array([
@@ -352,7 +360,8 @@ if __name__ == "__main__":
     x0 = x0.replace(qpos=qpos)
 
     key = jax.random.key(42)
-    pfmp = PFMP(make_transition_model(proposal_fn, cost_fn, dynamics_fn, l=L))
+    # pfmp = PFMP(make_transition_model(proposal_fn, cost_fn, dynamics_fn, l=L))
+    pfmp = PFMP(dynamics_fn, cost_fn, proposal_fn)
     # trajs, _ = pfmp.run_sis(key, x0, u0, theta, H, K)
     # trajs = trajs.reshape(K,-1,3)
 
