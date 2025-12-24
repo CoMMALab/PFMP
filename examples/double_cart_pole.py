@@ -37,9 +37,9 @@ if args.algorithm == "ps":
         task,
         num_samples=1024,
         noise_level=0.3,
-        plan_horizon=2.0,
+        plan_horizon=1.0,
         spline_type="linear",
-        num_knots=8,
+        num_knots=4,
     )
     theta = None
 elif args.algorithm == "mppi":
@@ -49,13 +49,13 @@ elif args.algorithm == "mppi":
         noise_level=0.3,
         temperature=0.1,
         spline_type="linear",
-        plan_horizon=2.0,
-        num_knots=8,
+        plan_horizon=1.0,
+        num_knots=4,
     )
     theta = None
 elif args.algorithm == "sis" or args.algorithm == "sir":
-    horizon = 2.0
-    num_knots = 8
+    horizon = 1.0
+    num_knots = 4
 
     class CartPoleParams(NamedTuple):
         mjx_model: mjx.Model
@@ -129,6 +129,6 @@ pfmp.run_interactive(
     fixed_camera_id=0,
     method=args.algorithm,
     record_video=False,
-    record_traj=True,
+    record_traj=False,
     max_step=1000
 )

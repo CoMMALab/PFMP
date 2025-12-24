@@ -42,7 +42,7 @@ if args.algorithm == "ps":
         num_knots=5,
     )
     theta = None
-if args.algorithm:
+if args.algorithm == "sir" or args.algorithm == "sis":
     horizon = 0.6
     num_knots = 5
 
@@ -83,6 +83,7 @@ if args.algorithm:
         horizon=horizon, num_knots=num_knots, particles=128, dt=mj_model.opt.timestep,
         ess_resample_thresh=0.5
         )
+
 
 pfmp.run_interactive(
     ctrl,

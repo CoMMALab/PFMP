@@ -6,7 +6,6 @@ from jaxtyping import PyTree, PRNGKeyArray
 from typing import NamedTuple, Callable
 from dataclasses import is_dataclass, fields
 from .interpolate import hermite_interp1d, Jet1, Jet2, Jet3
-from interpax import interp1d
 
 
 DEFAULT_MUJOCO_DT = 0.01
@@ -49,6 +48,13 @@ def get_field_info(x):
 
     raise TypeError(f"Unsupported state type: {type(x)}")
 
+# Predictive Sampling for PFMP
+def ps_update(theta: PyTree, trajs: jax.Array, costs: jax.Array):
+    best_idx = jnp.argmin(jnp.sum(costs, axis=1))
+    new_mean = trajs[best_idx]
+    theta = theta._replace(mean = new_mean)
+    return theta, costs[:,best_idx]
+
 class PFMP(NamedTuple):
     """ Particle Filtering Motion Planning (PFMP) """
 
@@ -70,21 +76,10 @@ class PFMP(NamedTuple):
         else:
             return jnp.linspace(0., self.horizon, self.num_knots)[:-1]
 
-    # def interpolate_step(
-    #     self, x: PyTree, u: JetType,
-    #     theta: PyTree, t: float
-    # ) -> tuple[PyTree,float]:
-    #     u, s = inps
-    #     x_next = self.mpc_dynamics(x, u, theta, s)
-    #     c_next = self.mpc_cost(x_next, u, theta, s)
-    #     return x_next, c_next
-
     @partial(jax.jit, static_argnames=['self'])
     def transition_model(self, key, x0: PyTree, u0: jax.Array, theta: PyTree, t0: float) -> PyTree:
         step_len = self.horizon / (self.num_knots - 1)
         steps_per_knot = int(step_len / self.dt)
-        # step_len = 0.33
-        # steps_per_knot = 33
         t1 = t0 + step_len
 
         # Propose new spline knot
@@ -103,10 +98,6 @@ class PFMP(NamedTuple):
             num=steps_per_knot+1,
             nout=nout
         )
-        # tq = jnp.linspace(t0, t1, steps_per_knot, endpoint=False)
-        # us = interp1d(tq, jnp.array([t0, t1]), jnp.array([u0, u1]), method="cubic")
-        # print(us.shape)
-        # us = us[:,0]
 
         def interpolate_step(
             carry: tuple[jax.Array, float, float],
@@ -114,7 +105,7 @@ class PFMP(NamedTuple):
         ) -> tuple[tuple[jax.Array, float, float], None]:
             x, c = carry
             u, s = inps
-            (x_next, y) = self.mpc_dynamics(x, u, theta, s)
+            (x_next, y) = self.mpc_dynamics(x, u, theta, s)  # should be probabilistic
             c_next = self.mpc_running_cost(x_next, u, theta, s)
             return (x_next, c + c_next), y
 

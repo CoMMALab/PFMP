@@ -1,3 +1,4 @@
 from .algorithm import *
 from .interpolate import hermite_spline
-from .simulation import run_interactive
+from .interactive import run_interactive
+from .passive import run_passive

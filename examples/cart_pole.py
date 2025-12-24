@@ -78,7 +78,7 @@ elif args.algorithm == "sir" or args.algorithm == "sis":
         return x, None
 
     # Cost from Hydrax
-    running_cost = lambda x, j, th, _t: task.running_cost(x, j) * th.mjx_model.opt.timestep
+    running_cost = lambda x, u, th, _t: task.running_cost(x, u) * th.mjx_model.opt.timestep
     terminal_cost = lambda x, th: task.terminal_cost(x)
 
     def init(key, x, th):
@@ -115,7 +115,7 @@ pfmp.run_interactive(
     frequency=50,
     fixed_camera_id=0,
     method=args.algorithm,
-    record_video=False,
+    record_video=True,
     record_traj=False,
     max_step=1000
 )
