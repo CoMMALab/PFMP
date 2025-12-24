@@ -141,8 +141,7 @@ cython_debug/
 # ============================================
 
 # Experiment results
-experiments/
-results/
+experiments/results/
 outputs/
 checkpoints/
 logs/

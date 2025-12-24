@@ -1,0 +1,13 @@
+task: "DoubleCartPole"
+algorithms: ["sis", "sir", "ps", "mppi", "cem"]
+num: 20
+max_step: 1000
+plan_horizon: 1.0
+num_knots: 4
+num_samples: 1024
+noise_level: 0.3
+spline_type: "linear"
+mppi_temperature: 0.1
+cem_num_elites: 3
+cem_sigma_start: 0.5
+cem_sigma_min: 0.1
