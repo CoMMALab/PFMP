@@ -58,13 +58,13 @@ def ps_update(theta: PyTree, trajs: jax.Array, costs: jax.Array):
 class PFMP(NamedTuple):
     """ Particle Filtering Motion Planning (PFMP) """
 
-    mpc_dynamics: Callable
-    mpc_running_cost: Callable
-    mpc_terminal_cost: Callable
-    mpc_init: Callable
-    mpc_proposal: Callable
+    mpc_dynamics: Callable[[PyTree, jax.Array, PyTree, float], tuple[PyTree, jax.Array]]
+    mpc_running_cost: Callable[[PyTree, jax.Array, PyTree, float], float]
+    mpc_terminal_cost: Callable[[PyTree, PyTree], float]    # should be deterministic
+    mpc_init: Callable[[PRNGKeyArray, PyTree, PyTree], jax.Array]
+    mpc_proposal: Callable[[PRNGKeyArray, PyTree, jax.Array, PyTree, float], jax.Array]
 
-    horizon: int
+    horizon: float
     num_knots: int
     particles: int
     ess_resample_thresh: float = 0.5
