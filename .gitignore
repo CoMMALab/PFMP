@@ -142,6 +142,7 @@ cython_debug/
 
 # Experiment results
 experiments/results/
+staging/
 outputs/
 checkpoints/
 logs/

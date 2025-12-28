@@ -8,8 +8,6 @@ from dataclasses import is_dataclass, fields
 from .interpolate import hermite_interp1d, Jet1, Jet2, Jet3
 
 
-DEFAULT_MUJOCO_DT = 0.01
-
 def get_field_info(x):
     """
     Return:
@@ -48,12 +46,29 @@ def get_field_info(x):
 
     raise TypeError(f"Unsupported state type: {type(x)}")
 
-# Predictive Sampling for PFMP
+# Predictive Sampling
 def ps_update(theta: PyTree, trajs: jax.Array, costs: jax.Array):
     best_idx = jnp.argmin(jnp.sum(costs, axis=1))
     new_mean = jax.tree.map(lambda u: u[best_idx], trajs)
     theta = theta._replace(mean = new_mean)
     return theta, costs[:,best_idx]
+
+# Model Predictive Path Integral
+def mppi_update(theta: PyTree, trajs: jax.Array, costs: jax.Array, temperature: float):
+    weights = jnp.exp(-costs / temperature)
+    weights = weights / jnp.sum(weights, axis=1, keepdims=True)
+    new_mean = jax.tree.map(lambda u: jnp.sum(u * weights[:,:,None], axis=1), trajs)
+    theta = theta._replace(mean = new_mean)
+    return theta, jnp.sum(costs * weights, axis=1)
+
+# Cross-Entropy Method
+def cem_update(theta: PyTree, trajs: jax.Array, costs: jax.Array, elite_frac: float):
+    num_elite = int(elite_frac * trajs.shape[0])
+    elite_idxs = jnp.argsort(costs, axis=0)[:num_elite]
+    new_mean = jax.tree.map(lambda u: jnp.mean(u[elite_idxs], axis=0), trajs)
+    new_std  = jax.tree.map(lambda u: jnp.std(u[elite_idxs], axis=0), trajs)
+    theta = theta._replace(mean=new_mean, du_stdev=new_std)
+    return theta, jnp.mean(costs[elite_idxs], axis=0)
 
 class PFMP(NamedTuple):
     """ Particle Filtering Motion Planning (PFMP) """
@@ -68,7 +83,7 @@ class PFMP(NamedTuple):
     num_knots: int
     particles: int
     ess_resample_thresh: float = 0.5
-    dt: float = DEFAULT_MUJOCO_DT
+    dt: float = 0.01
 
     def tk(self, endpoint: bool = True):
         if endpoint:
@@ -92,6 +107,7 @@ class PFMP(NamedTuple):
             nout = 2
         elif isinstance(u0, Jet3):
             nout = 3
+
         tq, us = hermite_interp1d(
             t0, t1,
             u0, u1,
@@ -105,12 +121,12 @@ class PFMP(NamedTuple):
         ) -> tuple[tuple[jax.Array, float, float], None]:
             x, c = carry
             u, s = inps
-            (x_next, y) = self.mpc_dynamics(x, u, theta, s)  # should be probabilistic
+            (x_next, y) = self.mpc_dynamics(x, u, theta, s)
             c_next = self.mpc_running_cost(x_next, u, theta, s)
             return (x_next, c + c_next), y
 
         # Scan over the spline and numerically integrate cost
-        (x1, cost), ys = jax.lax.scan(interpolate_step, (x0, 0.0), (jax.tree.map(lambda u: u[:-1], us), tq[:-1]))
+        (x1, cost), _ys = jax.lax.scan(interpolate_step, (x0, 0.0), (jax.tree.map(lambda u: u[:-1], us), tq[:-1]))
         return (x1, u1), (u1, cost)
 
     @partial(jax.jit, static_argnames=['self'])
@@ -189,7 +205,6 @@ class PFMP(NamedTuple):
             (jnp.zeros(self.particles), x0s, u0s, theta),
             (step_keys, resample_keys, self.tk(endpoint=False))
         )
-        # states = jnp.concat([u0s[None], us], axis=0)
         states = jax.tree.map(lambda u0, u: jnp.concat([u0[None], u], axis=0), u0s, us)
         trajs = self.choose_paths(states, ancestors, jnp.arange(self.particles))
         final_costs = jax.vmap(self.mpc_terminal_cost, in_axes=(0,None))(final_xs, theta)
