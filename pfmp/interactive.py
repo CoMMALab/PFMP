@@ -9,6 +9,7 @@ from mujoco import mjx
 from pfmp.interpolate import Jet2, hermite_spline
 from pfmp.algorithm import ps_update
 from hydrax.utils.video import VideoRecorder
+from typing import Optional, Any
 
 from .passive import Trajectory
 
@@ -19,6 +20,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     mj_model: mujoco.MjModel,
     mj_data: mujoco.MjData,
     frequency: float,
+    ik_interp: Optional[callable] = None,
     initial_knots: jax.Array = None,
     fixed_camera_id: int = None,
     method = "sir",
@@ -101,13 +103,13 @@ def run_interactive(  # noqa: PLR0912, PLR0915
         print(f"knots shape: {init_shape}")
         key, subkey = jax.random.split(key)
         (trajs, costs) = replan(subkey, mjx_data, theta)
-        assert theta.mean.shape == init_shape
+        # assert theta.mean.shape == init_shape
         theta, _ = ps_update(theta, trajs, costs)
-        assert theta.mean.shape == init_shape
+        # assert theta.mean.shape == init_shape
         key, subkey = jax.random.split(key)
         (trajs, costs) = replan(subkey, mjx_data, theta)
         theta, _ = ps_update(theta, trajs, costs)
-        assert theta.mean.shape == init_shape
+        # assert theta.mean.shape == init_shape
     else:
         policy_params = controller.init_params(initial_knots=initial_knots)
         policy_params, rollouts = replan(mjx_data, policy_params)
@@ -193,7 +195,13 @@ def run_interactive(  # noqa: PLR0912, PLR0915
 
             # simulate the system between spline replanning steps
             for i in range(sim_steps_per_replan):
-                mj_data.ctrl[:] = np.array(us[i])
+                if ik_interp is not None:
+                    # For systems that need IK lookup (e.g., push-T)
+                    target_xy = us[i]
+                    u = ik_interp(target_xy, theta.ik_cache)
+                else:
+                    u = us[i]
+                mj_data.ctrl[:] = np.array(u)
                 mujoco.mj_step(mj_model, mj_data)
                 viewer.sync()
                 if record_traj:
@@ -230,12 +238,15 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                 else:
                     nout = 1
                 new_mean = hermite_spline(new_tk, tk, theta.mean, nout=nout)
-                if new_mean.shape != init_shape:
-                    # 1D array
-                    theta = theta._replace(mean=new_mean[:,None])
-                else:
+                if isinstance(theta.mean, Jet2):
                     theta = theta._replace(mean=new_mean)
-                assert theta.mean.shape == init_shape
+                else:
+                    if new_mean.shape != init_shape:
+                        # 1D array
+                        theta = theta._replace(mean=new_mean[:,None])
+                    else:
+                        theta = theta._replace(mean=new_mean)
+                    # assert theta.mean.shape == init_shape
 
     # Preserve the last printout
     print("")

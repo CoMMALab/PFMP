@@ -115,7 +115,7 @@ pfmp.run_interactive(
     frequency=50,
     fixed_camera_id=0,
     method=args.algorithm,
-    record_video=True,
+    record_video=False,
     record_traj=False,
     max_step=1000
 )

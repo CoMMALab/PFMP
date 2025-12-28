@@ -51,7 +51,7 @@ def get_field_info(x):
 # Predictive Sampling for PFMP
 def ps_update(theta: PyTree, trajs: jax.Array, costs: jax.Array):
     best_idx = jnp.argmin(jnp.sum(costs, axis=1))
-    new_mean = trajs[best_idx]
+    new_mean = jax.tree.map(lambda u: u[best_idx], trajs)
     theta = theta._replace(mean = new_mean)
     return theta, costs[:,best_idx]
 
@@ -110,7 +110,7 @@ class PFMP(NamedTuple):
             return (x_next, c + c_next), y
 
         # Scan over the spline and numerically integrate cost
-        (x1, cost), ys = jax.lax.scan(interpolate_step, (x0, 0.0), (us[:-1], tq[:-1]))
+        (x1, cost), ys = jax.lax.scan(interpolate_step, (x0, 0.0), (jax.tree.map(lambda u: u[:-1], us), tq[:-1]))
         return (x1, u1), (u1, cost)
 
     @partial(jax.jit, static_argnames=['self'])
@@ -189,7 +189,8 @@ class PFMP(NamedTuple):
             (jnp.zeros(self.particles), x0s, u0s, theta),
             (step_keys, resample_keys, self.tk(endpoint=False))
         )
-        states = jnp.concat([u0s[None], us], axis=0)
+        # states = jnp.concat([u0s[None], us], axis=0)
+        states = jax.tree.map(lambda u0, u: jnp.concat([u0[None], u], axis=0), u0s, us)
         trajs = self.choose_paths(states, ancestors, jnp.arange(self.particles))
         final_costs = jax.vmap(self.mpc_terminal_cost, in_axes=(0,None))(final_xs, theta)
         costs = jnp.concatenate((costs.T, final_costs[:,None]), axis=-1)

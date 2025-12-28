@@ -1,199 +1,164 @@
+"""
+T-block pushing task using PFMP with Panda robot.
+
+Refactored to use the new PFMP API with Jet2 controls and cached IK.
+"""
+
+import argparse
 import os
+import time
+from io import StringIO
+from typing import NamedTuple, Tuple
+from xml.etree import ElementTree as ET
+
 import jax
 import jax.numpy as jnp
 import jax_dataclasses as jdc
-import yourdfpy
-import mujoco
-import time
-import os, time
-import numpy as np
-import jaxls
 import jaxlie
+import jaxls
+import mujoco
+import numpy as np
 import pyroki as pk
-
-
-from xml.etree import ElementTree as ET
-from io import StringIO
-from genjax import gen, mv_normal
-from jax.scipy.spatial.transform import Rotation
+import yourdfpy
 from mujoco import mjx
-from typing import NamedTuple, Tuple
-from mujoco.viewer import launch_passive
-from pfmp import PFMP #, make_transition_model
 
+import pfmp
+from pfmp.interpolate import Jet2
 
 # ===============================
-# Robot setup
+# Configuration
 # ===============================
 
-ROBOT_URDF_PATH = "/home/austin/src/panda_scripts/assets/panda_spherized.urdf"
+ROBOT_URDF_PATH = os.path.expanduser("~/src/PFMP/models/panda_spherized.urdf")
+SCENE_XML_PATH = os.path.expanduser("~/src/PFMP/models/mjx_t_push.xml")
 
-# Load URDF
-urdf = yourdfpy.URDF.load(ROBOT_URDF_PATH)
-
-# Convert prismatic joints to fixed (like in IK-Beam benchmark)
-xml_tree = urdf.write_xml()
-for joint in xml_tree.findall('.//joint[@type="prismatic"]'):
-    joint.set("type", "fixed")
-    for tag in ("axis", "limit", "dynamics"):
-        child = joint.find(tag)
-        if child is not None:
-            joint.remove(child)
-
-# Reload robot with modified XML
-xml_str = ET.tostring(xml_tree.getroot(), encoding="unicode")
-urdf = yourdfpy.URDF.load(StringIO(xml_str))
-
-# Build Pyroki robot object
-PANDA = pk.Robot.from_urdf(urdf)
+# End-effector configuration
 EE_ID = 12
+EE_HEIGHT = 0.06
+
+# Workspace bounds for IK cache
+WORKSPACE_XY_MIN = jnp.array([0.2, -0.5])
+WORKSPACE_XY_MAX = jnp.array([0.6, 0.5])
+IK_CACHE_RESOLUTION = 64
+
+# Fixed end-effector orientation (pointing down)
+EE_ROTATION = jnp.array([
+    [1., 0., 0.],
+    [0., -1., 0.],
+    [0., 0., -1.],
+])
+
+# T-block qpos offset in the MuJoCo state
 T_QPOS_OFFSET = 9
 
-class PParams(NamedTuple):
-    mjx_model: mjx.Model
-    t_qpos_offset: int
-    goal_xy: jax.Array
-    goal_angle: jax.Array
-    cost_factors: jax.Array
-    u_stdev: float
-    du_stdev: float
-    ddu_stdev: float
 
-class StateTracker(NamedTuple):
-    qpos: jax.Array
-    txyz: jax.Array
+# ===============================
+# Robot Setup (Pyroki IK)
+# ===============================
 
-def load_mj(name: str):
-    os.chdir("tests/mjx_mod/assets")
-    with open(f"{name}.xml", 'r') as f:
-        xml = f.read()
 
-    mj_model = mujoco.MjModel.from_xml_string(xml)
-    mj_data = mujoco.MjData(mj_model)
+def load_panda_robot():
+    """Load and configure the Panda robot for IK."""
+    urdf = yourdfpy.URDF.load(ROBOT_URDF_PATH)
 
-    key_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_KEY, "home")
-    mujoco.mj_resetDataKeyframe(mj_model, mj_data, key_id)
-    return (mj_model, mj_data)
+    # Convert prismatic joints to fixed
+    xml_tree = urdf.write_xml()
+    for joint in xml_tree.findall('.//joint[@type="prismatic"]'):
+        joint.set("type", "fixed")
+        for tag in ("axis", "limit", "dynamics"):
+            child = joint.find(tag)
+            if child is not None:
+                joint.remove(child)
 
-# Debug draw: red line + green target
-def add_line(user_scn, p0, p1, radius=0.004, color=(1,0,0,0.7)):
-    p0 = np.asarray(p0); p1 = np.asarray(p1)
-    mid = 0.5*(p0+p1)
-    v = p1 - p0
-    L = np.linalg.norm(v) + 1e-12
-    z = v / L
-    a = np.array([1.0,0.0,0.0]) if abs(z[0]) < 0.9 else np.array([0.0,1.0,0.0])
-    x = a - np.dot(a, z)*z; x /= (np.linalg.norm(x)+1e-12)
-    y = np.cross(z, x)
-    R = np.stack([x,y,z], axis=1)
-    geom = user_scn.geoms[user_scn.ngeom]
-    mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_CYLINDER,
-                        size=[radius, 0.5*L, 0.0], pos=mid, mat=R.flatten(), rgba=color)
-    user_scn.ngeom += 1
+    xml_str = ET.tostring(xml_tree.getroot(), encoding="unicode")
+    urdf = yourdfpy.URDF.load(StringIO(xml_str))
 
-def add_sphere(scene, pos, radius=0.0025, rgba=(0,1,0,0.9)):
-    if scene.ngeom >= scene.maxgeom: return
-    geom = scene.geoms[scene.ngeom]
-    mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_SPHERE,
-                        size=[radius,0,0], pos=pos, mat=np.eye(3).flatten(), rgba=rgba)
-    scene.ngeom += 1
+    return pk.Robot.from_urdf(urdf)
 
-def add_goal_T(user_scn,
-               goal_xy,
-               yaw_rad,
-               rgba=(0., 0., 0., 0.25),
-               z_shadow=1e-3,
-               thickness=5e-4):
-    """
-    Draw a translucent T-shaped 'shadow' using the user scene (passive viewer).
-    Geometry matches the model's t_stem/t_bar XY half-sizes; Z is made very thin.
 
-    Args:
-        user_scn: viewer.user_scn
-        goal_xy: (x, y) world position for the T body origin (matching t_block frame)
-        yaw_rad: rotation about +Z (radians)
-        rgba: color/alpha of the shadow
-        z_shadow: world Z to place the shadow (slightly above plane to avoid z-fighting)
-        thickness: half-thickness along Z for the two box geoms (very small)
-    """
-    # Guard: need 2 geoms available
-    if user_scn.ngeom + 2 > user_scn.maxgeom:
-        return
+PANDA = load_panda_robot()
 
-    # ---- Match the model's T dimensions (half-sizes) ----
-    # stem: centered at body origin
-    stem_half = np.array([0.0225, 0.0675, thickness], dtype=float)
-    # bar: centered at +y by 0.0675 in the T local frame
-    bar_half  = np.array([0.0675, 0.0225, thickness], dtype=float)
-    bar_off_y = 0.0675
 
-    # ---- Pose ----
-    x, y = np.asarray(goal_xy, dtype=float)
-    pos_world = np.array([x, y, float(z_shadow)], dtype=float)
+# ===============================
+# IK Cache
+# ===============================
 
-    c, s = float(np.cos(yaw_rad)), float(np.sin(yaw_rad))
-    R = np.array([[ c, -s, 0.0],
-                  [ s,  c, 0.0],
-                  [0.0, 0.0, 1.0]], dtype=float)
+class IKCache(NamedTuple):
+    """Precomputed IK solutions on a 2D grid."""
+    xy_min: jax.Array      # (2,) lower bounds
+    xy_max: jax.Array      # (2,) upper bounds
+    q_grid: jax.Array      # (Nx, Ny, 7) joint configurations
+    z: float               # fixed height
 
-    # ---- Stem (centered at body origin) ----
-    geom = user_scn.geoms[user_scn.ngeom]
-    mujoco.mjv_initGeom(
-        geom,
-        mujoco.mjtGeom.mjGEOM_BOX,
-        size=stem_half,
-        pos=pos_world,
-        mat=R.flatten(),
-        rgba=rgba
-    )
-    user_scn.ngeom += 1
+@jax.jit
+def ik_from_cache(xy: jax.Array, ik_cache: IKCache) -> jax.Array:
+    """Look up IK solution from cache using bilinear interpolation."""
+    # Normalize to [0, 1]
+    uv = (xy - ik_cache.xy_min) / (ik_cache.xy_max - ik_cache.xy_min)
+    uv = jnp.clip(uv, 0.0, 1.0)
+    
+    # Grid dimensions
+    Nx, Ny = ik_cache.q_grid.shape[:2]
+    
+    # Convert to grid coordinates
+    gx = uv[0] * (Nx - 1)
+    gy = uv[1] * (Ny - 1)
+    
+    # Integer indices
+    ix = jnp.floor(gx).astype(jnp.int32)
+    iy = jnp.floor(gy).astype(jnp.int32)
+    ix = jnp.clip(ix, 0, Nx - 2)
+    iy = jnp.clip(iy, 0, Ny - 2)
+    
+    # Fractional parts
+    fx = gx - ix
+    fy = gy - iy
+    
+    # Bilinear interpolation
+    q00 = ik_cache.q_grid[ix,     iy    ]
+    q01 = ik_cache.q_grid[ix,     iy + 1]
+    q10 = ik_cache.q_grid[ix + 1, iy    ]
+    q11 = ik_cache.q_grid[ix + 1, iy + 1]
+    
+    q0 = q00 * (1 - fy) + q01 * fy
+    q1 = q10 * (1 - fy) + q11 * fy
+    q = q0 * (1 - fx) + q1 * fx
+    
+    return q
 
-    # ---- Bar (offset +y in local frame, then rotated to world) ----
-    bar_center_world = pos_world + R @ np.array([0.0, bar_off_y, 0.0], dtype=float)
 
-    geom = user_scn.geoms[user_scn.ngeom]
-    mujoco.mjv_initGeom(
-        geom,
-        mujoco.mjtGeom.mjGEOM_BOX,
-        size=bar_half,
-        pos=bar_center_world,
-        mat=R.flatten(),
-        rgba=rgba
-    )
-    user_scn.ngeom += 1
-
-# ---------------------- IK (pose -> q*) ----------------------
 
 @jax.jit
 def mat4_from_pose(t: jax.Array, R: jax.Array) -> jax.Array:
+    """Create 4x4 transformation matrix from translation and rotation."""
     return jnp.array([
-        [R[0,0], R[0,1], R[0,2], t[0]],
-        [R[1,0], R[1,1], R[1,2], t[1]],
-        [R[2,0], R[2,1], R[2,2], t[2]],
-        [0.    , 0.    , 0.    , 1.  ]
+        [R[0, 0], R[0, 1], R[0, 2], t[0]],
+        [R[1, 0], R[1, 1], R[1, 2], t[1]],
+        [R[2, 0], R[2, 1], R[2, 2], t[2]],
+        [0., 0., 0., 1.]
     ])
 
-@jax.jit
-def quat_wxyz_from_R(R: jax.Array):
-    return Rotation.from_matrix(R).as_quat(scalar_first=True)
 
-@jax.jit
 def pose_from_mat4(mat4: jax.Array) -> Tuple[jax.Array, jax.Array]:
+    """Extract translation and quaternion from 4x4 matrix."""
     if mat4.shape[-1] == 16:
-        m = jnp.reshape(mat4, mat4.shape[:-1] + (4, 4))
+        m = mat4.reshape((*mat4.shape[:-1], 4, 4))
     else:
         m = mat4
-    R = m[..., :3, :3]
-    t = m[..., :3, 3]
-    return t, quat_wxyz_from_R(R)
+    R = m[:3, :3]
+    t = m[:3, 3]
+    q = jaxlie.SO3.from_matrix(R).wxyz
+    return t.reshape(3,), q.reshape(4,)
+
 
 @jdc.jit
 def make_ik_problem(
-        target_mat4: jax.Array,
-        pos_weight: float = 50.0,
-        ori_weight: float = 10.0,
-        weight: float = 100.0
-    ):
+    target_mat4: jax.Array,
+    pos_weight: float = 50.0,
+    ori_weight: float = 10.0,
+    limit_weight: float = 100.0
+):
+    """Create IK optimization problem."""
     target_p, target_q = pose_from_mat4(target_mat4)
     joint_var = PANDA.joint_var_cls(0)
     T_target = jaxlie.SE3.from_rotation_and_translation(
@@ -211,23 +176,27 @@ def make_ik_problem(
         pk.costs.limit_cost(
             PANDA,
             joint_var,
-            weight=weight,
+            weight=limit_weight,
         ),
     ]
     return jaxls.LeastSquaresProblem(factors, [joint_var]).analyze(), joint_var
 
+
 @jax.jit
 def ik_7d_from_mat4(target_mat4: jax.Array) -> jax.Array:
-    prob0, joint_var0 = make_ik_problem(target_mat4)
-    sol0 = prob0.solve(
+    """Solve IK for target pose (cold start)."""
+    prob, joint_var = make_ik_problem(target_mat4)
+    sol = prob.solve(
         verbose=False,
         linear_solver="dense_cholesky",
         trust_region=jaxls.TrustRegionConfig(lambda_initial=1.0),
     )
-    return sol0[joint_var0]
+    return sol[joint_var]
+
 
 @jax.jit
-def step_ik_7d_from_mat4(prev_q: jax.Array, target_mat4: jax.Array) -> tuple[jax.Array,jax.Array]:
+def ik_step_from_mat4(prev_q: jax.Array, target_mat4: jax.Array) -> Tuple[jax.Array, jax.Array]:
+    """Solve IK with warm start."""
     prob, joint_var = make_ik_problem(target_mat4)
     sol = prob.solve(
         initial_vals=jaxls.VarValues.make([joint_var.with_value(prev_q)]),
@@ -238,232 +207,329 @@ def step_ik_7d_from_mat4(prev_q: jax.Array, target_mat4: jax.Array) -> tuple[jax
     q = sol[joint_var]
     return q, q
 
-@jax.jit
-def ik_7d_from_mat4s(target_mat4s: jax.Array) -> jax.Array:
-    q0 = ik_7d_from_mat4(target_mat4s[0])
-    _, qs = jax.lax.scan(step_ik_7d_from_mat4, q0, target_mat4s[1:])
-    return jnp.concatenate([q0[None, ...], qs])
 
-class ParParams(NamedTuple):
-    # goal: jax.Array
-    # obstacles: jax.Array
-    # collision_multiplier: float
-    u_stdev: float
-    du_stdev: float
-    ddu_stdev: float
+def ik_from_xy(xy: jax.Array, z: float = EE_HEIGHT) -> jax.Array:
+    """Solve IK for xy position with fixed z and orientation."""
+    xyz = jnp.array([xy[0], xy[1], z])
+    mat4 = mat4_from_pose(xyz, EE_ROTATION)
+    return ik_7d_from_mat4(mat4)
 
-def init_mjx(mj_model, mj_data):
-    mjx_model = mjx.put_model(mj_model)
-    x0 = mjx.put_data(mj_model, mj_data)
 
-    return x0, PParams(
-        mjx_model,
-        t_qpos_offset=9,
-        goal_xy=jnp.array([0.4, 0.]),
-        goal_angle=3*jnp.pi/4,
-        cost_factors=jnp.array([3.0, 3.0, 0.5]),
-        u_stdev=0.0125,
-        du_stdev=0.01,
-        ddu_stdev=0.1
+def ik_step_from_xy(prev_q: jax.Array, xy: jax.Array, z: float = EE_HEIGHT) -> jax.Array:
+    """Solve IK for xy with warm start."""
+    xyz = jnp.array([xy[0], xy[1], z])
+    mat4 = mat4_from_pose(xyz, EE_ROTATION)
+    q, _ = ik_step_from_mat4(prev_q, mat4)
+    return q
+
+
+def build_ik_cache(
+    xy_min: jax.Array,
+    xy_max: jax.Array,
+    resolution: int = 50,
+    z: float = EE_HEIGHT,
+    verbose: bool = True
+) -> IKCache:
+    """Build IK cache by solving IK on a grid."""
+    xy_min = jnp.asarray(xy_min)
+    xy_max = jnp.asarray(xy_max)
+    
+    xs = jnp.linspace(xy_min[0], xy_max[0], resolution)
+    ys = jnp.linspace(xy_min[1], xy_max[1], resolution)
+    
+    if verbose:
+        print(f"Building IK cache: {resolution}x{resolution} = {resolution**2} points")
+        print(f"  x: [{float(xy_min[0]):.3f}, {float(xy_max[0]):.3f}]")
+        print(f"  y: [{float(xy_min[1]):.3f}, {float(xy_max[1]):.3f}]")
+        print(f"  z: {z:.3f} (fixed)")
+    
+    t0 = time.perf_counter()
+    
+    q_grid = np.zeros((resolution, resolution, 7))
+    
+    for i, x in enumerate(xs):
+        if verbose and i % 10 == 0:
+            print(f"  Row {i}/{resolution}...")
+        
+        for j, y in enumerate(ys):
+            xy = jnp.array([float(x), float(y)])
+            
+            if i == 0 and j == 0:
+                q = ik_from_xy(xy, z)
+            elif j == 0:
+                q = ik_step_from_xy(jnp.array(q_grid[i-1, 0]), xy, z)
+            else:
+                q = ik_step_from_xy(jnp.array(q_grid[i, j-1]), xy, z)
+            
+            q_grid[i, j] = np.array(q)
+    
+    elapsed = time.perf_counter() - t0
+    
+    if verbose:
+        print(f"  Cache built in {elapsed:.2f}s ({resolution**2 / elapsed:.1f} solves/sec)")
+    
+    return IKCache(
+        xy_min=xy_min, 
+        xy_max=xy_max, 
+        q_grid=jnp.array(q_grid), 
+        z=z
     )
 
 
-HEIGHT = 0.06
+# ===============================
+# Task Parameters
+# ===============================
 
-# @gen
-# def proposal_fn(x: mjx.Data, u: jax.Array, th: ParParams, t: int) -> jax.Array:
-#     nu = u.shape[1]  # eg. Cartesian 2D/3D 
-#     pred_x = mv_normal(x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET+2], jnp.eye(nu) * theta.u_stdev) @ "u"
-#     pred_v = mv_normal(u[1], jnp.eye(nu) * th.du_stdev) @ "du"
-#     return jnp.array([pred_x, pred_v])  # cubic
 
-def proposal_fn(key, x, u, th, t):
-    nu = u.shape[1]  # eg. Cartesian 2D/3D 
-    key1, key2 = jax.random.split(key)
-    pred_x = jax.random.normal(key1, (nu,)) * jnp.sqrt(th.u_stdev) + x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET+2]
-    pred_v = jax.random.normal(key2, (nu,)) * jnp.sqrt(th.du_stdev) + u[1]
-    # pred_x = mv_normal(x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET+2], jnp.eye(nu) * theta.u_stdev)
-    # pred_v = mv_normal(u[1], jnp.eye(nu) * th.du_stdev) @ "du"
-    return jnp.array([pred_x, pred_v])  # cubic
+class PushParams(NamedTuple):
+    """Parameters for the T-block pushing task."""
+    mean: jax.Array
+    mjx_model: mjx.Model
+    ik_cache: IKCache
+    goal_xy: jax.Array
+    goal_angle: jax.Array
+    pos_weight: float
+    angle_weight: float
+    u_stdev: float
+    du_stdev: float
 
-def dynamics_fn(x, u, th, t) -> Tuple[jax.Array,jax.Array]:
-    target_xyz = jnp.array([u[0,0], u[0,1], HEIGHT])
-    target_R = jnp.array([
-        [1.,  0.,  0.],
-        [0., -1.,  0.],
-        [0.,  0., -1.],
-    ])
-    target_eefk = mat4_from_pose(target_xyz, target_R)
-    target_qpos = step_ik_7d_from_mat4(x.qpos[:7], target_eefk)[0]
-    x = x.replace(ctrl = target_qpos)
-    x_next = mjx.step(th.mjx_model, x)
-    return x_next, StateTracker(qpos=x.qpos, txyz=target_xyz)
+
+# ===============================
+# Helper Functions
+# ===============================
+
 
 @jax.jit
-def _quat_yaw_wxyz(q):
-    # q = (w, x, y, z) per MuJoCo
+def quat_yaw_wxyz(q: jax.Array) -> jax.Array:
+    """Extract yaw angle from quaternion (w, x, y, z)."""
     w, x, y, z = q
     siny_cosp = 2.0 * (w * z + x * y)
     cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
     return jnp.arctan2(siny_cosp, cosy_cosp)
 
+
 @jax.jit
-def _angle_wrap(a):
-    # maps to (-pi, pi]
+def angle_wrap(a: jax.Array) -> jax.Array:
+    """Wrap angle to (-pi, pi]."""
     return (a + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
 
-def error_fn(th: PParams, t_qpos: jax.Array) -> jax.Array:
-    t_xy    = t_qpos[:2]
-    t_quat  = t_qpos[3:7]
-    t_yaw   = _quat_yaw_wxyz(t_quat)
-    x_err, y_err = t_xy - th.goal_xy
-    ang_err = _angle_wrap(t_yaw - th.goal_angle)
-    return jnp.array([x_err, y_err, ang_err])
 
 @jax.jit
-def cost_fn(x: mjx.Data, _u, th: PParams, _t) -> float:
-    # Free joint layout: [px, py, pz, qw, qx, qy, qz]
-    error = error_fn(th, x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET+7])
-    return jnp.dot(th.cost_factors, error ** 2)
+def compute_error(th: PushParams, t_qpos: jax.Array) -> jax.Array:
+    """Compute position and angle error for T-block."""
+    t_xy = t_qpos[:2]
+    t_quat = t_qpos[3:7]
+    t_yaw = quat_yaw_wxyz(t_quat)
+
+    x_err = t_xy[0] - th.goal_xy[0]
+    y_err = t_xy[1] - th.goal_xy[1]
+    ang_err = angle_wrap(t_yaw - th.goal_angle)
+
+    return jnp.array([x_err, y_err, ang_err])
+
+
+# ===============================
+# PFMP Task Functions
+# ===============================
+
+
+def dynamics(x: mjx.Data, u: Jet2, th: PushParams, t: float) -> Tuple[mjx.Data, jax.Array]:
+    """
+    Dynamics function for the pushing task.
+
+    Uses cached IK for fast lookup.
+    """
+    # Extract target position from Jet2
+    target_xy = u.u  # (2,) array
+
+    # Fast IK lookup from cache
+    target_qpos = ik_from_cache(target_xy, th.ik_cache)
+
+    # Step simulation with computed joint targets
+    x_next = mjx.step(th.mjx_model, x.replace(ctrl=target_qpos))
+
+    return x_next, target_xy
+
+
+def running_cost(x: mjx.Data, u: Jet2, th: PushParams, t: float) -> jax.Array:
+    """Running cost penalizing distance from goal."""
+    t_qpos = x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 7]
+    error = compute_error(th, t_qpos)
+
+    pos_cost = th.pos_weight * (error[0] ** 2 + error[1] ** 2)
+    angle_cost = th.angle_weight * error[2] ** 2
+
+    return pos_cost + angle_cost
+
+
+def terminal_cost(x: mjx.Data, th: PushParams) -> jax.Array:
+    """Terminal cost for final state."""
+    t_qpos = x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 7]
+    error = compute_error(th, t_qpos)
+
+    pos_cost = 10.0 * th.pos_weight * (error[0] ** 2 + error[1] ** 2)
+    angle_cost = 10.0 * th.angle_weight * error[2] ** 2
+
+    return pos_cost + angle_cost
+
+
+def init_control(key: jax.Array, x: mjx.Data, th: PushParams) -> Jet2:
+    """Initialize control near current T-block position."""
+    key1, key2 = jax.random.split(key)
+
+    t_xy = x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 2]
+    u = t_xy + jax.random.normal(key1, (2,)) * th.u_stdev
+    du = jax.random.normal(key2, (2,)) * th.du_stdev
+
+    return Jet2(u=u, du=du)
+
+
+def proposal(key: jax.Array, x: mjx.Data, u: Jet2, th: PushParams, t: float) -> Jet2:
+    """Proposal distribution for control sampling."""
+    key1, key2 = jax.random.split(key)
+
+    u_next = u.u + jax.random.normal(key1, (2,)) * th.u_stdev
+    du_next = u.du + jax.random.normal(key2, (2,)) * th.du_stdev
+
+    return Jet2(u=u_next, du=du_next)
+
+
+# ===============================
+# Visualization Helpers
+# ===============================
+
+
+def add_goal_T(
+    user_scn,
+    goal_xy: np.ndarray,
+    yaw_rad: float,
+    rgba=(0., 0., 0., 0.25),
+    z_shadow=1e-3,
+    thickness=5e-4
+):
+    """Draw a translucent T-shaped goal marker."""
+    if user_scn.ngeom + 2 > user_scn.maxgeom:
+        return
+
+    stem_half = np.array([0.0225, 0.0675, thickness], dtype=float)
+    bar_half = np.array([0.0675, 0.0225, thickness], dtype=float)
+    bar_off_y = 0.0675
+
+    x, y = np.asarray(goal_xy, dtype=float)
+    pos_world = np.array([x, y, float(z_shadow)], dtype=float)
+
+    c, s = float(np.cos(yaw_rad)), float(np.sin(yaw_rad))
+    R = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=float)
+
+    geom = user_scn.geoms[user_scn.ngeom]
+    mujoco.mjv_initGeom(
+        geom, mujoco.mjtGeom.mjGEOM_BOX,
+        size=stem_half, pos=pos_world, mat=R.flatten(), rgba=rgba
+    )
+    user_scn.ngeom += 1
+
+    bar_center = pos_world + R @ np.array([0.0, bar_off_y, 0.0], dtype=float)
+    geom = user_scn.geoms[user_scn.ngeom]
+    mujoco.mjv_initGeom(
+        geom, mujoco.mjtGeom.mjGEOM_BOX,
+        size=bar_half, pos=bar_center, mat=R.flatten(), rgba=rgba
+    )
+    user_scn.ngeom += 1
+
+
+# ===============================
+# Main
+# ===============================
+
+
+def load_scene(xml_path: str):
+    """Load MuJoCo model and data."""
+    mj_model = mujoco.MjModel.from_xml_path(xml_path)
+    mj_data = mujoco.MjData(mj_model)
+
+    key_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_KEY, "home")
+    if key_id >= 0:
+        mujoco.mj_resetDataKeyframe(mj_model, mj_data, key_id)
+
+    return mj_model, mj_data
+
+
+def main():
+    parser = argparse.ArgumentParser(description="T-block pushing with PFMP")
+    parser.add_argument('--cache-resolution', type=int, default=IK_CACHE_RESOLUTION,
+                        help='IK cache grid resolution')
+    subparsers = parser.add_subparsers(dest="algorithm", required=True)
+    subparsers.add_parser("sis", help="Sequential Importance Sampling")
+    subparsers.add_parser("sir", help="Sequential Importance Resampling")
+    args = parser.parse_args()
+
+    # Load scene
+    mj_model, mj_data = load_scene(SCENE_XML_PATH)
+
+    # Build IK cache (one-time cost)
+    print("Building IK cache...")
+    ik_cache = build_ik_cache(
+        xy_min=WORKSPACE_XY_MIN,
+        xy_max=WORKSPACE_XY_MAX,
+        resolution=args.cache_resolution,
+        z=EE_HEIGHT,
+        verbose=True
+    )
+
+    # Task configuration
+    horizon = 1.0
+    num_knots = 4
+    particles = 256
+
+    # Initial end-effector position
+    init_xy = jnp.array([0.4, -0.3])
+    
+    # Get initial joint config from cache
+    q0 = ik_from_cache(init_xy, ik_cache)
+    mj_data.qpos[:7] = np.array(q0)
+
+    # Create parameters
+    theta = PushParams(
+        mean=jnp.zeros((num_knots, 2)),
+        mjx_model=mjx.put_model(mj_model),
+        ik_cache=ik_cache,
+        goal_xy=jnp.array([-0.4, 0.3]),
+        goal_angle=-0.2,
+        pos_weight=3.0,
+        angle_weight=0.5,
+        u_stdev=0.05,
+        du_stdev=0.1,
+    )
+
+    # Create PFMP controller
+    ctrl = pfmp.PFMP(
+        dynamics,
+        running_cost,
+        terminal_cost,
+        init_control,
+        proposal,
+        horizon=horizon,
+        num_knots=num_knots,
+        particles=particles,
+        dt=mj_model.opt.timestep,
+        ess_resample_thresh=0.8,
+    )
+
+    # Run interactive simulation
+    pfmp.run_interactive(
+        ctrl,
+        theta,
+        mj_model,
+        mj_data,
+        ik_interp=ik_from_cache,
+        frequency=50,
+        method=args.algorithm,
+        fixed_camera_id=None,
+        record_video=True,
+        record_traj=False,
+        max_step=2000,
+    )
 
 
 if __name__ == "__main__":
-    K = 1000
-    H = 20
-    L = 80
-    RHO = 0.8
-    (mj_model, mj_data) = load_mj("mjx_t_push")
-
-
-    EE_SITE = "gripper"
-    ee_sid = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_SITE, EE_SITE)
-
-    u0 = jnp.array([
-        [0.4, -0.3],  # ( x0,  y0)
-        [0.0,  0.2]   # (vx0, vy0)
-    ])
-    
-    # p0 = mj_data.site_xpos[ee_sid].copy()
-    # R0 = mj_data.site_xmat[ee_sid].reshape(3,3).copy()
-    txyz = jnp.array([u0[0,0], u0[0,1], HEIGHT])
-    tR = jnp.array([
-        [1.,  0.,  0.],
-        [0., -1.,  0.],
-        [0.,  0., -1.],
-    ])
-    q0 = ik_7d_from_mat4(mat4_from_pose(txyz, tR))
-    mj_data.qpos[:7] = q0
-    (x0, theta) = init_mjx(mj_model, mj_data)
-    theta = theta._replace(goal_xy = jnp.array([-0.4, 0.3]), goal_angle=-0.2)
-    # theta = theta._replace(goal_xy = jnp.array([0.4, -0.3]), goal_angle=-0.2)
-    qpos = jnp.concat((q0,mj_data.qpos[7:]))
-    x0 = x0.replace(qpos=qpos)
-
-    key = jax.random.key(42)
-    # pfmp = PFMP(make_transition_model(proposal_fn, cost_fn, dynamics_fn, l=L))
-    pfmp = PFMP(dynamics_fn, cost_fn, proposal_fn)
-    # trajs, _ = pfmp.run_sis(key, x0, u0, theta, H, K)
-    # trajs = trajs.reshape(K,-1,3)
-
-    print("starting")
-    t0 = time.time()
-    states, ancestors = pfmp.run_sir(key, x0, u0, theta, H, K, RHO)
-    trajs = pfmp.choose_paths(states, ancestors, jnp.arange(K))
-    trajs = jax.tree.map(lambda x: x.reshape(K,-1,x.shape[-1]), trajs)
-    besti = jnp.argmin(
-        jnp.array([
-            jnp.dot(
-                theta.cost_factors,
-                error_fn(theta, tau[T_QPOS_OFFSET:T_QPOS_OFFSET+7]) ** 2
-            )
-        for tau in trajs.qpos[-1]])
-    )
-    traj = jax.tree.map(lambda x: x[besti], trajs)
-    # traj = jax.tree.map(lambda x: x.reshape(-1,x.shape[-1]), traj)
-    print(f"JIT time = {time.time() - t0}")
-    # t0 = time.time()
-
-    # states, ancestors = jax.block_until_ready(pfmp.run_sir(key, x0, u0, theta, H, K, RHO))
-    # traj = jax.block_until_ready(pfmp.choose_path(states, ancestors, 0))
-    # print(f"Run time = {time.time() - t0}")
-    # t0 = time.time()
-
-    # print(traj.qpos)
-
-    num_samples = 20
-
-    import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  # needed for 3D projection
-
-    # trajs.shape = (20, 960, 3)
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection="3d")
-
-    for i in range(trajs.txyz.shape[0]):
-        ax.plot(
-            trajs.txyz[i, :, 0],  # x
-            trajs.txyz[i, :, 1],  # y
-            trajs.txyz[i, :, 2],  # z
-            color="m",
-            alpha=0.5,
-        )
-
-    ax.plot(
-        traj.txyz[:, 0],  # x
-        traj.txyz[:, 1],  # y
-        traj.txyz[:, 2],  # z
-        color="green",
-        alpha=1.0
-    )
-
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_zlabel("z")
-    plt.show()
-
-    t = 0
-    with launch_passive(
-            mj_model,
-            data=mj_data,
-            show_left_ui=False,
-            show_right_ui=False,
-        ) as viewer:
-        while True:
-            # txyz = traj[t]
-            # mj_data.ctrl[:7] = step_ik_7d_from_mat4(mj_data.qpos[:7], mat4_from_pose(txyz, R_des))[0]
-            txyz = traj.txyz[t]
-            mj_data.qpos = traj.qpos[t]
-            mujoco.mj_step(mj_model, mj_data)
-
-            print(f"errors = {error_fn(theta, mj_data.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET+7])}")
-
-            # Clear previous markers
-            viewer.user_scn.ngeom = 0
-
-            # Add goal marker
-            add_goal_T(viewer.user_scn, theta.goal_xy, theta.goal_angle, rgba = (0, 0, 1, 0.9))
-
-            # Add knot markers
-            for n in range(0,H*L,L):
-                add_sphere(viewer.user_scn, traj.txyz[n], radius=0.01)
-
-            # Add interpolated markers
-            # for n in range(0,H*L):
-            #     add_sphere(viewer.user_scn, traj.txyz[n], radius=0.0025)
-            
-            # Add continuous PBC marker
-            add_sphere(viewer.user_scn, txyz, radius=0.02)
-
-            # Add continuous PBC error line
-            xpos = mj_data.site_xpos[ee_sid].copy()
-            add_line(
-                viewer.user_scn,
-                xpos,
-                txyz,
-                radius=0.005,
-                color=[1, 0, 0, 0.5]
-            )
-            
-            time.sleep(0.01)
-            viewer.sync()
-            t += 1
+    main()
