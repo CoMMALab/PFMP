@@ -1,3 +1,5 @@
+# drone.py
+
 import argparse
 
 import mujoco
@@ -7,29 +9,13 @@ import pfmp
 
 from mujoco import mjx
 from hydrax.task_base import Task
-from hydrax.algs import PredictiveSampling, MPPI
-from hydrax.simulation.deterministic import run_interactive
+from hydrax.algs import PredictiveSampling
 from typing import NamedTuple
 
 
-# class DroneRace(Task):
-#     def __init__(self) -> None:
-#         self.goal = jnp.array([5.0, 0.0, 1.0])
-#         mj_model = mujoco.MjModel.from_xml_path("./tests/mjx_mod/assets/x2_scene.xml")
-#         super().__init__(mj_model)
-
-#     def running_cost(self, state: mjx.Data, control: jax.Array) -> jax.Array:
-#         err = state.qpos[:3] - self.goal
-#         return jnp.dot(err, err) + \
-#                jnp.dot(1 - state.qpos[3], 1 - state.qpos[3])
-
-#     def terminal_cost(self, state: mjx.Data) -> jax.Array:
-#         err = state.qpos[:3] - self.goal
-#         return jnp.dot(err, err)
-
 class DroneRace(Task):
     def __init__(self) -> None:
-        mj_model = mujoco.MjModel.from_xml_path("./tests/mjx_mod/assets/x2_scene.xml")
+        mj_model = mujoco.MjModel.from_xml_path("./models/x2_scene.xml")
 
         self.goal = jnp.array([5.0, 0.0, 1.0])
         
@@ -126,42 +112,22 @@ elif args.algorithm == "sis" or "sir":
     horizon = 1.0
     num_knots = 4
 
-    def dynamics(x, j, th, _t):
-        x = mjx.step(th.mjx_model, x.replace(ctrl=j))
-        return x, j
-
-    # Cost from Hydrax
-    running_cost = lambda x, j, th, _t: task.running_cost(x, j) * 0.01
-    terminal_cost = lambda x, th: task.terminal_cost(x)
-
-    def init(key, x, th):
-        u = jax.random.normal(key, th.mjx_model.nu) * th.noise_level + th.mean[0]
-        u = jnp.clip(u, task.u_min, task.u_max)
-        return u
-
-    # Linear Proposal
-    def proposal(key, x: mjx.Data, u: jax.Array, th, t: float) -> jax.Array:
-        step_len = horizon / (num_knots - 1)
-        idx = (t / step_len).astype(int) + 1
-        u = jax.random.normal(key, th.mjx_model.nu) * th.noise_level + th.mean[idx]
-        u = jnp.clip(u, task.u_min, task.u_max)
-        return u
-
-    class DroneParams(NamedTuple):
-        mjx_model: mjx.Model
-        mean: jax.Array
-        noise_level: float
-
-    theta = DroneParams(
+    running_cost, terminal_cost = pfmp.mjx_hydrax_cost(task)
+    init, proposal = pfmp.mjx_linear_gaussian_proposal(task, horizon, num_knots)
+    ctrl = pfmp.PFMP(
+        pfmp.mjx_physics,
+        running_cost, terminal_cost,
+        init, proposal,
+        horizon=horizon,
+        num_knots=num_knots,
+        particles=1024,
+        dt=mj_model.opt.timestep,
+        ess_resample_thresh=0.3
+        )
+    theta = pfmp.GenericMJXTaskParams(
         mjx_model = mjx.put_model(mj_model),
         mean = jnp.zeros((num_knots,mj_model.nu)),
-        noise_level = 5.0
-    )
-
-    ctrl = pfmp.PFMP(
-        dynamics, running_cost, terminal_cost, init, proposal,
-        horizon=horizon, num_knots=num_knots, particles=1024, dt=mj_model.opt.timestep,
-        ess_resample_thresh=0.8
+        noise_level = 0.3
         )
 
 pfmp.run_interactive(
@@ -172,7 +138,7 @@ pfmp.run_interactive(
     frequency=50,
     method=args.algorithm,
     fixed_camera_id=None,
-    record_video=True,
+    record_video=False,
     record_traj=False,
     max_step=1500
 )

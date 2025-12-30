@@ -5,6 +5,8 @@ from functools import partial
 from jaxtyping import PyTree, PRNGKeyArray
 from typing import NamedTuple, Callable
 from dataclasses import is_dataclass, fields
+from hydrax.task_base import Task
+from mujoco import mjx
 from .interpolate import hermite_interp1d, Jet1, Jet2, Jet3
 
 
@@ -69,6 +71,40 @@ def cem_update(theta: PyTree, trajs: jax.Array, costs: jax.Array, elite_frac: fl
     new_std  = jax.tree.map(lambda u: jnp.std(u[elite_idxs], axis=0), trajs)
     theta = theta._replace(mean=new_mean, du_stdev=new_std)
     return theta, jnp.mean(costs[elite_idxs], axis=0)
+
+# Mujoco XLA helper functions
+def mjx_hydrax_cost(task: Task):
+    running_cost = lambda x, j, th, _t: task.running_cost(x, j) * 0.01
+    terminal_cost = lambda x, th: task.terminal_cost(x)
+    return running_cost, terminal_cost
+
+def mjx_linear_gaussian_proposal(task: Task, horizon: float, num_knots: int):
+    def init(key, x, th):
+        u = jax.random.normal(key, th.mjx_model.nu) * th.noise_level + th.mean[0]
+        u = jnp.clip(u, task.u_min, task.u_max)
+        return u
+
+    # Linear Proposal
+    def proposal(key, x: mjx.Data, u: jax.Array, th, t: float) -> jax.Array:
+        step_len = horizon / (num_knots - 1)
+        idx = (t / step_len).astype(int) + 1
+        u = jax.random.normal(key, th.mjx_model.nu) * th.noise_level + th.mean[idx]
+        u = jnp.clip(u, task.u_min, task.u_max)
+        return u
+
+    return init, proposal
+
+def mjx_physics(x, j, th, _t):
+    if j.shape == ():
+        x = mjx.step(th.mjx_model, x.replace(ctrl=jnp.array([j])))
+    else:
+        x = mjx.step(th.mjx_model, x.replace(ctrl=j))
+    return x, None
+
+class GenericMJXTaskParams(NamedTuple):
+    mjx_model: mjx.Model
+    mean: jax.Array
+    noise_level: float
 
 class PFMP(NamedTuple):
     """ Particle Filtering Motion Planning (PFMP) """

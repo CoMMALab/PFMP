@@ -46,42 +46,22 @@ if args.algorithm == "sir" or args.algorithm == "sis":
     horizon = 0.6
     num_knots = 5
 
-    def dynamics(x, j, th, _t):
-        x = mjx.step(th.mjx_model, x.replace(ctrl=j))
-        return x, j
-
-    # Cost from Hydrax
-    running_cost = lambda x, j, th, _t: task.running_cost(x, j) * 0.01
-    terminal_cost = lambda x, th: task.terminal_cost(x)
-
-    def init(key, x, th):
-        u = jax.random.normal(key, th.mjx_model.nu) * th.noise_level + th.mean[0]
-        u = jnp.clip(u, task.u_min, task.u_max)
-        return u
-
-    # Linear Proposal
-    def proposal(key, x: mjx.Data, u: jax.Array, th, t: float) -> jax.Array:
-        step_len = horizon / (num_knots - 1)
-        idx = (t / step_len).astype(int) + 1
-        u = jax.random.normal(key, th.mjx_model.nu) * th.noise_level + th.mean[idx]
-        u = jnp.clip(u, task.u_min, task.u_max)
-        return u
-
-    class DroneParams(NamedTuple):
-        mjx_model: mjx.Model
-        mean: jax.Array
-        noise_level: float
-
-    theta = DroneParams(
+    running_cost, terminal_cost = pfmp.mjx_hydrax_cost(task)
+    init, proposal = pfmp.mjx_linear_gaussian_proposal(task, horizon, num_knots)
+    ctrl = pfmp.PFMP(
+        pfmp.mjx_physics,
+        running_cost, terminal_cost,
+        init, proposal,
+        horizon=horizon,
+        num_knots=num_knots,
+        particles=128,
+        dt=mj_model.opt.timestep,
+        ess_resample_thresh=0.3
+        )
+    theta = pfmp.GenericMJXTaskParams(
         mjx_model = mjx.put_model(mj_model),
         mean = jnp.zeros((num_knots,mj_model.nu)),
-        noise_level = 0.5
-    )
-
-    ctrl = pfmp.PFMP(
-        dynamics, running_cost, terminal_cost, init, proposal,
-        horizon=horizon, num_knots=num_knots, particles=128, dt=mj_model.opt.timestep,
-        ess_resample_thresh=0.5
+        noise_level = 0.3
         )
 
 

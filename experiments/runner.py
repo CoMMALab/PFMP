@@ -56,36 +56,23 @@ def main(yamlfile, outdir):
         )
         theta = None
         if cfg.algorithm == "sis" or cfg.algorithm == "sir":
-            def dynamics(x, j, th, _t):
-                x = mjx.step(th.mjx_model, x.replace(ctrl=j.reshape(mj_model.nu)))
-                return x, None
-
-            running_cost = lambda x, j, th, _t: task.running_cost(x, j) * th.mjx_model.opt.timestep
-            terminal_cost = lambda x, th: task.terminal_cost(x)
-
-            def init(key, x, th):
-                u = jax.random.normal(key) * th.noise_level + th.mean[0]
-                u = jnp.clip(u, task.u_min, task.u_max)
-                return u
-
-            def proposal(key, x: mjx.Data, u: jax.Array, th: MujocoParams, t: float) -> jax.Array:
-                step_len = cfg.plan_horizon / (cfg.num_knots - 1)
-                idx = (jnp.round(t / step_len)).astype(int) + 1
-                u = jax.random.normal(key) * th.noise_level + th.mean[idx]
-                u = jnp.clip(u, task.u_min, task.u_max)
-                return u
-
+            running_cost, terminal_cost = pfmp.mjx_hydrax_cost(task)
+            init, proposal = pfmp.mjx_linear_gaussian_proposal(task, cfg.horizon, cfg.num_knots)
             ctrl = pfmp.PFMP(
-                dynamics, running_cost, terminal_cost, init, proposal,
-                horizon=cfg.plan_horizon, num_knots=cfg.num_knots, particles=cfg.num_samples, dt=mj_model.opt.timestep,
-                ess_resample_thresh=0.3
+                pfmp.mjx_physics,
+                running_cost, terminal_cost,
+                init, proposal,
+                horizon=cfg.horizon,
+                num_knots=cfg.num_knots,
+                particles=cfg.num_samples,
+                dt=mj_model.opt.timestep,
+                ess_resample_thresh=cfg.ess_resample_thresh
                 )
-
-            theta = MujocoParams(
+            theta = pfmp.GenericMJXTaskParams(
                 mjx_model = mjx.put_model(mj_model),
                 mean = jnp.zeros((cfg.num_knots,mj_model.nu)),
                 noise_level = cfg.noise_level
-            )
+                )
         elif cfg.algorithm == "ps":
             ctrl = PredictiveSampling(
                 task,

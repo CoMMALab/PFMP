@@ -56,54 +56,22 @@ elif args.algorithm == "sir" or args.algorithm == "sis":
     horizon = 1.0
     num_knots = 4
 
-    class CartPoleParams(NamedTuple):
-        mjx_model: mjx.Model
-        mean: jax.Array
-        coarse_control: float
-
-    u_min = jnp.where(
-        mj_model.actuator_ctrllimited,
-        mj_model.actuator_ctrlrange[:, 0],
-        -jnp.inf,
-    )
-    u_max = jnp.where(
-        mj_model.actuator_ctrllimited,
-        mj_model.actuator_ctrlrange[:, 1],
-        jnp.inf,
-    )
-
-    # Mujoco XLA dynamics
-    def dynamics(x, j, th, _t):
-        x = mjx.step(th.mjx_model, x.replace(ctrl=jnp.array([j])))
-        return x, None
-
-    # Cost from Hydrax
-    running_cost = lambda x, u, th, _t: task.running_cost(x, u) * th.mjx_model.opt.timestep
-    terminal_cost = lambda x, th: task.terminal_cost(x)
-
-    def init(key, x, th):
-        u = jax.random.normal(key) * th.coarse_control + th.mean[0]
-        u = jnp.clip(u, u_min, u_max)
-        return u
-
-    # Linear Proposal
-    def proposal(key, x: mjx.Data, u: jax.Array, th: CartPoleParams, t: float) -> jax.Array:
-        step_len = horizon / (num_knots - 1)
-        idx = (jnp.round(t / step_len)).astype(int) + 1
-        u = jax.random.normal(key) * th.coarse_control + th.mean[idx]
-        u = jnp.clip(u, u_min, u_max)
-        return u
-
-    theta = CartPoleParams(
+    running_cost, terminal_cost = pfmp.mjx_hydrax_cost(task)
+    init, proposal = pfmp.mjx_linear_gaussian_proposal(task, horizon, num_knots)
+    ctrl = pfmp.PFMP(
+        pfmp.mjx_physics,
+        running_cost, terminal_cost,
+        init, proposal,
+        horizon=horizon,
+        num_knots=num_knots,
+        particles=128,
+        dt=mj_model.opt.timestep,
+        ess_resample_thresh=0.3
+        )
+    theta = pfmp.GenericMJXTaskParams(
         mjx_model = mjx.put_model(mj_model),
         mean = jnp.zeros((num_knots,mj_model.nu)),
-        coarse_control = 0.3
-    )
-
-    ctrl = pfmp.PFMP(
-        dynamics, running_cost, terminal_cost, init, proposal,
-        horizon=horizon, num_knots=num_knots, particles=128, dt=mj_model.opt.timestep,
-        ess_resample_thresh=0.3
+        noise_level = 0.3
         )
 
 # Run the interactive simulation

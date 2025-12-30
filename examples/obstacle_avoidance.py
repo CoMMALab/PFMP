@@ -1,3 +1,5 @@
+# obstacle_avoidance.py
+
 import jax
 import jax.numpy as jnp
 from typing import NamedTuple
@@ -131,18 +133,8 @@ if __name__ == "__main__":
 
     key = jax.random.key(1)
     traj, scores = pfmp.run_sir(key, x0, theta)
-    print(scores.shape)
-    print(scores[:10,-1])
-    # print(final_costs)
-    # exit()
     tq = jnp.arange(0, horizon, pfmp.dt)
-    # print(trajs.shape)
-    # trajs = hermite_spline(tq, pfmp.tk(), trajs)
-    # print(trajs.shape)
-    # for i in range(len(trajs)):
-    #     plt.plot(trajs[i,:,0], trajs[i,:,1], c="magenta", alpha=0.5)
 
-    # plt.show()
     import matplotlib.patches as patches
     import matplotlib.transforms as transforms
 
