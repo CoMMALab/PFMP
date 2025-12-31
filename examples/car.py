@@ -166,7 +166,7 @@ if __name__ == "__main__":
 
     interval_len = horizon / (num_knots - 1)
     steps_per_knot = round(interval_len / pfmp.dt)
-    best_idx = jnp.argmax(jnp.sum(scores, axis=-1))
+    best_idx = jnp.argmin(jnp.sum(scores, axis=-1))
     tq = jnp.linspace(0,pfmp.horizon,int(pfmp.horizon/pfmp.dt))
     for i in range(20):
         us = hermite_spline(tq, pfmp.tk(), traj[i])
