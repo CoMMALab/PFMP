@@ -112,93 +112,340 @@ def plot_obstacles(ax, obstacles, color='black'):
                              edgecolor=color, facecolor='black', linewidth=1)
         ax.add_patch(rect)
 
+# if __name__ == "__main__":
+#     horizon = 10
+#     num_knots = int(2*horizon)
+#     particles = 128
+#     pfmp = PFMP(dynamics, cost_fn, terminal_cost, init, proposal,
+#                 horizon, num_knots, particles,
+#                 ess_resample_thresh=0.5)
+#     x0 = jnp.array([0,0,jnp.pi/4])
+#     # u0 = Jet2(0., 0.)
+#     u0 = 0.0
+#     theta = Params(
+#         goal = jnp.array([12.0, 12.0]),
+#         obstacles = generate_obstacle_grid(5, 5, 1.0, 1.0) + 1.0,
+#         L=0.3,          # typical wheelbase for normalized bicycle model
+#         v=2.0,          # moderate forward speed (m/s)
+#         du_stdev=0.1,  # tangent noise — gives gentle arc variation
+#         u_stdev=0.2    # tiny point jitter — stabilizes proposal
+#     )
+
+#     key = jax.random.key(1)
+#     traj, scores = pfmp.run_sir(key, x0, theta)
+#     tq = jnp.arange(0, horizon, pfmp.dt)
+
+#     import matplotlib.patches as patches
+#     import matplotlib.transforms as transforms
+
+#     car_length = theta.L
+#     car_width  = theta.L/2
+
+#     ax = plt.gca()
+
+#     xs = jnp.linspace(0, 12, 200)
+#     ys = jnp.linspace(0, 12, 200)
+#     X, Y = jnp.meshgrid(xs, ys)
+
+#     # Flatten for vectorization
+#     points = jnp.stack([X.ravel(), Y.ravel()], axis=1)
+
+#     # Wrap cost_fn so it only depends on position
+#     def cost_at_loc(loc):
+#         # Build a dummy x and u consistent with your system
+#         x = loc  # fill in based on your state dimension
+#         u = jnp.zeros(1)                          # fill in based on your control dimension
+#         return cost_fn(x, u, theta, t=0.0)
+
+#     cost_vmap = jax.vmap(cost_at_loc)
+#     Z = cost_vmap(points).reshape(X.shape)
+
+#     ax.contourf(X, Y, Z, levels=50)
+
+#     plot_obstacles(ax, theta.obstacles)
+
+#     interval_len = horizon / (num_knots - 1)
+#     steps_per_knot = round(interval_len / pfmp.dt)
+#     best_idx = jnp.argmin(jnp.sum(scores, axis=-1))
+#     tq = jnp.linspace(0,pfmp.horizon,int(pfmp.horizon/pfmp.dt))
+#     for i in range(20):
+#         us = hermite_spline(tq, pfmp.tk(), traj[i])
+#         _, xy = jax.lax.scan(lambda x, ut: dynamics(x, ut[0], theta, ut[1]), x0, (us, tq))
+#         plt.plot(xy[:,0], xy[:,1], c="magenta", alpha=0.5)
+
+#         for t in range(0, xy.shape[0], steps_per_knot):  # every 5 steps
+#             x, y, th = xy[t]
+
+#             # Create a rectangle centered at (0,0)
+#             rect = patches.Rectangle(
+#                 (-car_length/2, -car_width/2),  # center the box
+#                 car_length,
+#                 car_width,
+#                 facecolor="cyan",
+#                 edgecolor="black",
+#                 alpha=1.0,
+#                 zorder=5
+#             )
+
+#             # Build the transform: rotate, then translate
+#             trans = transforms.Affine2D()
+#             trans.rotate(th)
+#             trans.translate(x, y)
+
+#             rect.set_transform(trans + ax.transData)
+#             ax.add_patch(rect)
+#     us = hermite_spline(tq, pfmp.tk(), traj[best_idx])
+#     _, best_xy = jax.lax.scan(lambda x, ut: dynamics(x, ut[0], theta, ut[1]), x0, (us, tq))
+#     plt.plot(best_xy[:,0], best_xy[:,1], c="gold", lw=3, alpha=1)
+
+#     plt.axis("equal")
+#     plt.show()
+
 if __name__ == "__main__":
     horizon = 10
     num_knots = int(2*horizon)
-    particles = 128
+    particles = 256
     pfmp = PFMP(dynamics, cost_fn, terminal_cost, init, proposal,
                 horizon, num_knots, particles,
                 ess_resample_thresh=0.5)
     x0 = jnp.array([0,0,jnp.pi/4])
-    # u0 = Jet2(0., 0.)
     u0 = 0.0
     theta = Params(
         goal = jnp.array([12.0, 12.0]),
         obstacles = generate_obstacle_grid(5, 5, 1.0, 1.0) + 1.0,
-        L=0.3,          # typical wheelbase for normalized bicycle model
-        v=2.0,          # moderate forward speed (m/s)
-        du_stdev=0.1,  # tangent noise — gives gentle arc variation
-        u_stdev=0.2    # tiny point jitter — stabilizes proposal
+        L=0.3,
+        v=2.0,
+        du_stdev=0.1,
+        u_stdev=0.2
     )
-
-    key = jax.random.key(1)
-    traj, scores = pfmp.run_sir(key, x0, theta)
-    tq = jnp.arange(0, horizon, pfmp.dt)
-
+    
+    # Setup visualization with white background for publication
     import matplotlib.patches as patches
     import matplotlib.transforms as transforms
-
-    car_length = theta.L
-    car_width  = theta.L/2
-
-    ax = plt.gca()
-
+    from matplotlib.animation import FuncAnimation
+    
+    # Use default white background style
+    plt.style.use('default')
+    fig, ax = plt.subplots(figsize=(10, 10))
+    fig.patch.set_facecolor('white')
+    ax.set_facecolor('white')
+    
+    # Plot cost field with subtle colormap
     xs = jnp.linspace(0, 12, 200)
     ys = jnp.linspace(0, 12, 200)
     X, Y = jnp.meshgrid(xs, ys)
-
-    # Flatten for vectorization
     points = jnp.stack([X.ravel(), Y.ravel()], axis=1)
-
-    # Wrap cost_fn so it only depends on position
+    
     def cost_at_loc(loc):
-        # Build a dummy x and u consistent with your system
-        x = loc  # fill in based on your state dimension
-        u = jnp.zeros(1)                          # fill in based on your control dimension
+        x = loc
+        u = jnp.zeros(1)
         return cost_fn(x, u, theta, t=0.0)
-
+    
     cost_vmap = jax.vmap(cost_at_loc)
     Z = cost_vmap(points).reshape(X.shape)
-
-    ax.contourf(X, Y, Z, levels=50)
-
+    
+    # Use a subtle, printer-friendly colormap
+    contour = ax.contourf(X, Y, Z, levels=20, cmap='Greys', alpha=0.3)
+    
+    # Add colorbar with larger text
+    cbar = plt.colorbar(contour, ax=ax, label='Cost')
+    cbar.ax.tick_params(labelsize=14)
+    cbar.set_label('Cost', fontsize=16, fontweight='bold')
+    
+    # Plot obstacles with high contrast
     plot_obstacles(ax, theta.obstacles)
-
+    
+    # Mark start and goal with clear, publication-quality markers
+    ax.plot(x0[0], x0[1], 'o', color='darkgreen', markersize=14, 
+            markeredgecolor='black', markeredgewidth=1.5, label='Start', zorder=10)
+    ax.plot(theta.goal[0], theta.goal[1], '*', color='gold', markersize=20,
+            markeredgecolor='black', markeredgewidth=1.5, label='Goal', zorder=10)
+    
+    ax.set_xlim(-0.5, 12.5)
+    ax.set_ylim(-0.5, 12.5)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5, color='gray')
+    ax.set_xlabel('X Position (m)', fontsize=16, fontweight='bold')
+    ax.set_ylabel('Y Position (m)', fontsize=16, fontweight='bold')
+    ax.tick_params(labelsize=14)
+    
+    # Add legend with clean styling and larger text
+    ax.legend(loc='upper left', fontsize=14, framealpha=0.95, 
+             edgecolor='black', fancybox=False, shadow=False)
+    
+    # Add subtle border
+    for spine in ax.spines.values():
+        spine.set_edgecolor('black')
+        spine.set_linewidth(1.5)
+    
+    # Initialize storage
+    key = jax.random.key(1)
     interval_len = horizon / (num_knots - 1)
     steps_per_knot = round(interval_len / pfmp.dt)
-    best_idx = jnp.argmin(jnp.sum(scores, axis=-1))
-    tq = jnp.linspace(0,pfmp.horizon,int(pfmp.horizon/pfmp.dt))
-    for i in range(20):
-        us = hermite_spline(tq, pfmp.tk(), traj[i])
-        _, xy = jax.lax.scan(lambda x, ut: dynamics(x, ut[0], theta, ut[1]), x0, (us, tq))
-        plt.plot(xy[:,0], xy[:,1], c="magenta", alpha=0.5)
-
-        for t in range(0, xy.shape[0], steps_per_knot):  # every 5 steps
-            x, y, th = xy[t]
-
-            # Create a rectangle centered at (0,0)
+    
+    # Run full SIR to get complete data
+    states, ancestors, costs, final_xs = pfmp._sir(key, x0, theta)
+    
+    # Animation data
+    trajectory_lines = []
+    car_patches_list = []
+    knot_markers = []
+    progress_text = None
+    
+    # Define consistent colors
+    particle_color = 'steelblue'  # Consistent color for all particles
+    best_color = 'darkblue'       # Color for best trajectory
+    
+    def init_animation():
+        return trajectory_lines + car_patches_list + knot_markers
+    
+    def animate(frame):
+        global progress_text
+        
+        # Clear previous elements
+        for line in trajectory_lines:
+            line.remove()
+        for patch in car_patches_list:
+            patch.remove()
+        for marker in knot_markers:
+            marker.remove()
+        if progress_text:
+            progress_text.remove()
+            
+        trajectory_lines.clear()
+        car_patches_list.clear()
+        knot_markers.clear()
+        
+        # Calculate how many knots to use
+        current_num_knots = min(frame + 2, num_knots)
+        
+        # Slice states and ancestors up to current knot
+        current_states = jax.tree.map(lambda x: x[:current_num_knots], states)
+        current_ancestors = ancestors[:current_num_knots-1]
+        
+        # Choose paths with current data
+        current_trajs = pfmp.choose_paths(current_states, current_ancestors, 
+                                         jnp.arange(pfmp.particles))
+        
+        # Calculate time points for current trajectory
+        current_horizon = (current_num_knots - 1) * interval_len
+        tq = jnp.linspace(0, current_horizon, int(current_horizon/pfmp.dt))
+        tk = jnp.linspace(0, current_horizon, current_num_knots)
+        
+        # Calculate costs
+        current_costs = costs[:, :current_num_knots-1]
+        total_costs = jnp.sum(current_costs, axis=-1)
+        top_indices = jnp.argsort(total_costs)[:20]
+        best_idx = jnp.argmin(total_costs)
+        
+        # Plot particle trajectories with consistent color
+        for i in top_indices:
+            if i == best_idx:
+                continue  # Skip best, will plot it separately
+                
+            us = hermite_spline(tq, tk, current_trajs[i])
+            _, xy = jax.lax.scan(lambda x, ut: dynamics(x, ut[0], theta, ut[1]), 
+                                x0, (us, tq))
+            
+            line, = ax.plot(xy[:,0], xy[:,1], color=particle_color, 
+                           alpha=0.3, linewidth=1.5, zorder=2)
+            trajectory_lines.append(line)
+            
+            # Draw cars at knot points with consistent color
+            for t in range(0, xy.shape[0], steps_per_knot):
+                x, y, th = xy[t]
+                rect = patches.Rectangle(
+                    (-theta.L/2, -theta.L/4),
+                    theta.L,
+                    theta.L/2,
+                    facecolor=particle_color,
+                    edgecolor='black',
+                    linewidth=0.8,
+                    alpha=0.4,
+                    zorder=3
+                )
+                trans = transforms.Affine2D()
+                trans.rotate(th)
+                trans.translate(x, y)
+                rect.set_transform(trans + ax.transData)
+                ax.add_patch(rect)
+                car_patches_list.append(rect)
+        
+        # Plot best trajectory with emphasis
+        us = hermite_spline(tq, tk, current_trajs[best_idx])
+        _, best_xy = jax.lax.scan(lambda x, ut: dynamics(x, ut[0], theta, ut[1]), 
+                                 x0, (us, tq))
+        
+        # Best trajectory with shadow for depth
+        line, = ax.plot(best_xy[:,0], best_xy[:,1], c='lightgray', 
+                       lw=5, alpha=0.5, zorder=4, solid_capstyle='round')
+        trajectory_lines.append(line)
+        
+        # Main best trajectory line
+        line, = ax.plot(best_xy[:,0], best_xy[:,1], c=best_color, 
+                       lw=3.5, alpha=1, zorder=5, label='Best Path',
+                       solid_capstyle='round')
+        trajectory_lines.append(line)
+        
+        # Draw best car with consistent color
+        for t in range(0, best_xy.shape[0], steps_per_knot):
+            x, y, th = best_xy[t]
+            
+            # Car body
             rect = patches.Rectangle(
-                (-car_length/2, -car_width/2),  # center the box
-                car_length,
-                car_width,
-                facecolor="cyan",
-                edgecolor="black",
-                alpha=1.0,
-                zorder=5
+                (-theta.L/2, -theta.L/4),
+                theta.L,
+                theta.L/2,
+                facecolor=best_color,
+                edgecolor='black',
+                linewidth=2,
+                alpha=0.9,
+                zorder=6
             )
-
-            # Build the transform: rotate, then translate
             trans = transforms.Affine2D()
             trans.rotate(th)
             trans.translate(x, y)
-
             rect.set_transform(trans + ax.transData)
             ax.add_patch(rect)
-    us = hermite_spline(tq, pfmp.tk(), traj[best_idx])
-    _, best_xy = jax.lax.scan(lambda x, ut: dynamics(x, ut[0], theta, ut[1]), x0, (us, tq))
-    plt.plot(best_xy[:,0], best_xy[:,1], c="gold", lw=3, alpha=1)
-
-    plt.axis("equal")
+            car_patches_list.append(rect)
+        
+        # Mark knot points on best trajectory
+        for t in range(0, best_xy.shape[0], steps_per_knot):
+            marker, = ax.plot(best_xy[t, 0], best_xy[t, 1], 'o', 
+                            color=best_color, markersize=6,
+                            markeredgecolor='black', markeredgewidth=1,
+                            zorder=8, alpha=0.9)
+            knot_markers.append(marker)
+        
+        # Progress indicator - clean text box with larger text
+        progress_pct = (current_num_knots / num_knots) * 100
+        progress_text = ax.text(
+            0.02, 0.98, 
+            f'Knots: {current_num_knots}/{num_knots} ({progress_pct:.0f}%)\n'
+            f'Best Cost: {float(jnp.min(total_costs)):.2f}',
+            transform=ax.transAxes,
+            fontsize=14,
+            verticalalignment='bottom',
+            bbox=dict(boxstyle='round,pad=0.6', facecolor='white', 
+                     alpha=0.9, edgecolor='black', linewidth=1.5),
+            color='black',
+            fontfamily='monospace',
+            fontweight='bold'
+        )
+        
+        return trajectory_lines + car_patches_list + knot_markers + [progress_text]
+    
+    # Create animation
+    anim = FuncAnimation(fig, animate, init_func=init_animation,
+                        frames=num_knots-1, interval=1, blit=False, 
+                        repeat=True, repeat_delay=1)
+    
+    plt.tight_layout()
     plt.show()
-
-
+    
+    # Save with publication quality
+    # anim.save('pfmp_planning.mp4', writer='ffmpeg', fps=5, dpi=300, 
+    #           bitrate=5000, extra_args=['-vcodec', 'libx264'])
+    # 
+    # # Or save as GIF for easier inclusion in documents
+    # anim.save('pfmp_planning.gif', writer='pillow', fps=5, dpi=150)

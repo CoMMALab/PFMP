@@ -31,6 +31,6 @@ test = [
     "yourdfpy",
     "jaxls",
     "jaxlie",
-    "pyroki @ git+https://github.com/chungmin99/pyroki.git@main",
-    # "dial-mpc @ git+https://github.com/LeCAR-Lab/dial-mpc.git",
+    "viser",
+    "pyroki @ git+https://github.com/chungmin99/pyroki.git@main"
 ]
