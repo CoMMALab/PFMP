@@ -26,7 +26,8 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     method = "sir",
     record_video: bool = False,
     record_traj: bool = False,
-    max_step: int = int(1e6)
+    max_step: int = int(1e6),
+    goal_marker_fn: Optional[callable] = None
 ) -> None:
     """Run an interactive simulation with the MPC controller.
 
@@ -196,14 +197,21 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             # simulate the system between spline replanning steps
             for i in range(sim_steps_per_replan):
                 if ik_interp is not None:
-                    # For systems that need IK lookup (e.g., push-T)
                     target_xy = us[i]
                     u = ik_interp(target_xy, theta.ik_cache)
                 else:
                     u = us[i]
                 mj_data.ctrl[:] = np.array(u)
                 mujoco.mj_step(mj_model, mj_data)
+                
+                # Draw goal marker
+                if goal_marker_fn is not None:
+                    with viewer.lock():
+                        viewer.user_scn.ngeom = 0
+                        goal_marker_fn(viewer.user_scn, theta)
+                
                 viewer.sync()
+
                 if record_traj:
                     if family == "pfmp":
                         cost = controller.mpc_running_cost(mj_data, mj_data.ctrl, theta, mj_data.time)

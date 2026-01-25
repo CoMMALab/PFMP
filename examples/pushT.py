@@ -7,6 +7,7 @@ Refactored to use the new PFMP API with Jet2 controls and cached IK.
 import argparse
 import os
 import time
+import pickle
 from io import StringIO
 from typing import NamedTuple, Tuple
 from xml.etree import ElementTree as ET
@@ -37,9 +38,9 @@ EE_ID = 12
 EE_HEIGHT = 0.06
 
 # Workspace bounds for IK cache
-WORKSPACE_XY_MIN = jnp.array([0.2, -0.5])
-WORKSPACE_XY_MAX = jnp.array([0.6, 0.5])
-IK_CACHE_RESOLUTION = 64
+WORKSPACE_XY_MIN = jnp.array([-0.5, -0.6])
+WORKSPACE_XY_MAX = jnp.array([0.7, 0.6])
+IK_CACHE_RESOLUTION = 128
 
 # Fixed end-effector orientation (pointing down)
 EE_ROTATION = jnp.array([
@@ -222,6 +223,18 @@ def ik_step_from_xy(prev_q: jax.Array, xy: jax.Array, z: float = EE_HEIGHT) -> j
     q, _ = ik_step_from_mat4(prev_q, mat4)
     return q
 
+CACHE_PATH = "ik_cache.pkl"
+
+def get_or_build_cache(**kwargs):
+    if os.path.exists(CACHE_PATH):
+        print("Loading cached IK...")
+        with open(CACHE_PATH, 'rb') as f:
+            return pickle.load(f)
+    
+    cache = build_ik_cache(**kwargs)
+    with open(CACHE_PATH, 'wb') as f:
+        pickle.dump(cache, f)
+    return cache
 
 def build_ik_cache(
     xy_min: jax.Array,
@@ -468,7 +481,7 @@ def main():
 
     # Build IK cache (one-time cost)
     print("Building IK cache...")
-    ik_cache = build_ik_cache(
+    ik_cache = get_or_build_cache(
         xy_min=WORKSPACE_XY_MIN,
         xy_max=WORKSPACE_XY_MAX,
         resolution=args.cache_resolution,
@@ -477,9 +490,9 @@ def main():
     )
 
     # Task configuration
-    horizon = 1.0
-    num_knots = 4
-    particles = 256
+    horizon = 2.0
+    num_knots = 8
+    particles = 1024
 
     # Initial end-effector position
     init_xy = jnp.array([0.4, -0.3])
@@ -512,8 +525,12 @@ def main():
         num_knots=num_knots,
         particles=particles,
         dt=mj_model.opt.timestep,
-        ess_resample_thresh=0.8,
+        ess_resample_thresh=0.5,
     )
+
+    def goal_marker_callback(user_scn, theta):
+        add_goal_T(user_scn, np.array(theta.goal_xy), float(theta.goal_angle),
+                rgba=(0.2, 0.8, 0.2, 0.5))
 
     # Run interactive simulation
     pfmp.run_interactive(
@@ -522,12 +539,13 @@ def main():
         mj_model,
         mj_data,
         ik_interp=ik_from_cache,
-        frequency=50,
+        frequency=1,
         method=args.algorithm,
         fixed_camera_id=None,
-        record_video=True,
+        record_video=False,
         record_traj=False,
-        max_step=2000,
+        max_step=8000,
+        goal_marker_fn=goal_marker_callback
     )
 
 

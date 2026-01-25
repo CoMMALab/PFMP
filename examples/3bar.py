@@ -9,6 +9,7 @@ import viser.transforms as tf
 import trimesh
 
 from typing import NamedTuple
+from scipy.ndimage import label
 from pfmp import PFMP
 from pfmp.interpolate import hermite_spline
 
@@ -92,7 +93,6 @@ def terminal_cost(x: jax.Array, th: Params) -> float:
 
 
 def angle_diff(target, current):
-    """Shortest angular difference, handles wrapping."""
     diff = target - current
     return jnp.arctan2(jnp.sin(diff), jnp.cos(diff))
 
@@ -104,7 +104,6 @@ def dynamics(x: jax.Array, u: jax.Array, theta: Params, t: float):
     
     step = jnp.minimum(dist, 0.1)
     x_next = x + direction * step
-    
     x_next = jnp.arctan2(jnp.sin(x_next), jnp.cos(x_next))
     
     return (x_next, x_next)
@@ -132,10 +131,45 @@ def proposal(key, x, u, theta: Params, t: float):
     return target
 
 
-# === Environment Generation ===
+# ============================================================================
+# C-Space Feasibility
+# ============================================================================
+
+def build_cspace(link_lengths, env, resolution=0.1):
+    """Precompute C-space connected components."""
+    n_dof = len(link_lengths)
+    n_cells = int(2 * jnp.pi / resolution)
+    
+    axes = [jnp.linspace(-jnp.pi, jnp.pi, n_cells) for _ in range(n_dof)]
+    grid_coords = jnp.stack(jnp.meshgrid(*axes, indexing='ij'), axis=-1)
+    flat_coords = grid_coords.reshape(-1, n_dof)
+    
+    # Vectorized collision check
+    sdfs = jax.vmap(lambda q: arm_sdf_vmapped(q, link_lengths, env))(flat_coords)
+    free = (sdfs > 0.02).reshape(tuple([n_cells] * n_dof))
+    
+    # Connected components
+    labeled, n_components = label(np.array(free))
+    
+    return labeled, resolution, n_cells, n_components
+
+
+def is_feasible(q_start, q_goal, labeled, resolution, n_cells):
+    """O(1) feasibility check via precomputed C-space."""
+    def to_idx(q):
+        return tuple(((np.array(q) + np.pi) / resolution).astype(int) % n_cells)
+    
+    start_label = labeled[to_idx(q_start)]
+    goal_label = labeled[to_idx(q_goal)]
+    
+    return start_label > 0 and start_label == goal_label
+
+
+# ============================================================================
+# Environment Generation
+# ============================================================================
 
 def random_environment(key, n_obstacles=4, x_range=(-1.5, 2.0), y_range=(-1.5, 1.5), r_range=(0.15, 0.35)):
-    """Generate random circular obstacles."""
     k1, k2, k3 = jax.random.split(key, 3)
     
     centers_x = jax.random.uniform(k1, (n_obstacles,), minval=x_range[0], maxval=x_range[1])
@@ -149,34 +183,58 @@ def random_environment(key, n_obstacles=4, x_range=(-1.5, 2.0), y_range=(-1.5, 1
 
 def find_valid_config(key, link_lengths, env, n_attempts=100):
     """Find a collision-free configuration."""
-    for i in range(n_attempts):
+    for _ in range(n_attempts):
         key, subkey = jax.random.split(key)
         q = jax.random.uniform(subkey, (len(link_lengths),), minval=-jnp.pi, maxval=jnp.pi)
         sdf = arm_sdf_vmapped(q, link_lengths, env)
         if sdf > 0.1:
-            return q
-    return None
+            return key, q
+    return key, None
 
 
-def so3_from_z_to_vec(v):
-    v = v / (np.linalg.norm(v) + 1e-8)
-    z = np.array([0.0, 0.0, 1.0])
+def find_feasible_problem(key, link_lengths, n_attempts=50, cspace_resolution=0.1):
+    """Find a start/goal pair guaranteed to be feasible."""
+    for _ in range(n_attempts):
+        key, k1, k2, k3 = jax.random.split(key, 4)
+        
+        env = random_environment(k1)
+        
+        # Build C-space for this environment
+        labeled, resolution, n_cells, n_components = build_cspace(
+            link_lengths, env, resolution=cspace_resolution
+        )
+        
+        # Skip environments with no free space
+        if n_components == 0:
+            continue
+        
+        # Find start config
+        key, q_start = find_valid_config(k2, link_lengths, env)
+        if q_start is None:
+            continue
+        
+        # Find goal config in same component
+        for _ in range(50):
+            key, subkey = jax.random.split(key)
+            q_goal = jax.random.uniform(subkey, (len(link_lengths),), minval=-jnp.pi, maxval=jnp.pi)
+            
+            if arm_sdf_vmapped(q_goal, link_lengths, env) > 0.1:
+                if is_feasible(q_start, q_goal, labeled, resolution, n_cells):
+                    # Also ensure they're not too close
+                    if jnp.linalg.norm(q_start - q_goal) > 1.0:
+                        return key, env, q_start, q_goal
+        
+    return key, None, None, None
 
-    axis = np.cross(z, v)
-    angle = np.arccos(np.clip(np.dot(z, v), -1.0, 1.0))
 
-    if np.linalg.norm(axis) < 1e-8:
-        return tf.SO3.identity()
-
-    axis = axis / np.linalg.norm(axis)
-    return tf.SO3.from_axis_angle(axis * angle)
+# ============================================================================
+# Visualization Helpers
+# ============================================================================
 
 def create_arm_with_links(server, name, positions, color, offset,
                           z_plane=0.0, joint_radius=0.08, link_radius=0.04):
-    """Create arm with spheres at joints and cylinders for links."""
     handles = {'joints': [], 'links': []}
 
-    # Joints
     for i, pos in enumerate(positions):
         pos_3d = (pos[0] + offset[0], pos[1] + offset[1], z_plane)
         handles['joints'].append(
@@ -188,7 +246,6 @@ def create_arm_with_links(server, name, positions, color, offset,
             )
         )
 
-    # Links
     for i in range(len(positions) - 1):
         p1 = positions[i]
         p2 = positions[i + 1]
@@ -211,22 +268,17 @@ def create_arm_with_links(server, name, positions, color, offset,
                 mesh=mesh,
                 position=(center[0] + offset[0], center[1] + offset[1], z_plane),
                 wxyz=final_rot.wxyz,
-                # color=color,
             )
         )
 
     return handles
 
-def update_arm_with_links(handles, positions, color, offset,
-                          z_plane=0.0):
-    """Update arm positions and colors."""
 
-    # Joints
+def update_arm_with_links(handles, positions, color, offset, z_plane=0.0):
     for handle, pos in zip(handles['joints'], positions):
         handle.position = (pos[0] + offset[0], pos[1] + offset[1], z_plane)
         handle.color = color
 
-    # Links
     for i, handle in enumerate(handles['links']):
         p1 = positions[i]
         p2 = positions[i + 1]
@@ -246,6 +298,9 @@ def update_arm_with_links(handles, positions, color, offset,
         handle.color = color
 
 
+# ============================================================================
+# Main Visualization
+# ============================================================================
 
 def run_visual(seed=42):
     n_dof = 3
@@ -263,6 +318,18 @@ def run_visual(seed=42):
     
     q_start = jnp.array([0., 0.5, 0.2])
     q_goal = jnp.array([1.2, -0.6, -0.2])
+    
+    # Check feasibility
+    print("Building C-space...")
+    labeled, resolution, n_cells, n_components = build_cspace(link_lengths, env)
+    print(f"C-space: {n_cells}^{n_dof} cells, {n_components} components")
+    
+    feasible = is_feasible(q_start, q_goal, labeled, resolution, n_cells)
+    print(f"Feasible: {feasible}")
+    
+    if not feasible:
+        print("Warning: start and goal are not in the same C-space component!")
+    
     goal_ee = forward_kinematics(q_goal, link_lengths)[-1]
     
     theta = Params(
@@ -325,7 +392,7 @@ def run_visual(seed=42):
     offset_sir = np.array([4.0, 0.0])
     z_plane = 0.0
     
-    # Obstacles (cylinders standing up for 2D circles)
+    # Obstacles
     for i, (c, r) in enumerate(zip(np.array(env.centers), np.array(env.radii))):
         server.scene.add_icosphere(
             f"/env_sis/obstacle_{i}",
@@ -344,7 +411,7 @@ def run_visual(seed=42):
     server.scene.add_grid("/ground_sis", width=6, height=6, position=(offset_sis[0], offset_sis[1], -0.01), plane="xy")
     server.scene.add_grid("/ground_sir", width=6, height=6, position=(offset_sir[0], offset_sir[1], -0.01), plane="xy")
     
-    # Static arms (start, goal)
+    # Static arms
     create_arm_with_links(server, "start_sis", fk_start, (180, 180, 180), offset_sis, z_plane, joint_radius=0.06, link_radius=0.03)
     create_arm_with_links(server, "start_sir", fk_start, (180, 180, 180), offset_sir, z_plane, joint_radius=0.06, link_radius=0.03)
     create_arm_with_links(server, "goal_sis", fk_goal, (255, 193, 7), offset_sis, z_plane, joint_radius=0.06, link_radius=0.03)
@@ -354,22 +421,12 @@ def run_visual(seed=42):
     sis_handles = create_arm_with_links(server, "sis", fk_sis[0], (76, 175, 80), offset_sis, z_plane)
     sir_handles = create_arm_with_links(server, "sir", fk_sir[0], (76, 175, 80), offset_sir, z_plane)
     
-    # EE trace points
+    # EE traces
     ee_sis_points = np.array([[fk[-1][0] + offset_sis[0], fk[-1][1] + offset_sis[1], z_plane] for fk in fk_sis])
     ee_sir_points = np.array([[fk[-1][0] + offset_sir[0], fk[-1][1] + offset_sir[1], z_plane] for fk in fk_sir])
     
-    ee_trace_sis = server.scene.add_spline_catmull_rom(
-        "/ee_trace_sis",
-        positions=ee_sis_points[:2],
-        color=(33, 150, 243),
-        line_width=3.0,
-    )
-    ee_trace_sir = server.scene.add_spline_catmull_rom(
-        "/ee_trace_sir",
-        positions=ee_sir_points[:2],
-        color=(33, 150, 243),
-        line_width=3.0,
-    )
+    ee_trace_sis = server.scene.add_spline_catmull_rom("/ee_trace_sis", positions=ee_sis_points[:2], color=(33, 150, 243), line_width=3.0)
+    ee_trace_sir = server.scene.add_spline_catmull_rom("/ee_trace_sir", positions=ee_sir_points[:2], color=(33, 150, 243), line_width=3.0)
     
     # Labels
     server.scene.add_label("/label_sis", f"SIS (col: {np.mean(col_sis)*100:.0f}%)", position=(offset_sis[0], offset_sis[1], 2.5))
@@ -417,14 +474,12 @@ def run_visual(seed=42):
             frame_slider.value = frame
             last_time = current_time
         
-        # Update arms
         color_sis = (244, 67, 54) if col_sis[frame] else (76, 175, 80)
         color_sir = (244, 67, 54) if col_sir[frame] else (76, 175, 80)
         
         update_arm_with_links(sis_handles, fk_sis[frame], color_sis, offset_sis, z_plane)
         update_arm_with_links(sir_handles, fk_sir[frame], color_sir, offset_sir, z_plane)
         
-        # Update EE traces
         if frame >= 1:
             ee_trace_sis.positions = ee_sis_points[:frame+1]
             ee_trace_sir.positions = ee_sir_points[:frame+1]
@@ -433,7 +488,7 @@ def run_visual(seed=42):
 
 
 def run_benchmark_visual(n_envs=20, seed=0):
-    """Run benchmark with viser visualization."""
+    """Run benchmark with guaranteed feasible problems."""
     n_dof = 3
     link_lengths = jnp.array([1.0, 1.0, 0.5])
     
@@ -444,24 +499,21 @@ def run_benchmark_visual(n_envs=20, seed=0):
     offset_sir = np.array([4.0, 0.0])
     z_plane = 0.0
     
-    # Ground
     server.scene.add_grid("/ground_sis", width=6, height=6, position=(offset_sis[0], offset_sis[1], -0.01), plane="xy")
     server.scene.add_grid("/ground_sir", width=6, height=6, position=(offset_sir[0], offset_sir[1], -0.01), plane="xy")
     
-    # Labels (will update)
     label_sis = server.scene.add_label("/label_sis", "SIS: 0%", position=(offset_sis[0], offset_sis[1], 2.5))
     label_sir = server.scene.add_label("/label_sir", "SIR: 0%", position=(offset_sir[0], offset_sir[1], 2.5))
     
-    # GUI
     with server.gui.add_folder("Stats"):
         env_text = server.gui.add_text("Environment", initial_value="0/0", disabled=True)
         sis_rate_text = server.gui.add_text("SIS Success", initial_value="0%", disabled=True)
         sir_rate_text = server.gui.add_text("SIR Success", initial_value="0%", disabled=True)
+        feasibility_text = server.gui.add_text("Feasibility", initial_value="checking...", disabled=True)
     
     results = {'sis_success': [], 'sir_success': []}
     master_key = jax.random.key(seed)
     
-    # Handles for dynamic objects
     obstacle_handles = []
     sis_handles = None
     sir_handles = None
@@ -493,15 +545,18 @@ def run_benchmark_visual(n_envs=20, seed=0):
         if ee_trace_sir:
             ee_trace_sir.remove()
     
-    for env_idx in range(n_envs):
-        master_key, env_key, start_key, goal_key, run_key = jax.random.split(master_key, 5)
+    env_idx = 0
+    while env_idx < n_envs:
+        feasibility_text.value = "finding feasible problem..."
         
-        env = random_environment(env_key)
-        q_start = find_valid_config(start_key, link_lengths, env)
-        q_goal = find_valid_config(goal_key, link_lengths, env)
+        # Find a guaranteed feasible problem
+        master_key, env, q_start, q_goal = find_feasible_problem(master_key, link_lengths)
         
-        if q_start is None or q_goal is None:
+        if env is None:
+            print(f"Could not find feasible problem, retrying...")
             continue
+        
+        feasibility_text.value = "feasible ✓"
         
         goal_ee = forward_kinematics(q_goal, link_lengths)[-1]
         
@@ -520,6 +575,8 @@ def run_benchmark_visual(n_envs=20, seed=0):
             horizon=1.0, num_knots=5, particles=512,
             ess_resample_thresh=0.3
         )
+        
+        master_key, run_key = jax.random.split(master_key)
         
         traj_sis, costs_sis = pfmp.run_sis(run_key, q_start, theta)
         traj_sir, costs_sir = pfmp.run_sir(run_key, q_start, theta)
@@ -550,10 +607,11 @@ def run_benchmark_visual(n_envs=20, seed=0):
         results['sis_success'].append(sis_success)
         results['sir_success'].append(sir_success)
         
-        # Clear old scene
+        print(f"[{env_idx+1}/{n_envs}] SIS: {'✓' if sis_success else '✗'}, SIR: {'✓' if sir_success else '✗'}")
+        
+        # Clear and rebuild scene
         clear_scene()
         
-        # Add obstacles
         for i, (c, r) in enumerate(zip(np.array(env.centers), np.array(env.radii))):
             obstacle_handles.append(
                 server.scene.add_icosphere(
@@ -572,7 +630,6 @@ def run_benchmark_visual(n_envs=20, seed=0):
                 )
             )
         
-        # Create arms
         start_handles_sis = create_arm_with_links(server, "start_sis", fk_start, (180, 180, 180), offset_sis, z_plane, joint_radius=0.06, link_radius=0.03)
         start_handles_sir = create_arm_with_links(server, "start_sir", fk_start, (180, 180, 180), offset_sir, z_plane, joint_radius=0.06, link_radius=0.03)
         goal_handles_sis = create_arm_with_links(server, "goal_sis", fk_goal, (255, 193, 7), offset_sis, z_plane, joint_radius=0.06, link_radius=0.03)
@@ -581,24 +638,13 @@ def run_benchmark_visual(n_envs=20, seed=0):
         sis_handles = create_arm_with_links(server, "sis", fk_sis[0], (76, 175, 80), offset_sis, z_plane)
         sir_handles = create_arm_with_links(server, "sir", fk_sir[0], (76, 175, 80), offset_sir, z_plane)
         
-        # EE traces
         ee_sis_points = np.array([[fk[-1][0] + offset_sis[0], fk[-1][1] + offset_sis[1], z_plane] for fk in fk_sis])
         ee_sir_points = np.array([[fk[-1][0] + offset_sir[0], fk[-1][1] + offset_sir[1], z_plane] for fk in fk_sir])
         
-        ee_trace_sis = server.scene.add_spline_catmull_rom(
-            "/ee_trace_sis",
-            positions=ee_sis_points[:2],
-            color=(33, 150, 243),
-            line_width=3.0,
-        )
-        ee_trace_sir = server.scene.add_spline_catmull_rom(
-            "/ee_trace_sir",
-            positions=ee_sir_points[:2],
-            color=(33, 150, 243),
-            line_width=3.0,
-        )
+        ee_trace_sis = server.scene.add_spline_catmull_rom("/ee_trace_sis", positions=ee_sis_points[:2], color=(33, 150, 243), line_width=3.0)
+        ee_trace_sir = server.scene.add_spline_catmull_rom("/ee_trace_sir", positions=ee_sir_points[:2], color=(33, 150, 243), line_width=3.0)
         
-        # Update labels
+        # Update stats
         sis_rate = np.mean(results['sis_success']) * 100
         sir_rate = np.mean(results['sir_success']) * 100
         label_sis.text = f"SIS: {sis_rate:.0f}%"
@@ -607,9 +653,9 @@ def run_benchmark_visual(n_envs=20, seed=0):
         sis_rate_text.value = f"{sis_rate:.0f}%"
         sir_rate_text.value = f"{sir_rate:.0f}%"
         
-        # Animate (loop twice per environment)
+        # Animate
         n_frames = len(path_sis)
-        for _ in range(2):  # 2 loops per env
+        for _ in range(2):
             for frame in range(n_frames):
                 color_sis = (244, 67, 54) if col_sis[frame] else (76, 175, 80)
                 color_sir = (244, 67, 54) if col_sir[frame] else (76, 175, 80)
@@ -622,10 +668,11 @@ def run_benchmark_visual(n_envs=20, seed=0):
                     ee_trace_sir.positions = ee_sir_points[:frame+1]
                 
                 time.sleep(0.02)
+        
+        env_idx += 1
     
     print(f"\nFinal: SIS={np.mean(results['sis_success'])*100:.0f}%, SIR={np.mean(results['sir_success'])*100:.0f}%")
     
-    # Keep running
     while True:
         time.sleep(1)
 
