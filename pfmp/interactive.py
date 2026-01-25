@@ -196,6 +196,8 @@ def run_interactive(  # noqa: PLR0912, PLR0915
 
             # simulate the system between spline replanning steps
             for i in range(sim_steps_per_replan):
+                step_start = time.time()
+
                 if ik_interp is not None:
                     target_xy = us[i]
                     u = ik_interp(target_xy, theta.ik_cache)
@@ -212,6 +214,10 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                 
                 viewer.sync()
 
+                step_elapsed = time.time() - step_start
+                if step_elapsed < sim_dt:
+                    time.sleep(sim_dt - step_elapsed)
+
                 if record_traj:
                     if family == "pfmp":
                         cost = controller.mpc_running_cost(mj_data, mj_data.ctrl, theta, mj_data.time)
@@ -227,9 +233,9 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                 recorder.add_frame(frame.tobytes())
 
             # Try to run in roughly realtime
-            elapsed = time.time() - start_time
-            if elapsed < step_dt:
-                time.sleep(step_dt - elapsed)
+            # elapsed = time.time() - start_time
+            # if elapsed < step_dt:
+            #     time.sleep(step_dt - elapsed)
 
             # Print some timing information
             rtr = step_dt / (time.time() - start_time)
