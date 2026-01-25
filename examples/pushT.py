@@ -92,14 +92,14 @@ class IKCache(NamedTuple):
     z: float               # fixed height
 
 @jax.jit
-def ik_from_cache(xy: jax.Array, ik_cache: IKCache) -> jax.Array:
+def ik_from_cache(xy: jax.Array, theta, _mj_data=None) -> jax.Array:
     """Look up IK solution from cache using bilinear interpolation."""
     # Normalize to [0, 1]
-    uv = (xy - ik_cache.xy_min) / (ik_cache.xy_max - ik_cache.xy_min)
+    uv = (xy - theta.ik_cache.xy_min) / (theta.ik_cache.xy_max - theta.ik_cache.xy_min)
     uv = jnp.clip(uv, 0.0, 1.0)
     
     # Grid dimensions
-    Nx, Ny = ik_cache.q_grid.shape[:2]
+    Nx, Ny = theta.ik_cache.q_grid.shape[:2]
     
     # Convert to grid coordinates
     gx = uv[0] * (Nx - 1)
@@ -116,11 +116,11 @@ def ik_from_cache(xy: jax.Array, ik_cache: IKCache) -> jax.Array:
     fy = gy - iy
     
     # Bilinear interpolation
-    q00 = ik_cache.q_grid[ix,     iy    ]
-    q01 = ik_cache.q_grid[ix,     iy + 1]
-    q10 = ik_cache.q_grid[ix + 1, iy    ]
-    q11 = ik_cache.q_grid[ix + 1, iy + 1]
-    
+    q00 = theta.ik_cache.q_grid[ix,     iy    ]
+    q01 = theta.ik_cache.q_grid[ix,     iy + 1]
+    q10 = theta.ik_cache.q_grid[ix + 1, iy    ]
+    q11 = theta.ik_cache.q_grid[ix + 1, iy + 1]
+
     q0 = q00 * (1 - fy) + q01 * fy
     q1 = q10 * (1 - fy) + q11 * fy
     q = q0 * (1 - fx) + q1 * fx
@@ -223,7 +223,7 @@ def ik_step_from_xy(prev_q: jax.Array, xy: jax.Array, z: float = EE_HEIGHT) -> j
     q, _ = ik_step_from_mat4(prev_q, mat4)
     return q
 
-CACHE_PATH = "ik_cache.pkl"
+CACHE_PATH = "./examples/ik_cache.pkl"
 
 def get_or_build_cache(**kwargs):
     if os.path.exists(CACHE_PATH):
@@ -356,7 +356,7 @@ def dynamics(x: mjx.Data, u: Jet2, th: PushParams, t: float) -> Tuple[mjx.Data, 
     target_xy = u.u  # (2,) array
 
     # Fast IK lookup from cache
-    target_qpos = ik_from_cache(target_xy, th.ik_cache)
+    target_qpos = ik_from_cache(target_xy, th)
 
     # Step simulation with computed joint targets
     x_next = mjx.step(th.mjx_model, x.replace(ctrl=target_qpos))
@@ -472,7 +472,7 @@ def main():
     parser.add_argument('--cache-resolution', type=int, default=IK_CACHE_RESOLUTION,
                         help='IK cache grid resolution')
     subparsers = parser.add_subparsers(dest="algorithm", required=True)
-    subparsers.add_parser("sis", help="Sequential Importance Sampling")
+    subparsers.add_parser("ps", help="Predictive Sampling (Sequential Importance Sampling)")
     subparsers.add_parser("sir", help="Sequential Importance Resampling")
     args = parser.parse_args()
 

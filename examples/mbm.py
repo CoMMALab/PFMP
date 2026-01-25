@@ -43,7 +43,7 @@ def compute_distance_field(grid: VoxelGrid) -> jax.Array:
 # Grid Construction
 # ============================================================================
 
-def add_box(grid: VoxelGrid, center, half_extents) -> VoxelGrid:
+def add_box(grid: VoxelGrid, center, half_extents, rotation = None) -> VoxelGrid:
     """Vectorized box voxelization (axis-aligned)."""
     data = np.array(grid.data)
     center = np.array(center)
@@ -76,7 +76,7 @@ def add_sphere(grid: VoxelGrid, center, radius) -> VoxelGrid:
                     data[i, j, k] = 1.0
     return grid._replace(data=jnp.array(data))
 
-def add_cylinder(grid: VoxelGrid, center, radius, half_height) -> VoxelGrid:
+def add_cylinder(grid: VoxelGrid, center, radius, half_height, rotation = None) -> VoxelGrid:
     """Vectorized cylinder voxelization."""
     data = np.array(grid.data)
     center = np.array(center)

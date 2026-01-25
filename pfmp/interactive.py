@@ -199,8 +199,8 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                 step_start = time.time()
 
                 if ik_interp is not None:
-                    target_xy = us[i]
-                    u = ik_interp(target_xy, theta.ik_cache)
+                    target = us[i]
+                    u = ik_interp(target, theta, mj_data)
                 else:
                     u = us[i]
                 mj_data.ctrl[:] = np.array(u)

@@ -1,26 +1,31 @@
-# Particle Flow Motion Planning
+# Particle Filtering Motion Planning
 
-Particle Flow Motion Planning (PFMP) is a planning-as-inference library for fast path generation in JAX and Mujoco XLA. Specifically, PFMP provides an implementation of the highly-parallelizable sequential importance sampling-resampling (SIS/R) kernel, also known as sequential Monte Carlo (SMC).
+Particle Filtering Motion Planning is a planning-as-inference library for fast path generation in JAX and Mujoco XLA. Specifically, `PFMP` class is an implementation of the highly-parallel sequential importance sampling-resampling (SIS/R) kernel, also known as sequential Monte Carlo (SMC).
 
 ## Installation
 
 ```shell
 uv venv && source .venv/bin/activate
-uv pip install .[test]
+uv pip install .
 ```
 
 ## Control
 
-Run a control example:
+Run a controller example:
 
 ```
-XLA_PYTHON_CLIENT_PREALLOCATE=false python examples/double_cart_pole.py sir
+XLA_PYTHON_CLIENT_PREALLOCATE=false python examples/pushT.py [sir|ps]
 ```
+
+which will show sequential importance resampling (SIR) solving (or predictive sampling failing to solve) a non-prehensile manipulation push-T task with Mujoco physics.
 
 ## Planning
 
 Run a planner example:
 
 ```
-python examples/car.py
+tar -xvf models/problems.tar.bz2 -C models
+python examples/mbm.py bench models/problems/table_pick_panda 50
 ```
+
+Each planning example shows a side-by-side of the SIS and SIS/R algorithms.
