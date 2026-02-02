@@ -12,105 +12,16 @@ from pathlib import Path
 from typing import NamedTuple
 from scipy.spatial.transform import Rotation
 
+# Voxel grid from common module
+from voxels import (
+    VoxelGrid,
+    empty_voxel_grid,
+    compute_distance_field,
+    add_box,
+    add_sphere,
+    add_cylinder,
+)
 
-# ============================================================================
-# Voxel Grid
-# ============================================================================
-
-class VoxelGrid(NamedTuple):
-    data: jax.Array
-    origin: jax.Array
-    resolution: float
-
-
-def empty_voxel_grid(shape=(64, 64, 64), origin=(-1.0, -1.0, 0.0), resolution=0.05) -> VoxelGrid:
-    return VoxelGrid(
-        data=jnp.zeros(shape, dtype=jnp.float32),
-        origin=jnp.array(origin, dtype=jnp.float32),
-        resolution=float(resolution),
-    )
-
-
-def compute_distance_field(grid: VoxelGrid) -> jax.Array:
-    from scipy.ndimage import distance_transform_edt
-    occupied = np.array(grid.data > 0.5)
-    dist_free = distance_transform_edt(~occupied) * grid.resolution
-    dist_occ = distance_transform_edt(occupied) * grid.resolution
-    return jnp.array(np.where(occupied, -dist_occ, dist_free), dtype=jnp.float32)
-
-
-# ============================================================================
-# Grid Construction
-# ============================================================================
-
-def add_box(grid: VoxelGrid, center, half_extents, rotation = None) -> VoxelGrid:
-    """Vectorized box voxelization (axis-aligned)."""
-    data = np.array(grid.data)
-    center = np.array(center)
-    half_extents = np.array(half_extents)
-    origin = np.array(grid.origin)
-    res = grid.resolution
-    shape = data.shape
-    
-    min_idx = np.maximum(((center - half_extents - origin) / res).astype(int), 0)
-    max_idx = np.minimum(((center + half_extents - origin) / res).astype(int) + 1, shape)
-    
-    # Just fill the box directly - no loop needed for axis-aligned
-    data[min_idx[0]:max_idx[0], min_idx[1]:max_idx[1], min_idx[2]:max_idx[2]] = 1.0
-    
-    return grid._replace(data=jnp.array(data))
-
-
-def add_sphere(grid: VoxelGrid, center, radius) -> VoxelGrid:
-    data = np.array(grid.data)
-    center = np.array(center)
-    origin, res, shape = np.array(grid.origin), grid.resolution, np.array(data.shape)
-    min_idx = np.maximum(((center - radius - origin) / res).astype(int), 0)
-    max_idx = np.minimum(((center + radius - origin) / res).astype(int) + 1, shape)
-    
-    for i in range(min_idx[0], max_idx[0]):
-        for j in range(min_idx[1], max_idx[1]):
-            for k in range(min_idx[2], max_idx[2]):
-                pos = origin + (np.array([i, j, k]) + 0.5) * res
-                if np.linalg.norm(pos - center) <= radius:
-                    data[i, j, k] = 1.0
-    return grid._replace(data=jnp.array(data))
-
-def add_cylinder(grid: VoxelGrid, center, radius, half_height, rotation = None) -> VoxelGrid:
-    """Vectorized cylinder voxelization."""
-    data = np.array(grid.data)
-    center = np.array(center)
-    origin = np.array(grid.origin)
-    res = grid.resolution
-    shape = data.shape
-    
-    # Bounding box indices
-    extent = max(radius, half_height)
-    min_idx = np.maximum(((center - extent - origin) / res).astype(int) - 1, 0)
-    max_idx = np.minimum(((center + extent - origin) / res).astype(int) + 2, shape)
-    
-    # Create grid of voxel centers in the bounding box
-    i = np.arange(min_idx[0], max_idx[0])
-    j = np.arange(min_idx[1], max_idx[1])
-    k = np.arange(min_idx[2], max_idx[2])
-    
-    ii, jj, kk = np.meshgrid(i, j, k, indexing='ij')
-    
-    # Voxel centers
-    px = origin[0] + (ii + 0.5) * res
-    py = origin[1] + (jj + 0.5) * res
-    pz = origin[2] + (kk + 0.5) * res
-    
-    # Cylinder test (axis-aligned along Z)
-    radial_dist = np.sqrt((px - center[0])**2 + (py - center[1])**2)
-    axial_dist = np.abs(pz - center[2])
-    
-    inside = (radial_dist <= radius) & (axial_dist <= half_height)
-    
-    # Set occupied
-    data[min_idx[0]:max_idx[0], min_idx[1]:max_idx[1], min_idx[2]:max_idx[2]][inside] = 1.0
-    
-    return grid._replace(data=jnp.array(data))
 
 # ============================================================================
 # SDF Query

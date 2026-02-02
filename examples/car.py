@@ -204,7 +204,7 @@ def plot_obstacles(ax, obstacles, color='black'):
 if __name__ == "__main__":
     horizon = 10
     num_knots = int(2*horizon)
-    particles = 256
+    particles = 32
     pfmp = PFMP(dynamics, cost_fn, terminal_cost, init, proposal,
                 horizon, num_knots, particles,
                 ess_resample_thresh=0.5)
@@ -248,30 +248,32 @@ if __name__ == "__main__":
     contour = ax.contourf(X, Y, Z, levels=20, cmap='Greys', alpha=0.3)
     
     # Add colorbar with larger text
-    cbar = plt.colorbar(contour, ax=ax, label='Cost')
-    cbar.ax.tick_params(labelsize=14)
-    cbar.set_label('Cost', fontsize=16, fontweight='bold')
+    # cbar = plt.colorbar(contour, ax=ax, label='Cost')
+    # cbar.ax.tick_params(labelsize=14)
+    # cbar.set_label('Cost', fontsize=16, fontweight='bold')
     
     # Plot obstacles with high contrast
     plot_obstacles(ax, theta.obstacles)
     
     # Mark start and goal with clear, publication-quality markers
-    ax.plot(x0[0], x0[1], 'o', color='darkgreen', markersize=14, 
+    ax.plot(x0[0], x0[1], 'o', color='darkgreen', markersize=30, 
             markeredgecolor='black', markeredgewidth=1.5, label='Start', zorder=10)
-    ax.plot(theta.goal[0], theta.goal[1], '*', color='gold', markersize=20,
+    ax.plot(theta.goal[0], theta.goal[1], '*', color='gold', markersize=40,
             markeredgecolor='black', markeredgewidth=1.5, label='Goal', zorder=10)
     
     ax.set_xlim(-0.5, 12.5)
     ax.set_ylim(-0.5, 12.5)
     ax.set_aspect('equal')
     ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5, color='gray')
-    ax.set_xlabel('X Position (m)', fontsize=16, fontweight='bold')
-    ax.set_ylabel('Y Position (m)', fontsize=16, fontweight='bold')
-    ax.tick_params(labelsize=14)
+    # ax.set_xlabel('X Position (m)', fontsize=16, fontweight='bold')
+    # ax.set_ylabel('Y Position (m)', fontsize=16, fontweight='bold')
+    # ax.tick_params(labelsize=14)
+    ax.set_xticks([])
+    ax.set_yticks([])
     
     # Add legend with clean styling and larger text
-    ax.legend(loc='upper left', fontsize=14, framealpha=0.95, 
-             edgecolor='black', fancybox=False, shadow=False)
+    # ax.legend(loc='upper left', fontsize=14, framealpha=0.95, 
+    #          edgecolor='black', fancybox=False, shadow=False)
     
     # Add subtle border
     for spine in ax.spines.values():
@@ -418,20 +420,20 @@ if __name__ == "__main__":
             knot_markers.append(marker)
         
         # Progress indicator - clean text box with larger text
-        progress_pct = (current_num_knots / num_knots) * 100
-        progress_text = ax.text(
-            0.02, 0.98, 
-            f'Knots: {current_num_knots}/{num_knots} ({progress_pct:.0f}%)\n'
-            f'Best Cost: {float(jnp.min(total_costs)):.2f}',
-            transform=ax.transAxes,
-            fontsize=14,
-            verticalalignment='bottom',
-            bbox=dict(boxstyle='round,pad=0.6', facecolor='white', 
-                     alpha=0.9, edgecolor='black', linewidth=1.5),
-            color='black',
-            fontfamily='monospace',
-            fontweight='bold'
-        )
+        # progress_pct = (current_num_knots / num_knots) * 100
+        # progress_text = ax.text(
+        #     0.02, 0.98, 
+        #     f'Knots: {current_num_knots}/{num_knots} ({progress_pct:.0f}%)\n'
+        #     f'Best Cost: {float(jnp.min(total_costs)):.2f}',
+        #     transform=ax.transAxes,
+        #     fontsize=14,
+        #     verticalalignment='bottom',
+        #     bbox=dict(boxstyle='round,pad=0.6', facecolor='white', 
+        #              alpha=0.9, edgecolor='black', linewidth=1.5),
+        #     color='black',
+        #     fontfamily='monospace',
+        #     fontweight='bold'
+        # )
         
         return trajectory_lines + car_patches_list + knot_markers + [progress_text]
     
@@ -441,11 +443,11 @@ if __name__ == "__main__":
                         repeat=True, repeat_delay=1)
     
     plt.tight_layout()
-    plt.show()
+    # plt.show()
     
     # Save with publication quality
     # anim.save('pfmp_planning.mp4', writer='ffmpeg', fps=5, dpi=300, 
     #           bitrate=5000, extra_args=['-vcodec', 'libx264'])
     # 
     # # Or save as GIF for easier inclusion in documents
-    # anim.save('pfmp_planning.gif', writer='pillow', fps=5, dpi=150)
+    anim.save('pfmp_planning.gif', writer='pillow', fps=5, dpi=150)

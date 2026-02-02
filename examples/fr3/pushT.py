@@ -92,7 +92,7 @@ class IKCache(NamedTuple):
     z: float               # fixed height
 
 @jax.jit
-def ik_from_cache(xy: jax.Array, theta, _mj_data=None) -> jax.Array:
+def ik_from_cache(xy: jax.Array, theta, _mjx_data=None) -> jax.Array:
     """Look up IK solution from cache using bilinear interpolation."""
     # Normalize to [0, 1]
     uv = (xy - theta.ik_cache.xy_min) / (theta.ik_cache.xy_max - theta.ik_cache.xy_min)
@@ -492,27 +492,27 @@ def main():
     # Task configuration
     horizon = 2.0
     num_knots = 8
-    particles = 1024
-
-    # Initial end-effector position
-    init_xy = jnp.array([0.4, -0.3])
-    
-    # Get initial joint config from cache
-    q0 = ik_from_cache(init_xy, ik_cache)
-    mj_data.qpos[:7] = np.array(q0)
+    particles = 4096
 
     # Create parameters
     theta = PushParams(
         mean=jnp.zeros((num_knots, 2)),
         mjx_model=mjx.put_model(mj_model),
         ik_cache=ik_cache,
-        goal_xy=jnp.array([-0.4, 0.3]),
+        goal_xy=jnp.array([-0.2, 0.3]),
         goal_angle=-0.2,
         pos_weight=3.0,
         angle_weight=0.5,
         u_stdev=0.05,
         du_stdev=0.1,
     )
+
+    # Initial end-effector position
+    init_xy = jnp.array([0.4, -0.3])
+
+    # Get initial joint config from cache
+    q0 = ik_from_cache(init_xy, theta)
+    mj_data.qpos[:7] = np.array(q0)
 
     # Create PFMP controller
     ctrl = pfmp.PFMP(
