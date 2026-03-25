@@ -17,7 +17,7 @@ Run a controller example:
 XLA_PYTHON_CLIENT_PREALLOCATE=false python examples/pushT.py [sir|ps]
 ```
 
-which will show sequential importance resampling (SIR) solving (or predictive sampling failing to solve) a non-prehensile manipulation push-T task with Mujoco physics.
+which will show sequential importance resampling (SIR) solving a non-prehensile manipulation push-T task with Mujoco physics.
 
 ## Planning
 
