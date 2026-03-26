@@ -2,6 +2,10 @@
   <include file="mjx_scene.xml"/>
 
   <worldbody>
+  <!-- workspace footprint: 53-1/8" x 23-1/4", 1.5" from base -->
+  <geom type="box" name="workspace"
+      pos="0.395 0.0 0.001" size="0.295 0.675 0.001"
+      rgba="0.7 0.7 0.7 0.25" contype="0" conaffinity="0" group="2"/>
   <body name="t_block" pos="0.6 0 0.045">
       <freejoint/>
       <!-- T stem -->
@@ -19,8 +23,7 @@
   <keyframe>
     <key name="home"
         qpos="0 -0.785398 0 -2.356194 0 1.570796 0.785398
-              0.04 0.04
-              0.60 0.00 0.03  1 0 0 0"/>
+              0.50 0.00 0.03  1 0 0 0"/>
   </keyframe>
 
 </mujoco>

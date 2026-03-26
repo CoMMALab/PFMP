@@ -11,7 +11,7 @@ from pfmp.algorithm import ps_update
 from hydrax.utils.video import VideoRecorder
 from typing import Optional, Any
 
-from .passive import Trajectory
+from .run_batch import Trajectory
 
 
 def run_interactive(  # noqa: PLR0912, PLR0915
@@ -200,7 +200,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
 
                 if ik_interp is not None:
                     target = us[i]
-                    u = ik_interp(target, theta, mj_data)
+                    u = ik_interp(target, theta, mjx_data)
                 else:
                     u = us[i]
                 mj_data.ctrl[:] = np.array(u)
