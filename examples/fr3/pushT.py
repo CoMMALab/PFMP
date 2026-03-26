@@ -2,6 +2,8 @@
 T-block pushing task using PFMP with Panda robot.
 
 Refactored to use the new PFMP API with Jet2 controls and cached IK.
+
+Real world workspace is 53' 1/8" x 23' 1/4"
 """
 
 import argparse
@@ -35,12 +37,13 @@ SCENE_XML_PATH = os.path.expanduser("~/src/PFMP/models/mjx_t_push.xml")
 
 # End-effector configuration
 EE_ID = 12
-EE_HEIGHT = 0.06
+EE_HEIGHT = 0.045
 
-# Workspace bounds for IK cache
-WORKSPACE_XY_MIN = jnp.array([-0.5, -0.6])
-WORKSPACE_XY_MAX = jnp.array([0.7, 0.6])
-IK_CACHE_RESOLUTION = 128
+# Physical platform: 53-1/8" wide x 23-1/4" deep, 1-1/2" clearance from base
+# 53.125" = 1.349 m (Y), 23.25" = 0.591 m (X), 1.5" = 0.038 m clearance
+WORKSPACE_XY_MIN = jnp.array([0.1, -0.675])
+WORKSPACE_XY_MAX = jnp.array([0.69, 0.675])
+IK_CACHE_RESOLUTION = 64
 
 # Fixed end-effector orientation (pointing down)
 EE_ROTATION = jnp.array([
@@ -49,8 +52,15 @@ EE_ROTATION = jnp.array([
     [0., 0., -1.],
 ])
 
+# Home joint configuration (from keyframe) — used as IK rest pose to keep
+# null-space resolution consistent across the workspace.
+HOME_Q = jnp.array([0., -0.785398, 0., -2.356194, 0., 1.570796, 0.785398])
+# Null-space weights: heavy on joints 5-7 to prevent wrist flip / elbow swing.
+# These must dominate the rest_cost in the null space (pose_cost ≈ 0 there).
+REST_WEIGHT = jnp.array([0.0, 0.1, 0.1, 0.1, 1.0, 1.0, 1.0])
+
 # T-block qpos offset in the MuJoCo state
-T_QPOS_OFFSET = 9
+T_QPOS_OFFSET = 7
 
 
 # ===============================
@@ -92,7 +102,7 @@ class IKCache(NamedTuple):
     z: float               # fixed height
 
 @jax.jit
-def ik_from_cache(xy: jax.Array, theta, _mj_data=None) -> jax.Array:
+def ik_from_cache(xy: jax.Array, theta, _mjx_data=None) -> jax.Array:
     """Look up IK solution from cache using bilinear interpolation."""
     # Normalize to [0, 1]
     uv = (xy - theta.ik_cache.xy_min) / (theta.ik_cache.xy_max - theta.ik_cache.xy_min)
@@ -152,11 +162,27 @@ def pose_from_mat4(mat4: jax.Array) -> Tuple[jax.Array, jax.Array]:
     return t.reshape(3,), q.reshape(4,)
 
 
+def _ee_z_axis_residual(
+    vals: jaxls.VarValues,
+    robot: pk.Robot,
+    joint_var,
+    target_link_index: jax.Array,
+    weight: float,
+) -> jax.Array:
+    """Residual: EE z-axis must point down [-z world]. Spin about z is free."""
+    Ts = robot.forward_kinematics(vals[joint_var])
+    R = jaxlie.SE3(Ts[..., target_link_index, :]).rotation().as_matrix()
+    ee_z = R @ jnp.array([0., 0., 1.])
+    return ((ee_z - jnp.array([0., 0., -1.])) * weight).flatten()
+
+_ee_z_cost = jaxls.Cost.factory(_ee_z_axis_residual)
+
+
 @jdc.jit
 def make_ik_problem(
     target_mat4: jax.Array,
-    pos_weight: float = 50.0,
-    ori_weight: float = 10.0,
+    pos_weight: float = 10.0,
+    ori_weight: float = 5.0,
     limit_weight: float = 100.0
 ):
     """Create IK optimization problem."""
@@ -172,12 +198,18 @@ def make_ik_problem(
             T_target,
             target_link_index=jnp.array(EE_ID),
             pos_weight=pos_weight,
-            ori_weight=ori_weight
+            ori_weight=0.0,        # full ori replaced by z-axis cost below
         ),
+        _ee_z_cost(PANDA, joint_var, jnp.array(EE_ID), ori_weight),
         pk.costs.limit_cost(
             PANDA,
             joint_var,
             weight=limit_weight,
+        ),
+        pk.costs.rest_cost(
+            joint_var,
+            HOME_Q,
+            REST_WEIGHT * 0.1,
         ),
     ]
     return jaxls.LeastSquaresProblem(factors, [joint_var]).analyze(), joint_var
@@ -190,7 +222,7 @@ def ik_7d_from_mat4(target_mat4: jax.Array) -> jax.Array:
     sol = prob.solve(
         verbose=False,
         linear_solver="dense_cholesky",
-        trust_region=jaxls.TrustRegionConfig(lambda_initial=1.0),
+        trust_region=jaxls.TrustRegionConfig(lambda_initial=1.),
     )
     return sol[joint_var]
 
@@ -203,7 +235,7 @@ def ik_step_from_mat4(prev_q: jax.Array, target_mat4: jax.Array) -> Tuple[jax.Ar
         initial_vals=jaxls.VarValues.make([joint_var.with_value(prev_q)]),
         verbose=False,
         linear_solver="dense_cholesky",
-        trust_region=jaxls.TrustRegionConfig(lambda_initial=1.0),
+        trust_region=jaxls.TrustRegionConfig(lambda_initial=1.),
     )
     q = sol[joint_var]
     return q, q
@@ -225,13 +257,37 @@ def ik_step_from_xy(prev_q: jax.Array, xy: jax.Array, z: float = EE_HEIGHT) -> j
 
 CACHE_PATH = "./examples/ik_cache.pkl"
 
+_CACHE_MAX_JUMP = np.pi / 3  # ~60° — larger jumps indicate a wrist flip
+
+def validate_cache(cache: IKCache) -> bool:
+    """Return True if the cache has no large joint-angle discontinuities."""
+    q = np.array(cache.q_grid)  # (Nx, Ny, 7)
+    def _wrapped_max(diff):
+        # Wrap to [-π, π] so joints near ±π don't look like ~360° jumps
+        d = (diff + np.pi) % (2 * np.pi) - np.pi
+        return float(np.max(np.abs(d)))
+    worst = max(_wrapped_max(np.diff(q, axis=0)),
+                _wrapped_max(np.diff(q, axis=1)))
+    if worst >= _CACHE_MAX_JUMP:
+        print(f"  IK cache invalid: max neighbour jump = {np.degrees(worst):.1f}° "
+              f"(limit {np.degrees(_CACHE_MAX_JUMP):.0f}°)")
+        return False
+    print(f"  IK cache valid: max neighbour jump = {np.degrees(worst):.1f}°")
+    return True
+
 def get_or_build_cache(**kwargs):
     if os.path.exists(CACHE_PATH):
         print("Loading cached IK...")
         with open(CACHE_PATH, 'rb') as f:
-            return pickle.load(f)
-    
+            cache = pickle.load(f)
+        if validate_cache(cache):
+            return cache
+        print("  Cache failed validation — rebuilding...")
+        os.remove(CACHE_PATH)
+
     cache = build_ik_cache(**kwargs)
+    if not validate_cache(cache):
+        print("WARNING: rebuilt cache still has discontinuities — check rest_cost weights")
     with open(CACHE_PATH, 'wb') as f:
         pickle.dump(cache, f)
     return cache
@@ -260,20 +316,18 @@ def build_ik_cache(
     
     q_grid = np.zeros((resolution, resolution, 7))
     
+    # Always warm-start from HOME_Q so rest_cost resolves the null space
+    # consistently.  Raster warm-start (from previous neighbour) would lock in
+    # the wrong null-space branch and rest_cost can't pull it back.
+    home_q_np = np.array(HOME_Q)
+
     for i, x in enumerate(xs):
         if verbose and i % 10 == 0:
             print(f"  Row {i}/{resolution}...")
-        
+
         for j, y in enumerate(ys):
             xy = jnp.array([float(x), float(y)])
-            
-            if i == 0 and j == 0:
-                q = ik_from_xy(xy, z)
-            elif j == 0:
-                q = ik_step_from_xy(jnp.array(q_grid[i-1, 0]), xy, z)
-            else:
-                q = ik_step_from_xy(jnp.array(q_grid[i, j-1]), xy, z)
-            
+            q = ik_step_from_xy(jnp.array(home_q_np), xy, z)
             q_grid[i, j] = np.array(q)
     
     elapsed = time.perf_counter() - t0
@@ -490,29 +544,29 @@ def main():
     )
 
     # Task configuration
-    horizon = 2.0
+    horizon = 4.0
     num_knots = 8
-    particles = 1024
-
-    # Initial end-effector position
-    init_xy = jnp.array([0.4, -0.3])
-    
-    # Get initial joint config from cache
-    q0 = ik_from_cache(init_xy, ik_cache)
-    mj_data.qpos[:7] = np.array(q0)
+    particles = 4096
 
     # Create parameters
     theta = PushParams(
         mean=jnp.zeros((num_knots, 2)),
         mjx_model=mjx.put_model(mj_model),
         ik_cache=ik_cache,
-        goal_xy=jnp.array([-0.4, 0.3]),
-        goal_angle=-0.2,
+        goal_xy=jnp.array([0.35, 0.15]),
+        goal_angle=np.pi/3,
         pos_weight=3.0,
         angle_weight=0.5,
         u_stdev=0.05,
         du_stdev=0.1,
     )
+
+    # Initial end-effector position
+    init_xy = jnp.array([0.5, -0.2])
+
+    # Get initial joint config from cache
+    q0 = ik_from_cache(init_xy, theta)
+    mj_data.qpos[:7] = np.array(q0)
 
     # Create PFMP controller
     ctrl = pfmp.PFMP(
@@ -539,7 +593,7 @@ def main():
         mj_model,
         mj_data,
         ik_interp=ik_from_cache,
-        frequency=1,
+        frequency=0.5,
         method=args.algorithm,
         fixed_camera_id=None,
         record_video=False,

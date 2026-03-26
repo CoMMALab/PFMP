@@ -2,15 +2,19 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 from tabulate import tabulate
-from pfmp.passive import Trajectory
+from pfmp.run_batch import Trajectory
 from fire import Fire
 
-METHODS = ["ps", "mppi", "cem", "sis", "sir"]
+# METHODS = ["ps", "mppi", "cem", "sis", "sir"]
+# LABELS = [
+#     "Hydrax (PS)",
+#     "Hydrax (MPPI)",
+#     "Hydrax (CEM)",
+#     "PFMP (SIS)",
+#     "PFMP (SIR)"
+# ]
+METHODS = ["sir"]
 LABELS = [
-    "Hydrax (PS)",
-    "Hydrax (MPPI)",
-    "Hydrax (CEM)",
-    "PFMP (SIS)",
     "PFMP (SIR)"
 ]
 
@@ -30,7 +34,7 @@ def main(results):
         x = np.full(len(y), float(i)) + 0.05 * np.random.randn(len(y))
         plt.scatter(x, y, s=8, alpha=0.6)
     
-    plt.xticks(range(5), LABELS)
+    plt.xticks(range(len(LABELS)), LABELS)
     plt.title(os.path.basename(results))
     plt.xlabel("Method")
     plt.ylabel("Cost")

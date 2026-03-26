@@ -4,4 +4,4 @@ from .algorithm import PFMP, \
     GenericMJXTaskParams
 from .interpolate import hermite_spline
 from .interactive import run_interactive
-from .passive import run_passive
+from .run_batch import run_batch

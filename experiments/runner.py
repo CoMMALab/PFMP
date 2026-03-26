@@ -39,15 +39,25 @@ class Experiment(NamedTuple):
     cem_sigma_min: float
     frequency: int = 50
 
+def _load_task(name):
+    """Instantiate a task by name. PFMP-native tasks are imported lazily."""
+    if name == "PushT":
+        from pfmp.tasks.pushT import PushT
+        return PushT()
+    return eval(name)()
+
 def main(yamlfile, outdir):
     os.makedirs(outdir, exist_ok=True)
 
     with open(yamlfile, "r") as f:
         config = yaml.safe_load(f)
 
-    task = eval(config["task"])()
+    task = _load_task(config["task"])
     mj_model = task.mj_model
     mj_data = mujoco.MjData(mj_model)
+
+    # Check if this is a PFMP-native task (provides its own controller)
+    pfmp_native = hasattr(task, 'make_controller')
 
     for algorithm in config.pop("algorithms"):
         cfg = Experiment(
@@ -55,18 +65,34 @@ def main(yamlfile, outdir):
             algorithm=algorithm
         )
         theta = None
-        if cfg.algorithm == "sis" or cfg.algorithm == "sir":
+        ik_interp = None
+
+        sample_problem = None
+
+        if pfmp_native:
+            # PFMP-native task (e.g. PushT) — provides its own dynamics,
+            # cost functions, proposals, and optionally ik_interp.
+            if cfg.algorithm not in ("sis", "sir"):
+                raise ValueError(
+                    f"Task {cfg.task} only supports PFMP algorithms (sis/sir), "
+                    f"got '{cfg.algorithm}'"
+                )
+            ctrl, theta = task.make_controller(cfg)
+            task.init_data(mj_data, theta)
+            ik_interp = getattr(task, 'ik_interp', None)
+            sample_problem = getattr(task, 'sample_problem', None)
+        elif cfg.algorithm == "sis" or cfg.algorithm == "sir":
             running_cost, terminal_cost = pfmp.mjx_hydrax_cost(task)
-            init, proposal = pfmp.mjx_linear_gaussian_proposal(task, cfg.horizon, cfg.num_knots)
+            init, proposal = pfmp.mjx_linear_gaussian_proposal(task, cfg.plan_horizon, cfg.num_knots)
             ctrl = pfmp.PFMP(
                 pfmp.mjx_physics,
                 running_cost, terminal_cost,
                 init, proposal,
-                horizon=cfg.horizon,
+                horizon=cfg.plan_horizon,
                 num_knots=cfg.num_knots,
                 particles=cfg.num_samples,
                 dt=mj_model.opt.timestep,
-                ess_resample_thresh=cfg.ess_resample_thresh
+                ess_resample_thresh=0.5,
                 )
             theta = pfmp.GenericMJXTaskParams(
                 mjx_model = mjx.put_model(mj_model),
@@ -106,7 +132,7 @@ def main(yamlfile, outdir):
         else:
             raise ValueError(f"Unsupported MPC algorithm: {cfg.algorithm}")
 
-        traj = pfmp.run_passive(
+        traj = pfmp.run_batch(
             ctrl,
             theta,
             mj_model,
@@ -114,7 +140,9 @@ def main(yamlfile, outdir):
             frequency=cfg.frequency,
             algorithm=cfg.algorithm,
             max_step=cfg.max_step,
-            num=cfg.num
+            num=cfg.num,
+            ik_interp=ik_interp,
+            sample_problem=sample_problem,
         )
         traj.save(os.path.join(outdir, cfg.algorithm))
 
