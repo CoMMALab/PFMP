@@ -15,7 +15,7 @@ dependencies = [
     "mujoco",
     "mujoco-mjx",
     "warp-lang",
-    "hydrax @ git+https://github.com/vincekurtz/hydrax.git@main",
+    "hydrax @ git+https://github.com/vincekurtz/hydrax.git@63c715df2925b689b838dda2c7534deb292dd8f1",
     "matplotlib",
     "jax_dataclasses",
     "yourdfpy",
