@@ -4,6 +4,10 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import matplotlib.transforms as transforms
+from matplotlib.animation import FuncAnimation
+from pfmp.interpolate import hermite_spline
 
 
 # =============================================================================
@@ -189,3 +193,184 @@ def generate_map_batch(
         jnp.array(np.stack(all_goals)),
         maps_rejected,
     )
+
+
+# =============================================================================
+# Shared animation
+# =============================================================================
+
+def setup_2d(ax, pfmp, x0, theta, dynamics, cost_fn,
+             xlim, ylim, plot_obs=None,
+             smooth: bool = False, stride: int = 3, num_top: int = 20,
+             color_best: str = 'darkblue', color_rest: str = 'steelblue',
+             nominals=None, highlight_best: bool = True):
+    """Set up a 2D animation panel on ax.
+
+    Draws the background, runs SIR, precomputes trajectories, and creates
+    matplotlib artists. Returns (update_fn, frames, interval) for use with
+    FuncAnimation — the caller is responsible for creating the animation.
+
+    Args:
+        plot_obs: obstacles to draw (defaults to theta.obstacles; pass filtered
+                  array to exclude padding dummies)
+    """
+    obs_to_plot = plot_obs if plot_obs is not None else theta.obstacles
+
+    # Background
+    xs = jnp.linspace(xlim[0], xlim[1], 200)
+    ys = jnp.linspace(ylim[0], ylim[1], 150)
+    X, Y = jnp.meshgrid(xs, ys)
+    points = jnp.stack([X.ravel(), Y.ravel()], axis=1)
+    Z = jax.vmap(lambda loc: cost_fn(loc, jnp.zeros(1), theta, 0.0))(points).reshape(X.shape)
+    ax.contourf(X, Y, Z, levels=20, cmap='Greys', alpha=0.3)
+    plot_obstacles(ax, obs_to_plot)
+    ax.plot(float(x0[0]), float(x0[1]), 'o', color='darkgreen', markersize=20,
+            markeredgecolor='black', markeredgewidth=1.5, zorder=10)
+    ax.plot(float(theta.goal[0]), float(theta.goal[1]), '*', color='gold', markersize=30,
+            markeredgecolor='black', markeredgewidth=1.5, zorder=10)
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
+    ax.set_aspect('equal')
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_edgecolor('black')
+        spine.set_linewidth(1.5)
+
+    # Run SIR
+    num_knots = pfmp.num_knots
+    horizon = pfmp.horizon
+    interval_len = horizon / (num_knots - 1)
+    steps_per_knot = round(interval_len / pfmp.dt)
+
+    states, ancestors, costs, _ = pfmp._sir(jax.random.key(1), x0, theta)
+
+    total_costs = jnp.sum(costs, axis=-1)
+    top_indices = np.array(jnp.argsort(total_costs)[:num_top])
+    best_pi = int(np.where(top_indices == int(jnp.argmin(total_costs)))[0][0])
+
+    print("Precomputing trajectories...", end=" ", flush=True)
+    frame_xys = []
+    for k in range(num_knots - 1):
+        current_num_knots = k + 2
+        current_states = jax.tree.map(lambda x: x[:current_num_knots], states)
+        current_trajs = pfmp.choose_paths(
+            current_states, ancestors[:current_num_knots - 1],
+            jnp.arange(pfmp.particles))
+
+        current_horizon = (current_num_knots - 1) * interval_len
+        tq = jnp.linspace(0, current_horizon, (k + 1) * steps_per_knot)
+        tk = jnp.linspace(0, current_horizon, current_num_knots)
+
+        def rollout(knots):
+            us = hermite_spline(tq, tk, knots)
+            _, xy = jax.lax.scan(lambda x, ut: dynamics(x, ut[0], theta, ut[1]),
+                                  x0, (us, tq))
+            return xy
+
+        frame_xys.append(np.array(jax.vmap(rollout)(current_trajs[top_indices])))
+    print("done")
+
+    T = (num_knots - 1) * steps_per_knot
+    alphas = np.linspace(0.4, 0.1, num_top)
+    if highlight_best:
+        alphas[best_pi] = 1.0
+
+    trail_lines, car_patches, knot_patches = [], [], []
+    for pi in range(num_top):
+        is_best = pi == best_pi and highlight_best
+        color = color_best if is_best else color_rest
+        trail, = ax.plot([], [], color=color, alpha=alphas[pi],
+                         linewidth=2.0 if is_best else 0.8,
+                         zorder=5 if is_best else 2, solid_capstyle='round')
+        trail_lines.append(trail)
+        car = patches.Rectangle((-theta.L / 2, -theta.L / 4), theta.L, theta.L / 2,
+                                 facecolor=color, edgecolor='black',
+                                 linewidth=1.5 if is_best else 0.5,
+                                 alpha=alphas[pi], zorder=6 if is_best else 3)
+        ax.add_patch(car)
+        car_patches.append(car)
+        kp = []
+        for _ in range(num_knots):
+            box = patches.Rectangle((-theta.L / 2, -theta.L / 4), theta.L, theta.L / 2,
+                                    facecolor=color, edgecolor='black',
+                                    linewidth=0.5, alpha=0.0,
+                                    zorder=4 if is_best else 1)
+            ax.add_patch(box)
+            kp.append(box)
+        knot_patches.append(kp)
+
+    nominal_artists = []
+    if nominals:
+        for xy, label, color in nominals:
+            line, = ax.plot([], [], color=color, linewidth=2.5, alpha=0.0,
+                            zorder=9, solid_capstyle='round', label=label)
+            nominal_artists.append((line, np.array(xy)))
+
+    def _reveal_nominals():
+        for line, xy in nominal_artists:
+            line.set_data(xy[:, 0], xy[:, 1])
+            line.set_alpha(1.0)
+        if nominal_artists:
+            ax.legend(loc='upper left', fontsize=9, framealpha=0.85,
+                      edgecolor='black', fancybox=False)
+
+    if smooth:
+        def update(t):
+            k = min(t // steps_per_knot, num_knots - 2)
+            xys = frame_xys[k]
+            for pi in range(num_top):
+                px, py, th = xys[pi, t]
+                car_patches[pi].set_transform(
+                    transforms.Affine2D().rotate(th).translate(px, py) + ax.transData)
+                trail_lines[pi].set_data(xys[pi, :t + 1, 0], xys[pi, :t + 1, 1])
+                for ki in range(num_knots):
+                    box = knot_patches[pi][ki]
+                    if ki <= k:
+                        kx, ky, kth = xys[pi, ki * steps_per_knot]
+                        box.set_transform(
+                            transforms.Affine2D().rotate(kth).translate(kx, ky) + ax.transData)
+                        box.set_alpha(alphas[pi] * 0.5)
+                    else:
+                        box.set_alpha(0.0)
+            if nominal_artists and k == num_knots - 2:
+                _reveal_nominals()
+        return update, range(0, T, stride), 7
+    else:
+        def update(frame):
+            xys = frame_xys[frame]
+            for pi in range(num_top):
+                trail_lines[pi].set_data(xys[pi, :, 0], xys[pi, :, 1])
+                car_patches[pi].set_alpha(0.0)
+                for ki in range(num_knots):
+                    box = knot_patches[pi][ki]
+                    if ki <= frame + 1:
+                        knot_t = min(ki * steps_per_knot, xys.shape[1] - 1)
+                        kx, ky, kth = xys[pi, knot_t]
+                        box.set_transform(
+                            transforms.Affine2D().rotate(kth).translate(kx, ky) + ax.transData)
+                        box.set_alpha(alphas[pi] * 0.6)
+                    else:
+                        box.set_alpha(0.0)
+            if nominal_artists and frame == num_knots - 2:
+                _reveal_nominals()
+        return update, num_knots - 1, 300
+
+
+def animate_2d(ax, pfmp, x0, theta, dynamics, cost_fn,
+               xlim, ylim, plot_obs=None,
+               smooth: bool = False, stride: int = 3, num_top: int = 20,
+               color_best: str = 'darkblue', color_rest: str = 'steelblue'):
+    """Animate PFMP planning on a 2D obstacle environment.
+
+    Sets up the background on `ax`, precomputes trajectories, and returns a
+    FuncAnimation. The caller handles figure creation, tight_layout, and
+    save/show. For multi-panel use, call setup_2d directly.
+    """
+    update, frames, interval = setup_2d(
+        ax, pfmp, x0, theta, dynamics, cost_fn,
+        xlim, ylim, plot_obs, smooth, stride, num_top, color_best, color_rest)
+    repeat_delay = 1000 if smooth else 2000
+    return FuncAnimation(ax.figure, update, frames=frames,
+                         interval=interval, blit=False, repeat=True,
+                         repeat_delay=repeat_delay)

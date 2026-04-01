@@ -14,8 +14,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-import matplotlib.transforms as transforms
 from matplotlib.animation import FuncAnimation
 import json
 import argparse
@@ -35,7 +33,7 @@ from obstacle_grid import (
 # Configuration
 # =============================================================================
 
-SEED = 42
+SEED = 123
 NUM_MAPS = 128
 PARTICLES = 1024
 ESS_THRESH = 0.5
@@ -73,6 +71,8 @@ class Params(NamedTuple):
     v: float              # forward speed (m/s)
     du_stdev: float       # tangent noise
     u_stdev: float        # point noise
+    mean: jax.Array       # (num_knots,) proposal mean
+    step_len: float       # horizon / (num_knots - 1)
 
 
 def cost_fn(x: jax.Array, u: jax.Array, th: Params, t: float) -> float:
@@ -85,7 +85,7 @@ def cost_fn(x: jax.Array, u: jax.Array, th: Params, t: float) -> float:
 
 
 def terminal_cost(x, th) -> float:
-    return 10 * jnp.linalg.norm(x[:2] - th.goal) ** 2
+    return 100 * jnp.linalg.norm(x[:2] - th.goal) ** 2
 
 
 def dynamics(x: jax.Array, u: jax.Array, theta: Params, t):
@@ -100,166 +100,311 @@ def dynamics(x: jax.Array, u: jax.Array, theta: Params, t):
 
 
 def init(key, x, theta):
-    return jnp.clip(jax.random.normal(key) * theta.u_stdev, -0.8, 0.8)
+    return jnp.clip(jax.random.normal(key) * theta.u_stdev + theta.mean[0], -0.8, 0.8)
 
 
 def proposal(key, _x, _u, theta: Params, t):
-    return jnp.clip(jax.random.normal(key) * theta.u_stdev, -0.8, 0.8)
+    idx = jnp.clip(jnp.round(t / theta.step_len).astype(int) + 1, 0, theta.mean.shape[0] - 1)
+    return jnp.clip(jax.random.normal(key) * theta.u_stdev + theta.mean[idx], -0.8, 0.8)
+
+
+# =============================================================================
+# Animation — shared helpers
+# =============================================================================
+
+BASELINE_COLORS = {
+    'ps':   ('crimson',    'indianred',      r'$\mathrm{argmax}$'),
+    'mppi': ('royalblue',  'cornflowerblue', r'$\mathbb{E}$'),
+    'cem':  ('darkorange', 'sandybrown',     r'$\mathbb{E}_\mathrm{elite}$'),
+}
+NUM_CLOUD = 30   # particle paths shown per baseline per frame
+NUM_OUTER = 15   # default outer optimization iterations
+SIGMA_MIN_FRAC = 0.1  # final noise = U_STDEV * this
+
+
+def _sigma_schedule(sigma_max, n):
+    return np.geomspace(sigma_max, sigma_max * SIGMA_MIN_FRAC, n)
+
+
+def _rollout_xy(pfmp, knots, x0, theta):
+    tq = jnp.linspace(0, pfmp.horizon, round(pfmp.horizon / pfmp.dt))
+    tk = jnp.linspace(0, pfmp.horizon, pfmp.num_knots)
+    us = hermite_spline(tq, tk, knots)
+    _, xy = jax.lax.scan(lambda x, ut: dynamics(x, ut[0], theta, ut[1]), x0, (us, tq))
+    return xy
+
+@partial(jax.jit, static_argnames=['pfmp'])
+def _rollout_xy_jit(pfmp, knots, x0, theta):
+    return _rollout_xy(pfmp, knots, x0, theta)
+
+
+def _draw_panel_bg(ax, x0, theta, cost_fn, xlim, ylim, plot_obs):
+    obs_to_plot = plot_obs if plot_obs is not None else theta.obstacles
+    xs = jnp.linspace(xlim[0], xlim[1], 200)
+    ys = jnp.linspace(ylim[0], ylim[1], 150)
+    X, Y = jnp.meshgrid(xs, ys)
+    points = jnp.stack([X.ravel(), Y.ravel()], axis=1)
+    Z = jax.vmap(lambda loc: cost_fn(loc, jnp.zeros(1), theta, 0.0))(
+        points).reshape(X.shape)
+    ax.contourf(X, Y, Z, levels=20, cmap='Greys', alpha=0.3)
+    plot_obstacles(ax, obs_to_plot)
+    ax.plot(float(x0[0]), float(x0[1]), 'o', color='darkgreen', markersize=20,
+            markeredgecolor='black', markeredgewidth=1.5, zorder=10)
+    ax.plot(float(theta.goal[0]), float(theta.goal[1]), '*', color='gold',
+            markersize=30, markeredgecolor='black', markeredgewidth=1.5, zorder=10)
+    ax.set_xlim(*xlim); ax.set_ylim(*ylim)
+    ax.set_aspect('equal'); ax.set_xticks([]); ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_edgecolor('black'); spine.set_linewidth(1.5)
+
+
+# =============================================================================
+# Animation — baselines
+# =============================================================================
+
+def precompute_baselines(names, pfmp, x0, theta, num_outer):
+    """N outer iterations of each baseline with annealed noise.
+
+    Returns: dict name -> list of (cloud_xys, nominal_xy) per outer iteration
+        cloud_xys:  (NUM_CLOUD, T, 2)
+        nominal_xy: (T, 2)
+    """
+    sigmas = _sigma_schedule(float(theta.u_stdev), num_outer)
+    rollout_batch = jax.jit(jax.vmap(partial(_rollout_xy_jit, pfmp, x0=x0, theta=theta)))
+    name_seed = {'ps': 0, 'mppi': 1, 'cem': 2}
+    results = {name: [] for name in names}
+
+    for name in names:
+        nominal = jnp.zeros(pfmp.num_knots)
+        print(f"  {name} ({num_outer} iters)...", end=" ", flush=True)
+
+        for i, sigma in enumerate(sigmas):
+            key = jax.random.key(i * 3 + name_seed[name])
+            keys = jax.random.split(key, pfmp.particles)
+            noise = jax.vmap(
+                lambda k: jax.random.normal(k, (pfmp.num_knots,)) * sigma)(keys)
+            trajs = jnp.clip(nominal[None] + noise, -0.8, 0.8)
+            costs = jax.vmap(lambda k: _rollout_cost_jit(pfmp, k, x0, theta))(trajs)
+
+            if name == 'ps':
+                nominal = trajs[jnp.argmin(costs)]
+            elif name == 'mppi':
+                # Temperature anneals with sigma^2 (variance of the proposal)
+                temperature = max(float(jnp.std(costs)) * (sigma / sigmas[0]) ** 2, 1e-6)
+                weights = jax.nn.softmax(-costs / temperature)
+                nominal = jnp.sum(trajs * weights[:, None], axis=0)
+            elif name == 'cem':
+                num_elite = max(1, int(CEM_ELITE_FRAC * pfmp.particles))
+                nominal = jnp.mean(trajs[jnp.argsort(costs)[:num_elite]], axis=0)
+
+            sample_idx = np.random.RandomState(i).choice(
+                pfmp.particles, NUM_CLOUD, replace=False)
+            cloud_xys = np.array(rollout_batch(trajs[sample_idx]))[:, :, :2]
+            nom_xy = np.array(_rollout_xy_jit(pfmp, nominal, x0, theta))[:, :2]
+            results[name].append((cloud_xys, nom_xy))
+
+        print("done")
+
+    return results
+
+
+def setup_baseline_panel(ax, baselines_data, x0, theta, cost_fn, xlim, ylim,
+                          plot_obs=None, unroll=False, steps_per_knot=None,
+                          num_knots=None):
+    """Set up the baselines animation panel. Returns (update_fn, num_frames, interval)."""
+    _draw_panel_bg(ax, x0, theta, cost_fn, xlim, ylim, plot_obs)
+
+    cloud_lines = {}
+    nominal_lines = {}
+    for name in baselines_data:
+        color_best, color_rest, label = BASELINE_COLORS[name]
+        lines = [ax.plot([], [], color=color_rest, alpha=0.2, linewidth=0.8,
+                         zorder=2, solid_capstyle='round')[0]
+                 for _ in range(NUM_CLOUD)]
+        cloud_lines[name] = lines
+        nom_line, = ax.plot([], [], color=color_best, linewidth=2.5, alpha=1.0,
+                            zorder=8, solid_capstyle='round', label=label)
+        nominal_lines[name] = nom_line
+
+    ax.legend(loc='upper left', fontsize=9, framealpha=0.85,
+              edgecolor='black', fancybox=False)
+
+    def _draw(name, cloud_xys, nom_xy):
+        for j, line in enumerate(cloud_lines[name]):
+            line.set_data(cloud_xys[j, :, 0], cloud_xys[j, :, 1])
+        nominal_lines[name].set_data(nom_xy[:, 0], nom_xy[:, 1])
+
+    num_outer = len(next(iter(baselines_data.values())))
+
+    if unroll:
+        inner_frames = num_knots - 1
+        def update(j):
+            outer, inner = divmod(j, inner_frames)
+            end = (inner + 1) * steps_per_knot
+            for name, iters in baselines_data.items():
+                cloud_xys, nom_xy = iters[outer]
+                _draw(name, cloud_xys[:, :end, :], nom_xy)
+        return update, num_outer * inner_frames, 300
+    else:
+        def update(frame):
+            for name, iters in baselines_data.items():
+                cloud_xys, nom_xy = iters[frame]
+                _draw(name, cloud_xys, nom_xy)
+        return update, num_outer, 300
+
+
+# =============================================================================
+# Animation — SMC
+# =============================================================================
+
+def precompute_smc(pfmp_sir, x0, theta, num_outer, num_top=20):
+    """N outer SMC runs with annealed noise.
+
+    Returns: list of (xys, best_pi) per outer iteration
+        xys:     (num_top, T, 2) full-horizon trajectories
+        best_pi: index into xys of the best trajectory
+    """
+    sigmas = _sigma_schedule(float(theta.u_stdev), num_outer)
+    num_knots = pfmp_sir.num_knots
+    interval_len = pfmp_sir.horizon / (num_knots - 1)
+    steps_per_knot = round(interval_len / pfmp_sir.dt)
+    tq = jnp.linspace(0, pfmp_sir.horizon, (num_knots - 1) * steps_per_knot)
+    tk = pfmp_sir.tk()
+
+    frames = []
+    best_knots = jnp.zeros(pfmp_sir.num_knots)
+    print(f"  SMC ({num_outer} iters)...", end=" ", flush=True)
+    for i, sigma in enumerate(sigmas):
+        theta_i = theta._replace(u_stdev=sigma, mean=best_knots)
+        states, ancestors, costs, _ = pfmp_sir._sir(jax.random.key(i), x0, theta_i)
+        total_costs = jnp.sum(costs, axis=-1)
+        top_indices = np.array(jnp.argsort(total_costs)[:num_top])
+        best_pi = int(np.where(top_indices == int(jnp.argmin(total_costs)))[0][0])
+
+        trajs = pfmp_sir.choose_paths(states, ancestors, jnp.array(top_indices))
+
+        def rollout(knots, tq=tq, tk=tk):
+            us = hermite_spline(tq, tk, knots)
+            _, xy = jax.lax.scan(
+                lambda x, ut: dynamics(x, ut[0], theta_i, ut[1]), x0, (us, tq))
+            return xy
+
+        xys = np.array(jax.vmap(rollout)(trajs))[:, :, :2]
+        best_knots = trajs[best_pi]
+        frames.append((xys, best_pi))
+    print("done")
+
+    return frames, steps_per_knot
+
+
+def setup_smc_panel(ax, smc_frames, steps_per_knot, x0, theta, cost_fn, xlim, ylim,
+                     plot_obs=None, num_top=20, unroll=False, num_knots=None):
+    """Set up the SMC animation panel. Returns (update_fn, num_frames, interval)."""
+    _draw_panel_bg(ax, x0, theta, cost_fn, xlim, ylim, plot_obs)
+
+    alphas = np.linspace(0.4, 0.1, num_top)
+    trail_lines = []
+    for pi in range(num_top):
+        line, = ax.plot([], [], color='mediumseagreen', alpha=alphas[pi],
+                        linewidth=0.8, zorder=2, solid_capstyle='round')
+        trail_lines.append(line)
+    best_line, = ax.plot([], [], color='darkgreen', linewidth=2.5, alpha=1.0,
+                          zorder=8, solid_capstyle='round')
+
+    def _draw(xys, end, best_pi):
+        for pi in range(num_top):
+            if pi != best_pi:
+                trail_lines[pi].set_data(xys[pi, :end, 0], xys[pi, :end, 1])
+            else:
+                trail_lines[pi].set_data([], [])
+        best_line.set_data(xys[best_pi, :, 0], xys[best_pi, :, 1])
+
+    if unroll:
+        inner_frames = num_knots - 1
+        def update(j):
+            outer, inner = divmod(j, inner_frames)
+            xys, best_pi = smc_frames[outer]
+            _draw(xys, (inner + 1) * steps_per_knot, best_pi)
+        return update, len(smc_frames) * inner_frames, 300
+    else:
+        def update(frame):
+            xys, best_pi = smc_frames[frame]
+            _draw(xys, xys.shape[1], best_pi)
+        return update, len(smc_frames), 300
 
 
 # =============================================================================
 # Animation
 # =============================================================================
 
-def animate(num_knots: int = 20, map_index: int = 0, num_top: int = 20,
-            save_gif: bool = False):
-    """Animate SIS vs SIS/R side-by-side on a single random problem instance."""
-    OUTPUT_DIR.mkdir(exist_ok=True)
-
+def animate(num_knots: int = 20, map_index: int = 0,
+            save_gif: bool = False, num_outer: int = NUM_OUTER,
+            baseline: str = 'all', unroll: bool = False):
+    """Animate MPC baselines vs SMC, synchronized over N outer iterations."""
     arena_length = round(1.0 * num_knots + 1.0, 1)
     horizon = num_knots * 0.5
 
+    pfmp_base = PFMP(dynamics, cost_fn, terminal_cost, init, proposal,
+                     horizon=horizon, num_knots=num_knots, particles=PARTICLES,
+                     ess_resample_thresh=0.0, dt=DT)
     pfmp_sir = PFMP(dynamics, cost_fn, terminal_cost, init, proposal,
                     horizon=horizon, num_knots=num_knots, particles=PARTICLES,
                     ess_resample_thresh=ESS_THRESH, dt=DT)
-    pfmp_sis = PFMP(dynamics, cost_fn, terminal_cost, init, proposal,
-                    horizon=horizon, num_knots=num_knots, particles=PARTICLES,
-                    ess_resample_thresh=0.0, dt=DT)
 
     obs_batch, x0_batch, goals_batch, _ = generate_map_batch(
-        SEED + num_knots * 10000, max(map_index + 1, NUM_MAPS),
+        SEED + num_knots * 10000, max(map_index + 1, 1),
         arena_length, ARENA_WIDTH, OBSTACLE_DENSITY, BOX_SIZE_RANGE, MIN_MARGIN,
     )
 
     obstacles = obs_batch[map_index]
     x0 = x0_batch[map_index]
     goal = goals_batch[map_index]
-    theta = Params(goal=goal, obstacles=obstacles,
-                   L=WHEELBASE, v=SPEED, du_stdev=DU_STDEV, u_stdev=U_STDEV)
-
-    key = jax.random.key(SEED + map_index)
-
-    print("  running SIS/R ...", end=" ", flush=True)
-    sir_states, sir_ancestors, sir_costs, _ = pfmp_sir._sir(key, x0, theta)
-    print("done")
-
-    print("  running SIS ...", end=" ", flush=True)
-    sis_trajs, sis_costs_raw = pfmp_sis.run_sis(key, x0, theta)
-    print("done")
-
-    interval_len = horizon / (num_knots - 1)
-    steps_per_knot = round(interval_len / pfmp_sir.dt)
-
-    xs = jnp.linspace(-0.5, arena_length + 0.5, 200)
-    ys = jnp.linspace(-0.5, ARENA_WIDTH + 0.5, 150)
-    X, Y = jnp.meshgrid(xs, ys)
-    points = jnp.stack([X.ravel(), Y.ravel()], axis=1)
-    Z = jax.vmap(lambda loc: cost_fn(loc, jnp.zeros(1), theta, 0.0))(points).reshape(X.shape)
     real_obs = obstacles[obstacles[:, 0] < 1e5]
+    step_len = horizon / (num_knots - 1)
+    theta = Params(goal=goal, obstacles=obstacles,
+                   L=WHEELBASE, v=SPEED, du_stdev=DU_STDEV, u_stdev=U_STDEV,
+                   mean=jnp.zeros(num_knots), step_len=step_len)
 
-    def render_background(ax):
-        ax.set_facecolor("white")
-        ax.contourf(X, Y, Z, levels=20, cmap="Greys", alpha=0.2)
-        plot_obstacles(ax, real_obs)
-        ax.plot(float(x0[0]), float(x0[1]), "o", color="darkgreen", markersize=16,
-                markeredgecolor="black", markeredgewidth=1.5, zorder=10)
-        ax.plot(float(goal[0]), float(goal[1]), "*", color="gold", markersize=24,
-                markeredgecolor="black", markeredgewidth=1.5, zorder=10)
-        ax.set_xlim(-0.5, arena_length + 0.5)
-        ax.set_ylim(-0.5, ARENA_WIDTH + 0.5)
-        ax.set_aspect("equal")
-        ax.set_xticks([])
-        ax.set_yticks([])
-        for spine in ax.spines.values():
-            spine.set_edgecolor("black")
-            spine.set_linewidth(1.5)
+    names = ['ps', 'mppi', 'cem'] if baseline == 'all' else [baseline]
 
-    def render_sir(ax, current_num_knots):
-        render_background(ax)
-        current_states = jax.tree.map(lambda x: x[:current_num_knots], sir_states)
-        current_ancestors = sir_ancestors[:current_num_knots - 1]
-        current_trajs = pfmp_sir.choose_paths(
-            current_states, current_ancestors, jnp.arange(pfmp_sir.particles))
-        current_costs = sir_costs[:, :current_num_knots - 1]
-        total_costs = jnp.sum(current_costs, axis=-1)
-        top_indices = jnp.argsort(total_costs)[:num_top]
-        best_idx = jnp.argmin(total_costs)
+    print("Precomputing baselines:")
+    baselines_data = precompute_baselines(names, pfmp_base, x0, theta, num_outer)
+    print("Precomputing SMC:")
+    smc_frames, steps_per_knot = precompute_smc(pfmp_sir, x0, theta, num_outer)
 
-        current_horizon = (current_num_knots - 1) * interval_len
-        tq = jnp.linspace(0, current_horizon, int(current_horizon / pfmp_sir.dt))
-        tk = jnp.linspace(0, current_horizon, current_num_knots)
+    plt.style.use('default')
+    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(16, 5))
+    fig.patch.set_facecolor('white')
+    for ax in (ax_left, ax_right):
+        ax.set_facecolor('white')
+        ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5, color='gray')
 
-        for i in top_indices:
-            if i == best_idx:
-                continue
-            us = hermite_spline(tq, tk, current_trajs[i])
-            _, xy = jax.lax.scan(
-                lambda x, ut: dynamics(x, ut[0], theta, ut[1]), x0, (us, tq))
-            ax.plot(xy[:, 0], xy[:, 1], color="#4A90D9",
-                    alpha=0.3, linewidth=1.2, zorder=2)
+    xlim = (-0.5, arena_length + 0.5)
+    ylim = (-0.5, ARENA_WIDTH + 0.5)
 
-        us = hermite_spline(tq, tk, current_trajs[best_idx])
-        _, best_xy = jax.lax.scan(
-            lambda x, ut: dynamics(x, ut[0], theta, ut[1]), x0, (us, tq))
-        ax.plot(best_xy[:, 0], best_xy[:, 1], color="white",
-                linewidth=5, alpha=0.6, zorder=4, solid_capstyle="round")
-        ax.plot(best_xy[:, 0], best_xy[:, 1], color="#1a3a5c",
-                linewidth=3, alpha=1.0, zorder=5, solid_capstyle="round")
-        for t in range(0, best_xy.shape[0], steps_per_knot):
-            ax.plot(best_xy[t, 0], best_xy[t, 1], "o", color="#1a3a5c",
-                    markersize=5, markeredgecolor="black", markeredgewidth=0.8, zorder=8)
-        ax.set_title("SIS/R (resampling)", fontsize=12)
+    steps_per_knot = round((horizon / (num_knots - 1)) / DT)
 
-    def render_sis(ax, current_num_knots):
-        render_background(ax)
-        current_trajs = sis_trajs[:, :current_num_knots]
-        current_costs = sis_costs_raw[:, :current_num_knots - 1]
-        total_costs = jnp.sum(current_costs, axis=-1)
-        top_indices = jnp.argsort(total_costs)[:num_top]
-        best_idx = jnp.argmin(total_costs)
+    update_left, frames, interval = setup_baseline_panel(
+        ax_left, baselines_data, x0, theta, cost_fn, xlim, ylim, plot_obs=real_obs,
+        unroll=unroll, steps_per_knot=steps_per_knot, num_knots=num_knots)
+    ax_left.set_title("MPC Baselines", fontsize=12)
 
-        current_horizon = (current_num_knots - 1) * interval_len
-        tq = jnp.linspace(0, current_horizon, int(current_horizon / pfmp_sis.dt))
-        tk = jnp.linspace(0, current_horizon, current_num_knots)
+    update_right, _, _ = setup_smc_panel(
+        ax_right, smc_frames, steps_per_knot, x0, theta, cost_fn, xlim, ylim,
+        plot_obs=real_obs, unroll=unroll, num_knots=num_knots)
+    ax_right.set_title("SMC", fontsize=12)
 
-        for i in top_indices:
-            if i == best_idx:
-                continue
-            us = hermite_spline(tq, tk, current_trajs[i])
-            _, xy = jax.lax.scan(
-                lambda x, ut: dynamics(x, ut[0], theta, ut[1]), x0, (us, tq))
-            ax.plot(xy[:, 0], xy[:, 1], color="#E74C3C",
-                    alpha=0.3, linewidth=1.2, zorder=2)
+    def combined(frame):
+        update_left(frame)
+        update_right(frame)
 
-        us = hermite_spline(tq, tk, current_trajs[best_idx])
-        _, best_xy = jax.lax.scan(
-            lambda x, ut: dynamics(x, ut[0], theta, ut[1]), x0, (us, tq))
-        ax.plot(best_xy[:, 0], best_xy[:, 1], color="white",
-                linewidth=5, alpha=0.6, zorder=4, solid_capstyle="round")
-        ax.plot(best_xy[:, 0], best_xy[:, 1], color="#8B0000",
-                linewidth=3, alpha=1.0, zorder=5, solid_capstyle="round")
-        for t in range(0, best_xy.shape[0], steps_per_knot):
-            ax.plot(best_xy[t, 0], best_xy[t, 1], "o", color="#8B0000",
-                    markersize=5, markeredgecolor="black", markeredgewidth=0.8, zorder=8)
-        ax.set_title("SIS (no resampling)", fontsize=12)
-
-    fig_anim, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(16, 4))
-
-    def update(frame):
-        ax_left.clear()
-        ax_right.clear()
-        current_num_knots = min(frame + 2, num_knots)
-        render_sis(ax_left, current_num_knots)
-        render_sir(ax_right, current_num_knots)
-
-    anim = FuncAnimation(fig_anim, update,
-                         frames=num_knots - 1, interval=200,
+    anim = FuncAnimation(fig, combined, frames=frames, interval=interval,
                          blit=False, repeat=True, repeat_delay=2000)
+    plt.tight_layout()
 
     if save_gif:
-        OUTPUT_DIR.mkdir(exist_ok=True)
-        anim.save(OUTPUT_DIR / "fig1_animation.gif", writer="pillow", fps=5, dpi=150)
-        print(f"Saved fig1_animation.gif")
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        anim.save(OUTPUT_DIR / 'pfmp_complex.gif', writer='pillow', fps=5, dpi=150)
     else:
         plt.show()
 
@@ -330,6 +475,8 @@ def run_experiment():
             v=jnp.full(NUM_MAPS, SPEED),
             du_stdev=jnp.full(NUM_MAPS, DU_STDEV),
             u_stdev=jnp.full(NUM_MAPS, U_STDEV),
+            mean=jnp.zeros((NUM_MAPS, num_knots)),
+            step_len=horizon / (num_knots - 1),
         )
         keys = jax.random.split(jax.random.key(SEED + num_knots * 1000), NUM_MAPS)
 
@@ -514,6 +661,13 @@ if __name__ == "__main__":
                         help="Number of knots for animation (default: 20)")
     parser.add_argument("--animate-map", type=int, default=0,
                         help="Map index for animation (default: 0)")
+    parser.add_argument("--iters", type=int, default=NUM_OUTER,
+                        help=f"Outer optimization iterations (default: {NUM_OUTER})")
+    parser.add_argument("--baseline", type=str, default="all",
+                        choices=["ps", "mppi", "cem", "all"],
+                        help="Which baseline(s) to show (default: all)")
+    parser.add_argument("--unroll", action="store_true",
+                        help="Show inner knot-by-knot unrolls within each outer iteration")
     args = parser.parse_args()
 
     if args.plot_only:
@@ -525,4 +679,5 @@ if __name__ == "__main__":
         make_plots(results)
     else:
         animate(num_knots=args.animate_knots, map_index=args.animate_map,
-                save_gif=args.save)
+                save_gif=args.save, num_outer=args.iters,
+                baseline=args.baseline, unroll=args.unroll)

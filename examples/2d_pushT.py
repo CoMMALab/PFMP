@@ -44,7 +44,7 @@ STEPS_PER_REPLAN = 100  # sim steps between replans
 WORKSPACE_MIN = np.array([-0.5, -0.6])
 WORKSPACE_MAX = np.array([ 0.7,  0.6])
 T_BLOCK_MIN   = np.array([-0.3, -0.4])
-T_BLOCK_MAX   = np.array([ 0.5,  0.4])
+T_BLOCK_MAX   = np.array([ 0.65,  0.5])
 
 # T-block geometry — matches mjx_t_push.xml (MuJoCo half-extents)
 #   stem: size="0.0225 0.0675", centered at body origin
@@ -435,11 +435,28 @@ def main():
     parser.add_argument('--method', choices=['pfmp', 'mppi', 'dial'], default='pfmp')
     args = parser.parse_args()
 
+    # ── Corridor geometry (needed for sampling) ─────────────
+    wall_hw  = 0.02
+    wall_len = 0.20
+    gap_y    = 0.073
+    x_left   = 0.03
+    x_right  = 0.27
+
     # ── Initial conditions ──────────────────────────────────
-    t_xy_0    = np.array([-0.15, 0.15])   # T starts above corridor centre
-    t_angle_0 = 0.0
-    goal_xy   = np.array([ 0.40, 0.0])
-    goal_angle = 0.0
+    rng = np.random.default_rng(args.seed)
+    if args.seed != SEED:
+        # T starts left of left wall, goal right of right wall
+        t_xy_0    = rng.uniform([WORKSPACE_MIN[0] + 0.05, -gap_y + 0.05],
+                                 [x_left - 0.10,           gap_y - 0.05])
+        t_angle_0 = rng.uniform(-np.pi, np.pi)
+        goal_xy   = rng.uniform([x_right + 0.15, -gap_y + 0.05],
+                                 [WORKSPACE_MAX[0] - 0.05, gap_y - 0.05])
+        goal_angle = rng.uniform(-np.pi, np.pi)
+    else:
+        t_xy_0    = np.array([-0.15, 0.15])
+        t_angle_0 = 0.0
+        goal_xy   = np.array([ 0.40, 0.0])
+        goal_angle = 0.0
 
     r_xy_0 = t_xy_0 - np.array([0.12, 0.0])
     r_xy_0 = np.clip(r_xy_0, WORKSPACE_MIN + 0.05, WORKSPACE_MAX - 0.05)
@@ -453,11 +470,6 @@ def main():
 
     # Narrow corridor: two pairs of wall segments with a gap in the middle.
     # Each wall: [cx, cy, hx, hy]
-    wall_hw  = 0.02   # wall half-thickness
-    wall_len = 0.20   # wall half-length (extends outward from gap edge)
-    gap_y    = 0.073  # passage half-width (inner edge) — gap 0.146m, bar 0.135m fits just barely
-    x_left   = 0.03   # left wall-pair centre x
-    x_right  = 0.27   # right wall-pair centre x (more space between pairs)
     obstacles = np.array([
         [x_left,  gap_y + wall_len, wall_hw, wall_len],
         [x_left, -gap_y - wall_len, wall_hw, wall_len],
