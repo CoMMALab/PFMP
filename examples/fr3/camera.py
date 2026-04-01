@@ -20,6 +20,13 @@ class AprilDetections(NamedTuple):
     cam2: np.array
     cam3: np.array
 
+T_ARUCO = np.array([
+    [1.0,  0.0,  0.0,  0.379],
+    [0.0, -1.0,  0.0, -0.064],
+    [0.0,  0.0, -1.0,  0.012],
+    [0.0,  0.0,  0.0,  1.0],
+])
+
 class WorldFrame(NamedTuple):
     t_aruco: np.array
     t_cam1: np.array
@@ -93,13 +100,6 @@ class WorldFrame(NamedTuple):
         plt.show()
 
 def test_world():
-    t_aruco = np.array([
-        [1.0,  0.0,  0.0,  0.379],
-        [0.0, -1.0,  0.0, -0.064],
-        [0.0,  0.0, -1.0,  0.012],
-        [0.0,  0.0,  0.0,  1.0],
-    ])
-
     def make_cam(tx, ty, tz, angle_z):
         c, s = np.cos(angle_z), np.sin(angle_z)
         return np.array([
@@ -114,7 +114,7 @@ def test_world():
     fake_cam3 = make_cam(  0.0,  0.25, 0.25, 0.0)
 
     dets = AprilDetections(cam1=fake_cam1, cam2=fake_cam2, cam3=fake_cam3)
-    wf = WorldFrame.build_world_frame(dets, t_aruco)
+    wf = WorldFrame.build_world_frame(dets, T_ARUCO)
     print("cam1 world:\n", wf.t_cam1)
     print("cam2 world:\n", wf.t_cam2)
     print("cam3 world:\n", wf.t_cam3)
@@ -211,9 +211,14 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--calibrate", action="store_true")
     parser.add_argument("--cams", nargs="+", default=["top", "corner", "side"])
     args = parser.parse_args()
+    if args.calibrate:
+        test_world()
+        # TODO
+        # 1. build WorldFrame with april detections (wf = build_world_frame(april_dets, T_ARUCO))
+        # 2. wf.plot() and save, update with visualization
+        # 3. serialize calibrated WorldFrame
+
     main(args)
-
-
-
