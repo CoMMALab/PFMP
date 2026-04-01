@@ -242,6 +242,8 @@ class PFMP(NamedTuple):
             (step_keys, resample_keys, self.tk(endpoint=False))
         )
         states = jax.tree.map(lambda u0, u: jnp.concat([u0[None], u], axis=0), u0s, us)
+        final_costs = jax.vmap(self.mpc_terminal_cost, in_axes=(0, None))(final_xs, theta)
+        costs = jnp.concatenate((costs.T, final_costs[:, None]), axis=-1)
         return states, ancestors, costs, final_xs
 
     @partial(jax.jit, static_argnames=['self'])
@@ -250,10 +252,8 @@ class PFMP(NamedTuple):
         key: PRNGKeyArray,
         x0: PyTree, theta: PyTree
     ) -> tuple[PyTree[jax.Array], jax.Array]:
-        states, ancestors, costs, final_xs = self._sir(key, x0, theta)
+        states, ancestors, costs, _ = self._sir(key, x0, theta)
         trajs = self.choose_paths(states, ancestors, jnp.arange(self.particles))
-        final_costs = jax.vmap(self.mpc_terminal_cost, in_axes=(0,None))(final_xs, theta)
-        costs = jnp.concatenate((costs.T, final_costs[:,None]), axis=-1)
         return trajs, costs
 
     @staticmethod
