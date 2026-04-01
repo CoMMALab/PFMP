@@ -1,14 +1,124 @@
+from typing import NamedTuple, Optional
 import pyrealsense2 as rs
 import numpy as np
 import cv2
 import argparse
 import time
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use("TkAgg")
+from mpl_toolkits.mplot3d import Axes3D
 
 SERIAL_NUMS = {
                 "top": "234322070408",
                 "corner": "234322070144",
                 "side": "234322070341"
             }
+
+class AprilDetections(NamedTuple):
+    cam1: np.array
+    cam2: np.array
+    cam3: np.array
+
+class WorldFrame(NamedTuple):
+    t_aruco: np.array
+    t_cam1: np.array
+    t_cam2: np.array
+    t_cam3: np.array
+    t_pose: Optional[np.array] = None
+
+    @staticmethod
+    def build_world_frame(dets: AprilDetections, t_aruco: np.array) -> "Self":
+        # T_world_cam = T_world_aruco @ inv(T_cam_aruco)
+        t_cam1 = t_aruco @ np.linalg.inv(dets.cam1)
+        t_cam2 = t_aruco @ np.linalg.inv(dets.cam2)
+        t_cam3 = t_aruco @ np.linalg.inv(dets.cam3)
+        return WorldFrame(t_aruco=t_aruco, t_cam1=t_cam1, t_cam2=t_cam2, t_cam3=t_cam3)
+
+    def save(self, path: str):
+        arrays = dict(t_aruco=self.t_aruco, t_cam1=self.t_cam1, t_cam2=self.t_cam2, t_cam3=self.t_cam3)
+        if self.t_pose is not None:
+            arrays["t_pose"] = self.t_pose
+        np.savez(path, **arrays)
+
+    @staticmethod
+    def load(path: str) -> "WorldFrame":
+        data = np.load(path)
+        return WorldFrame(
+            t_aruco=data["t_aruco"],
+            t_cam1=data["t_cam1"],
+            t_cam2=data["t_cam2"],
+            t_cam3=data["t_cam3"],
+            t_pose=data["t_pose"] if "t_pose" in data else None,
+        )
+
+    def into(self, p: np.array) -> np.array:
+        """Transform a homogeneous (4,) point from each camera frame into world frame.
+        Returns (3, 3) world-space xyz for cam1, cam2, cam3.
+        """
+        return np.stack([
+            (self.t_cam1 @ p)[:3],
+            (self.t_cam2 @ p)[:3],
+            (self.t_cam3 @ p)[:3],
+        ])
+
+    def plot(self, ps: Optional[np.array] = None):
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection="3d")
+
+        ax.set_xlim(-0.5, 0.5)
+        ax.set_ylim(-0.5, 0.5)
+        ax.set_zlim(-0.5, 0.5)
+
+        def draw_vec(T, label, color, axis_scale=0.05):
+            pos = T[:3, 3]
+            ax.quiver(0, 0, 0, *pos, color=color, normalize=False)
+            ax.text(*pos, label, fontsize=8)
+            for i, c in enumerate(["r", "g", "b"]):
+                ax.quiver(*pos, *T[:3, i], color=c, length=axis_scale, normalize=False)
+
+        ax.scatter([0], [0], [0], c="k", s=40)
+        draw_vec(self.t_aruco, "aruco", "k")
+        draw_vec(self.t_cam1,  "cam1",  "r")
+        draw_vec(self.t_cam2,  "cam2",  "g")
+        draw_vec(self.t_cam3,  "cam3",  "b")
+        if self.t_pose is not None:
+            draw_vec(self.t_pose, "pose", "m")
+
+        if ps is not None:
+            ax.scatter(ps[:, 0], ps[:, 1], ps[:, 2], c="k", s=10)
+
+        ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
+        plt.tight_layout()
+        plt.show()
+
+def test_world():
+    t_aruco = np.array([
+        [1.0,  0.0,  0.0,  0.379],
+        [0.0, -1.0,  0.0, -0.064],
+        [0.0,  0.0, -1.0,  0.012],
+        [0.0,  0.0,  0.0,  1.0],
+    ])
+
+    def make_cam(tx, ty, tz, angle_z):
+        c, s = np.cos(angle_z), np.sin(angle_z)
+        return np.array([
+            [ c, -s, 0, tx],
+            [ s,  c, 0, ty],
+            [ 0,  0, 1, tz],
+            [ 0,  0, 0,  1],
+        ], dtype=float)
+
+    fake_cam1 = make_cam(  0.0, -0.25, 0.25, 0.0)
+    fake_cam2 = make_cam(-0.15,  0.0 ,  0.5, 0.0)
+    fake_cam3 = make_cam(  0.0,  0.25, 0.25, 0.0)
+
+    dets = AprilDetections(cam1=fake_cam1, cam2=fake_cam2, cam3=fake_cam3)
+    wf = WorldFrame.build_world_frame(dets, t_aruco)
+    print("cam1 world:\n", wf.t_cam1)
+    print("cam2 world:\n", wf.t_cam2)
+    print("cam3 world:\n", wf.t_cam3)
+    wf.plot()
 
 def start_pipeline(serial):
     # Start pipeline for one camera.
