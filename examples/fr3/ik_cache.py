@@ -22,7 +22,7 @@ import numpy as np
 import pyroki as pk
 import yourdfpy
 
-ROBOT_URDF_PATH = os.path.expanduser("~/src/PFMP/models/panda_spherized.urdf")
+ROBOT_URDF_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "models", "panda_spherized.urdf")
 CACHE_PATH      = "./examples/ik_cache.pkl"
 
 EE_ID     = 12
