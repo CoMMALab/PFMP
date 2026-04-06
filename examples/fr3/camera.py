@@ -4,26 +4,31 @@ import numpy as np
 import cv2
 import argparse
 import time
-import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
 SERIAL_NUMS = {
                 "top": "234322070408",
                 "corner": "234322070144",
-                "side": "234322070341"
+                "side": "234322070341",
             }
+
+APRILTAG_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+APRILTAG_PARAMS = cv2.aruco.DetectorParameters()
+APRILTAG_DETECTOR = cv2.aruco.ArucoDetector(APRILTAG_DICT, APRILTAG_PARAMS)
 
 class AprilDetections(NamedTuple):
     cam1: np.array
     cam2: np.array
     cam3: np.array
 
+# tag_to_world (T_R^A)
 T_ARUCO = np.array([
-    [1.0,  0.0,  0.0,  0.379],
-    [0.0, -1.0,  0.0, -0.064],
-    [0.0,  0.0, -1.0,  0.012],
+    [-1.0,  0.0,  0.0,  0.379],
+    [0.0,  1.0,  0.0, -0.064],
+    [0.0,  0.0,  1.0,  0.012],
     [0.0,  0.0,  0.0,  1.0],
 ])
 
@@ -40,6 +45,17 @@ class WorldFrame(NamedTuple):
         t_cam1 = t_aruco @ np.linalg.inv(dets.cam1)
         t_cam2 = t_aruco @ np.linalg.inv(dets.cam2)
         t_cam3 = t_aruco @ np.linalg.inv(dets.cam3)
+
+        # dets.cam1 = T_c1^A
+        # t_cam1 = T_c1^R
+        # t_cam1 = dets.cam1 @ np.linalg.inv(t_aruco) 
+        # t_cam2 = dets.cam2 @ np.linalg.inv(t_aruco) 
+        # t_cam3 = dets.cam3 @ np.linalg.inv(t_aruco) 
+
+        # t_aruco_inv = np.linalg.inv(t_aruco)
+        # t_cam1 = dets.cam1 @ t_aruco_inv
+        # t_cam2 = dets.cam2 @ t_aruco_inv
+        # t_cam3 = dets.cam3 @ t_aruco_inv
         return WorldFrame(t_aruco=t_aruco, t_cam1=t_cam1, t_cam2=t_cam2, t_cam3=t_cam3)
 
     def save(self, path: str):
@@ -99,6 +115,52 @@ class WorldFrame(NamedTuple):
         plt.tight_layout()
         plt.show()
 
+    def plot_workspace(self, ps: Optional[np.array] = None):
+        """Plot world frame as workspace view with robot at origin."""
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection="3d")
+
+        ax.set_xlim(-0.5, 0.5)
+        ax.set_ylim(-0.5, 0.5)
+        ax.set_zlim(-0.5, 0.5)
+
+        # Robot/world origin.
+        ax.scatter([0], [0], [0], c="m", s=80)
+        ax.text(0, 0, 0, "robot/world", fontsize=9)
+
+        cams = [self.t_cam1, self.t_cam2, self.t_cam3]
+        labels = ["cam1", "cam2", "cam3"]
+        colors = ["r", "g", "b"]
+        for T, label, color in zip(cams, labels, colors):
+            p = T[:3, 3]
+            ax.scatter([p[0]], [p[1]], [p[2]], c=color, s=40)
+            ax.text(p[0], p[1], p[2], label, fontsize=8)
+
+        p_tag = self.t_aruco[:3, 3]
+        ax.scatter([p_tag[0]], [p_tag[1]], [p_tag[2]], c="k", s=40)
+        ax.text(p_tag[0], p_tag[1], p_tag[2], "aruco", fontsize=8)
+
+        if ps is not None:
+            ax.scatter(ps[:, 0], ps[:, 1], ps[:, 2], c="k", s=10)
+
+        ax.set_title("Workspace View (World Frame)")
+        ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
+        plt.tight_layout()
+        plt.show()
+
+    def print_world_coordinates(self):
+        """Print key object coordinates in world frame (meters)."""
+        objects = [
+            ("robot/world", np.array([0.0, 0.0, 0.0], dtype=np.float64)),
+            ("aruco", self.t_aruco[:3, 3]),
+            ("cam1", self.t_cam1[:3, 3]),
+            ("cam2", self.t_cam2[:3, 3]),
+            ("cam3", self.t_cam3[:3, 3]),
+        ]
+        print("\nWorld-frame coordinates (meters):")
+        for name, p in objects:
+            print(f"  {name:12s} -> x={p[0]: .4f}, y={p[1]: .4f}, z={p[2]: .4f}")
+
 def test_world():
     def make_cam(tx, ty, tz, angle_z):
         c, s = np.cos(angle_z), np.sin(angle_z)
@@ -128,8 +190,8 @@ def start_pipeline(serial):
     cfg.enable_device(serial)
 
     # Safe baseline for D4xx / many RealSense setups
-    cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-    cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 15)
+    cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 15)
 
     profile = pipe.start(cfg)
     intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
@@ -171,7 +233,7 @@ def detect_apriltags(color_image, K, dist, tag_size_m):
 
     return detections
 
-def get_camera_panel(pipe, cam_name, K, dist, tag_size_m, retries=5, timeout_ms=5000):
+def get_rgbd_frames(pipe, cam_name, retries=5, timeout_ms=5000, colorize_depth=False):
     frames = None
     for attempt in range(1, retries + 1):
         try:
@@ -191,7 +253,14 @@ def get_camera_panel(pipe, cam_name, K, dist, tag_size_m, retries=5, timeout_ms=
         return None
 
     color_image = np.asanyarray(color_frame.get_data())
-    depth_image = np.asanyarray(rs.colorizer().colorize(depth_frame).get_data())
+    if colorize_depth:
+        depth_image = np.asanyarray(rs.colorizer().colorize(depth_frame).get_data())
+    else:
+        depth_image = np.asanyarray(depth_frame.get_data())
+    return color_image, depth_image
+
+def get_camera_panel(pipe, cam_name, K, dist, tag_size_m, retries=5, timeout_ms=5000):
+    color_image, depth_image = get_rgbd_frames(pipe, cam_name, retries, timeout_ms, colorize_depth=True)
     detections = detect_apriltags(color_image, K, dist, tag_size_m)
 
     print(f"\n[{cam_name}] detected {len(detections)} AprilTag(s)")
@@ -227,15 +296,18 @@ def get_camera_panel(pipe, cam_name, K, dist, tag_size_m, retries=5, timeout_ms=
 
     return np.hstack((color_image, depth_image))
 
-def main(args):
+def init_cameras(cams: list[str]):
     pipelines = {}
     intrinsics = {}
-    try:
-        for cam in args.cams:
-            pipe, K, dist = start_pipeline(SERIAL_NUMS[cam])
-            pipelines[cam] = pipe
-            intrinsics[cam] = (K, dist)
+    for cam in cams:
+        pipe, K, dist = start_pipeline(SERIAL_NUMS[cam])
+        pipelines[cam] = pipe
+        intrinsics[cam] = (K, dist)
+    return pipelines, intrinsics
 
+def main(args):
+    pipelines, intrinsics = init_cameras(args.cams)
+    try:
         print("Capturing one frame per selected camera...")
         # Give sensors a brief moment to start producing stable frames.
         time.sleep(0.5)
@@ -249,7 +321,7 @@ def main(args):
                 dist,
                 args.tag_size_m,
                 retries=4,
-                timeout_ms=4000,
+                timeout_ms=40000,
             )
             if panel is not None:
                 rows.append(panel)
@@ -280,10 +352,28 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     if args.calibrate:
-        test_world()
+        # test_world()
         # TODO
-        # 1. build WorldFrame with april detections (wf = build_world_frame(april_dets, T_ARUCO))
-        # 2. wf.plot() and save, update with visualization
-        # 3. serialize calibrated WorldFrame
 
-    main(args)
+        # 1. build WorldFrame with april detections (wf = build_world_frame(april_dets, T_ARUCO))
+        pipelines, intrinsics = init_cameras(args.cams)
+        time.sleep(1) # give cameras a brief moment to start producing stable frames
+        april_dets = {}
+        assert len(args.cams) == 3, "Only 3 cameras are supported for now"
+        for cam in args.cams:
+            K, dist = intrinsics[cam]
+            print(f"[{cam}] K: {K}")
+            color_image, _ = get_rgbd_frames(pipelines[cam], cam, retries=4, timeout_ms=10000)
+            april_dets[cam] = detect_apriltags(color_image, K, dist, args.tag_size_m)
+        april_dets = AprilDetections(cam1=april_dets["top"][0][1], cam2=april_dets["corner"][0][1], cam3=april_dets["side"][0][1])
+        wf = WorldFrame.build_world_frame(april_dets, T_ARUCO)
+        wf.print_world_coordinates()
+
+        # 2. wf.plot() and save, update with visualization
+        wf.plot()
+        wf.plot_workspace()
+
+        # 3. serialize calibrated WorldFrame
+        # wf.save("wf.npz")
+
+    # main(args)
