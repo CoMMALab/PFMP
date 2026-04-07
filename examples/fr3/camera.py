@@ -19,6 +19,9 @@ APRILTAG_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
 APRILTAG_PARAMS = cv2.aruco.DetectorParameters()
 APRILTAG_DETECTOR = cv2.aruco.ArucoDetector(APRILTAG_DICT, APRILTAG_PARAMS)
 
+TABLE_TAG_ID = 0
+TEE_TAG_ID = 2
+
 class AprilDetections(NamedTuple):
     cam1: np.array
     cam2: np.array
@@ -46,16 +49,6 @@ class WorldFrame(NamedTuple):
         t_cam2 = t_aruco @ np.linalg.inv(dets.cam2)
         t_cam3 = t_aruco @ np.linalg.inv(dets.cam3)
 
-        # dets.cam1 = T_c1^A
-        # t_cam1 = T_c1^R
-        # t_cam1 = dets.cam1 @ np.linalg.inv(t_aruco) 
-        # t_cam2 = dets.cam2 @ np.linalg.inv(t_aruco) 
-        # t_cam3 = dets.cam3 @ np.linalg.inv(t_aruco) 
-
-        # t_aruco_inv = np.linalg.inv(t_aruco)
-        # t_cam1 = dets.cam1 @ t_aruco_inv
-        # t_cam2 = dets.cam2 @ t_aruco_inv
-        # t_cam3 = dets.cam3 @ t_aruco_inv
         return WorldFrame(t_aruco=t_aruco, t_cam1=t_cam1, t_cam2=t_cam2, t_cam3=t_cam3)
 
     def save(self, path: str):
@@ -111,39 +104,6 @@ class WorldFrame(NamedTuple):
         if ps is not None:
             ax.scatter(ps[:, 0], ps[:, 1], ps[:, 2], c="k", s=10)
 
-        ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
-        plt.tight_layout()
-        plt.show()
-
-    def plot_workspace(self, ps: Optional[np.array] = None):
-        """Plot world frame as workspace view with robot at origin."""
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection="3d")
-
-        ax.set_xlim(-0.5, 0.5)
-        ax.set_ylim(-0.5, 0.5)
-        ax.set_zlim(-0.5, 0.5)
-
-        # Robot/world origin.
-        ax.scatter([0], [0], [0], c="m", s=80)
-        ax.text(0, 0, 0, "robot/world", fontsize=9)
-
-        cams = [self.t_cam1, self.t_cam2, self.t_cam3]
-        labels = ["cam1", "cam2", "cam3"]
-        colors = ["r", "g", "b"]
-        for T, label, color in zip(cams, labels, colors):
-            p = T[:3, 3]
-            ax.scatter([p[0]], [p[1]], [p[2]], c=color, s=40)
-            ax.text(p[0], p[1], p[2], label, fontsize=8)
-
-        p_tag = self.t_aruco[:3, 3]
-        ax.scatter([p_tag[0]], [p_tag[1]], [p_tag[2]], c="k", s=40)
-        ax.text(p_tag[0], p_tag[1], p_tag[2], "aruco", fontsize=8)
-
-        if ps is not None:
-            ax.scatter(ps[:, 0], ps[:, 1], ps[:, 2], c="k", s=10)
-
-        ax.set_title("Workspace View (World Frame)")
         ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
         plt.tight_layout()
         plt.show()
@@ -305,6 +265,64 @@ def init_cameras(cams: list[str]):
         intrinsics[cam] = (K, dist)
     return pipelines, intrinsics
 
+def get_tag_transform_by_id(detections, tag_id):
+    """Return 4x4 T_tag_to_cam for a specific tag id, or None if missing."""
+    for det_id, T, _, _, _ in detections:
+        if det_id == tag_id:
+            return T
+    return None
+
+def localize_tee(args):
+    wf = WorldFrame.load("wf.npz")
+    # Saved world frame stores camera-to-world transforms.
+    cam_to_world = {
+        "top": wf.t_cam1,
+        "corner": wf.t_cam2,
+        "side": wf.t_cam3,
+    }
+
+    pipelines, intrinsics = init_cameras(args.cams)
+    try:
+        tee_tag_size_m = args.tee_tag_size_m
+        print(f"[TEE] using tag id={TEE_TAG_ID} size={tee_tag_size_m:.4f} m")
+        time.sleep(1.0)  # warm up sensors before one-shot capture
+        tee_positions_world = []
+
+        for cam in args.cams:
+            frames = get_rgbd_frames(pipelines[cam], cam, retries=4, timeout_ms=10000)
+            if frames is None:
+                print(f"[WARN] {cam}: no RGBD frame, skipping Tee localization for this camera")
+                continue
+
+            color_image, _ = frames
+            K, dist = intrinsics[cam]
+            detections = detect_apriltags(color_image, K, dist, tee_tag_size_m)
+            t_tee_to_cam = get_tag_transform_by_id(detections, TEE_TAG_ID)
+            if t_tee_to_cam is None:
+                print(f"[WARN] {cam}: Tee tag id={TEE_TAG_ID} not detected")
+                continue
+
+            # Tee origin in world frame: p_world = T_cam_to_world @ T_tee_to_cam @ [0,0,0,1].
+            p_tee_world_h = cam_to_world[cam] @ (t_tee_to_cam @ np.array([0.0, 0.0, 0.0, 1.0]))
+            p_tee_world = p_tee_world_h[:3]
+            tee_positions_world.append(p_tee_world)
+            print(
+                f"[TEE][world] {cam:6s} -> x={p_tee_world[0]: .4f}, "
+                f"y={p_tee_world[1]: .4f}, z={p_tee_world[2]: .4f}"
+            )
+
+        if tee_positions_world:
+            mean_pos = np.mean(np.stack(tee_positions_world), axis=0)
+            print(
+                f"[TEE][world] mean  -> x={mean_pos[0]: .4f}, "
+                f"y={mean_pos[1]: .4f}, z={mean_pos[2]: .4f}"
+            )
+        else:
+            print("[TEE] No valid Tee detections from selected cameras.")
+    finally:
+        for pipe in pipelines.values():
+            pipe.stop()
+
 def main(args):
     pipelines, intrinsics = init_cameras(args.cams)
     try:
@@ -319,7 +337,7 @@ def main(args):
                 cam,
                 K,
                 dist,
-                args.tag_size_m,
+                args.table_tag_size_m,
                 retries=4,
                 timeout_ms=40000,
             )
@@ -344,11 +362,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--calibrate", action="store_true")
     parser.add_argument("--cams", nargs="+", default=["top", "corner", "side"])
+    parser.add_argument("--tee", action="store_true")
     parser.add_argument(
-        "--tag-size-m",
+        "--table-tag-size-m",
         type=float,
         default=0.1651,
-        help="AprilTag edge length in meters for pose estimation.",
+        help="Table tag (id=0) edge length in meters.",
+    )
+    parser.add_argument(
+        "--tee-tag-size-m",
+        type=float,
+        default=0.0445,
+        help="Tee tag (id=2) edge length in meters.",
     )
     args = parser.parse_args()
     if args.calibrate:
@@ -356,6 +381,8 @@ if __name__ == "__main__":
         # TODO
 
         # 1. build WorldFrame with april detections (wf = build_world_frame(april_dets, T_ARUCO))
+        table_tag_size_m = args.table_tag_size_m
+        print(f"[CALIB] using tag id={TABLE_TAG_ID} size={table_tag_size_m:.4f} m")
         pipelines, intrinsics = init_cameras(args.cams)
         time.sleep(1) # give cameras a brief moment to start producing stable frames
         april_dets = {}
@@ -364,16 +391,28 @@ if __name__ == "__main__":
             K, dist = intrinsics[cam]
             print(f"[{cam}] K: {K}")
             color_image, _ = get_rgbd_frames(pipelines[cam], cam, retries=4, timeout_ms=10000)
-            april_dets[cam] = detect_apriltags(color_image, K, dist, args.tag_size_m)
-        april_dets = AprilDetections(cam1=april_dets["top"][0][1], cam2=april_dets["corner"][0][1], cam3=april_dets["side"][0][1])
+            detections = detect_apriltags(color_image, K, dist, table_tag_size_m)
+            t_table_to_cam = get_tag_transform_by_id(detections, TABLE_TAG_ID)
+            if t_table_to_cam is None:
+                raise RuntimeError(f"[{cam}] Table tag id={TABLE_TAG_ID} not detected during calibration")
+            april_dets[cam] = t_table_to_cam
+        april_dets = AprilDetections(
+            cam1=april_dets["top"],
+            cam2=april_dets["corner"],
+            cam3=april_dets["side"],
+        )
         wf = WorldFrame.build_world_frame(april_dets, T_ARUCO)
         wf.print_world_coordinates()
 
-        # 2. wf.plot() and save, update with visualization
         wf.plot()
-        wf.plot_workspace()
 
         # 3. serialize calibrated WorldFrame
-        # wf.save("wf.npz")
+        wf.save("wf.npz")
 
-    # main(args)
+    elif args.tee:
+        # localize the tee
+        localize_tee(args)
+
+    else:
+        main(args)
+    
