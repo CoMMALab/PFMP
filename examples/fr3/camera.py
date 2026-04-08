@@ -43,6 +43,9 @@ TEE_THICKNESS_M = 2.0 * INCH_TO_M
 
 class WorldFrame(NamedTuple):
     t_aruco: np.array
+    K_cam1: np.array
+    K_cam2: np.array
+    K_cam3: np.array
     t_cam1: np.array
     t_cam2: np.array
     t_cam3: np.array
@@ -73,6 +76,46 @@ class WorldFrame(NamedTuple):
             t_cam3=data["t_cam3"],
             t_pose=data["t_pose"] if "t_pose" in data else None,
         )
+
+    def _t_cam(self, cam: int) -> np.ndarray:
+        return {1: self.t_cam1, 2: self.t_cam2, 3: self.t_cam3}[cam]
+
+    def reproject(
+        self,
+        pts_px: np.ndarray,  # (N, 2) pixel coords in source camera
+        depths: np.ndarray,  # (N,)   metric depth per point (metres)
+        src: int,            # source camera: 1, 2, or 3
+        dst: int,            # destination camera: 1, 2, or 3
+    ) -> np.ndarray:         # (N, 2) pixel coords in destination camera
+        """Unproject pixel-space points from one camera to world, then project to another.
+
+        1. Back-project to 3-D in source camera frame: X = K_src^{-1} @ [u,v,1] * depth
+        2. Transform to world via T_cam_src_to_world.
+        3. Transform to destination camera frame.
+        4. Project with K_dst.
+        """
+        pts_px = np.asarray(pts_px, dtype=np.float64)
+        depths = np.asarray(depths, dtype=np.float64).ravel()
+
+        # Back-project: normalised image coords × depth
+        fx, fy = self.K_src[0, 0], self.K_src[1, 1]
+        cx, cy = self.K_src[0, 2], self.K_src[1, 2]
+        xs = (pts_px[:, 0] - cx) / fx * depths
+        ys = (pts_px[:, 1] - cy) / fy * depths
+        pts_src = np.column_stack([xs, ys, depths])          # (N, 3)
+
+        # Source camera frame → world
+        pts_src_h = np.column_stack([pts_src, np.ones(len(pts_src))])
+        pts_world = (self._t_cam(src) @ pts_src_h.T).T[:, :3]   # (N, 3)
+
+        # World → destination camera frame
+        pts_world_h = np.column_stack([pts_world, np.ones(len(pts_world))])
+        pts_dst = (np.linalg.inv(self._t_cam(dst)) @ pts_world_h.T).T[:, :3]  # (N, 3)
+
+        # Perspective project
+        u = pts_dst[:, 0] / pts_dst[:, 2] * self.K_dst[0, 0] + self.K_dst[0, 2]
+        v = pts_dst[:, 1] / pts_dst[:, 2] * self.K_dst[1, 1] + self.K_dst[1, 2]
+        return np.column_stack([u, v])
 
     def into(self, p: np.array) -> np.array:
         """Transform a homogeneous (4,) point from each camera frame into world frame.
