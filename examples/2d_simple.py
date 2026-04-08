@@ -8,7 +8,7 @@ from typing import NamedTuple
 from pfmp import PFMP
 import matplotlib.pyplot as plt
 
-from obstacle_grid import (
+from pfmp.obstacle_grid import (
     generate_obstacle_grid, sdf_aabb, hinge_loss, animate_2d
 )
 

@@ -23,7 +23,7 @@ from typing import NamedTuple
 
 from pfmp import PFMP
 from pfmp.interpolate import hermite_spline
-from obstacle_grid import (
+from pfmp.obstacle_grid import (
     sdf_aabb, hinge_loss, plot_obstacles,
     generate_map_batch,
 )
