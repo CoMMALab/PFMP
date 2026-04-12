@@ -151,7 +151,7 @@ def localize_tee(args):
 
             color_image, _ = frames
             K, dist = intrinsics[cam]
-            detections, debug = detect_apriltags(color_image, K, dist, tee_tag_size_m, staged=True, return_debug=True)
+            detections, _, debug = detect_apriltags(color_image, K, dist, tee_tag_size_m, staged=True, return_debug=True)
             t_tee_to_cam = get_tag_transform_by_id(detections, TEE_TAG_ID)
             if t_tee_to_cam is None:
                 print(f"[WARN] {cam}: Tee tag id={TEE_TAG_ID} not detected")

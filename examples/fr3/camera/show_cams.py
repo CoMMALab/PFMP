@@ -9,7 +9,7 @@ def get_camera_panel(pipe, cam_name, K, dist, tag_size_m, retries=5, timeout_ms=
     if frames is None:
         return None, None
     color_image, depth_image = frames
-    detections, debug = detect_apriltags(color_image, K, dist, tag_size_m, staged=True, return_debug=True)
+    detections, _, debug = detect_apriltags(color_image, K, dist, tag_size_m, staged=True, return_debug=True)
 
     print(f"\n[{cam_name}] detected {len(detections)} AprilTag(s)")
     for tag_id, T, _, _, _ in detections:

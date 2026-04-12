@@ -97,6 +97,9 @@ class WorldFrame(NamedTuple):
             t_pose=data["t_pose"] if "t_pose" in data else None,
         )
 
+    def _K_cam(self, cam: int) -> np.ndarray:
+        return {1: self.K_cam1, 2: self.K_cam2, 3: self.K_cam3}[cam]
+
     def _t_cam(self, cam: int) -> np.ndarray:
         return {1: self.t_cam1, 2: self.t_cam2, 3: self.t_cam3}[cam]
 
@@ -118,8 +121,9 @@ class WorldFrame(NamedTuple):
         depths = np.asarray(depths, dtype=np.float64).ravel()
 
         # Back-project: normalised image coords × depth
-        fx, fy = self.K_src[0, 0], self.K_src[1, 1]
-        cx, cy = self.K_src[0, 2], self.K_src[1, 2]
+        K_src = self._K_cam(src)
+        fx, fy = K_src[0, 0], K_src[1, 1]
+        cx, cy = K_src[0, 2], K_src[1, 2]
         xs = (pts_px[:, 0] - cx) / fx * depths
         ys = (pts_px[:, 1] - cy) / fy * depths
         pts_src = np.column_stack([xs, ys, depths])          # (N, 3)
@@ -133,8 +137,9 @@ class WorldFrame(NamedTuple):
         pts_dst = (np.linalg.inv(self._t_cam(dst)) @ pts_world_h.T).T[:, :3]  # (N, 3)
 
         # Perspective project
-        u = pts_dst[:, 0] / pts_dst[:, 2] * self.K_dst[0, 0] + self.K_dst[0, 2]
-        v = pts_dst[:, 1] / pts_dst[:, 2] * self.K_dst[1, 1] + self.K_dst[1, 2]
+        K_dst = self._K_cam(dst)
+        u = pts_dst[:, 0] / pts_dst[:, 2] * K_dst[0, 0] + K_dst[0, 2]
+        v = pts_dst[:, 1] / pts_dst[:, 2] * K_dst[1, 1] + K_dst[1, 2]
         return np.column_stack([u, v])
 
     def into(self, p: np.array) -> np.array:
@@ -275,16 +280,16 @@ def detect_apriltags(color_image, K, dist, tag_size_m, staged=True, return_debug
     detections = _pose_from_detections(corners, ids, K, dist, tag_size_m)
     if detections:
         debug["stage"] = 1
-        return (detections, debug) if return_debug else detections
+        return (detections, corners, debug) if return_debug else (detections, corners)
     if not staged:
-        return ([], debug) if return_debug else []
+        return ([], [], debug) if return_debug else ([], [])
 
     # Stage 2: CLAHE + mild unsharp mask.
     corners, ids, _ = APRILTAG_DETECTOR.detectMarkers(enhanced)
     detections = _pose_from_detections(corners, ids, K, dist, tag_size_m)
     if detections:
         debug["stage"] = 2
-        return (detections, debug) if return_debug else detections
+        return (detections, corners, debug) if return_debug else (detections, corners)
 
     # Stage 3: upscale fallback for small/far tags.
     scale = 1.5
@@ -292,12 +297,14 @@ def detect_apriltags(color_image, K, dist, tag_size_m, staged=True, return_debug
     corners, ids, _ = APRILTAG_DETECTOR.detectMarkers(up)
     if ids is None:
         debug["stage"] = 3
-        return ([], debug) if return_debug else []
+        return ([], [], debug) if return_debug else ([], [])
     for c in corners:
         c[0] /= scale
     detections = _pose_from_detections(corners, ids, K, dist, tag_size_m)
     debug["stage"] = 3
-    return (detections, debug) if return_debug else detections
+
+    return (detections, corners, debug) if return_debug else (detections, corners)
+
 
 def get_rgbd_frames(pipe, cam_name, retries=5, timeout_ms=5000, colorize_depth=False):
     frames = None
