@@ -39,13 +39,15 @@ class Intrinsics(NamedTuple):
     cam2: np.array
     cam3: np.array
 
-# tag_to_world (T_R^A)
+# tag_to_world (T_R^A): 180 deg about world Z, then translate to tag origin.
 T_ARUCO = np.array([
     [-1.0,  0.0,  0.0,  0.379],
-    [0.0,  1.0,  0.0, -0.064],
-    [0.0,  0.0,  1.0,  0.012],
-    [0.0,  0.0,  0.0,  1.0],
+    [ 0.0, -1.0,  0.0, -0.064],
+    [ 0.0,  0.0,  1.0,  0.012],
+    [ 0.0,  0.0,  0.0,  1.0  ],
 ])
+assert np.isclose(np.linalg.det(T_ARUCO[:3, :3]), 1.0), \
+    "T_ARUCO rotation must be a proper rotation (det = +1); diag(-1,1,1) is a reflection."
 
 INCH_TO_M = 0.0254
 TEE_WIDTH_M = 8.0 * INCH_TO_M
