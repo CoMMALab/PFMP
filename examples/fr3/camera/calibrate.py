@@ -267,19 +267,6 @@ def calibrate(args):
 
     return wf, keypoints, reproj_keypoints, color_images
 
-# def fine_tune(wf: WorldFrame, args):
-#     return wf
-
-# def fine_tune(wf: WorldFrame, args):
-#     # 1. get keypoints from all cameras
-#     keypoints = []
-#     for cam in args.cams:
-#         color_image, _ = get_rgbd_frames(pipelines[cam], cam, retries=4, timeout_ms=10000)
-#         keypoints.append(detect_keypoints(color_image))
-
-#     # 2. match keypoints between cameras
-#     matches = match_keypoints(keypoints)
-
 def visualize_keypoints(wf: WorldFrame, keypoints: dict, reproj_keypoints: dict, color_images: dict):
     def draw_box(img, pts, color, label):
         pts = np.round(pts).astype(int)
