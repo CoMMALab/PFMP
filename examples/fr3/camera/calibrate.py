@@ -6,35 +6,41 @@ from scipy.optimize import least_squares
 from camera import *
 
 """
-Create world frame from april detections and intrinsics.
+Compute per-camera extrinsics from a single multi-view AprilTag observation.
+
+The world frame produced here is the reference camera's frame at calibration
+time (so `t_cam_ref ≈ I`). The output is an UNANCHORED `WorldFrame` (sentinel
+`t_aruco = I`). Run `anchor.py` afterwards to express everything in the robot
+base/world frame.
 """
-def _table_tag_world_corners(tag_size_m: float) -> np.ndarray:
-    """Return 4 table-tag corners in world frame using T_ARUCO (tag->world)."""
+
+# Camera label -> WorldFrame slot index (cam1=top, cam2=corner, cam3=side).
+CAM_TO_IDX = {"top": 1, "corner": 2, "side": 3}
+
+def _tag_corners_local(tag_size_m: float) -> np.ndarray:
+    """Return the 4 AprilTag corners in tag-local frame, matching solvePnP order."""
     s = tag_size_m / 2.0
-    corners_tag = np.array(
+    return np.array(
         [[-s, s, 0.0], [s, s, 0.0], [s, -s, 0.0], [-s, -s, 0.0]],
         dtype=np.float64,
     )
-    corners_tag_h = np.column_stack([corners_tag, np.ones(4, dtype=np.float64)])
-    corners_world = (T_ARUCO @ corners_tag_h.T).T[:, :3]
-    return corners_world
+
+def _tag_corners_in_frame(t_tag_to_frame: np.ndarray, tag_size_m: float) -> np.ndarray:
+    """Lift the 4 tag corners into a target frame via t_tag_to_frame (4x4)."""
+    corners_tag = _tag_corners_local(tag_size_m)
+    corners_h = np.column_stack([corners_tag, np.ones(4, dtype=np.float64)])
+    return (t_tag_to_frame @ corners_h.T).T[:, :3]
 
 def _corner_depths_from_tag_pose(t_tag_to_cam: np.ndarray, tag_size_m: float) -> np.ndarray:
     """Return metric z-depths (meters) of the 4 AprilTag corners in camera frame."""
-    s = tag_size_m / 2.0
-    obj_pts_tag = np.array(
-        [[-s, s, 0.0], [s, s, 0.0], [s, -s, 0.0], [-s, -s, 0.0]],
-        dtype=np.float64,
-    )  # same corner ordering used in detect_apriltags/solvePnP
     R = t_tag_to_cam[:3, :3]
     t = t_tag_to_cam[:3, 3]
-    pts_cam = (R @ obj_pts_tag.T).T + t[None, :]
+    pts_cam = _tag_corners_local(tag_size_m) @ R.T + t
     return pts_cam[:, 2]
 
 def _compute_reproj_keypoints(
     wf: WorldFrame, cams: list[str], keypoints: dict, keypoint_depths: dict
 ) -> dict:
-    cam_to_idx = {"top": 1, "corner": 2, "side": 3}
     reproj_keypoints = {dst: {} for dst in cams}
     for src in cams:
         for dst in cams:
@@ -43,8 +49,8 @@ def _compute_reproj_keypoints(
             reproj_keypoints[dst][src] = wf.reproject(
                 keypoints[src],
                 keypoint_depths[src],
-                cam_to_idx[src],
-                cam_to_idx[dst],
+                CAM_TO_IDX[src],
+                CAM_TO_IDX[dst],
             )
     return reproj_keypoints
 
@@ -57,29 +63,29 @@ def _print_reprojection_errors(cams: list[str], keypoints: dict, reproj_keypoint
             diff = keypoints[dst].astype(np.float64) - reproj_keypoints[dst][src]
             print(f"  {src}_to_{dst}: {np.linalg.norm(diff):.3f}")
 
-def _project_world_points_to_cam_pixels(world_pts: np.ndarray, K: np.ndarray, t_cam_to_world: np.ndarray) -> np.ndarray:
-    t_world_to_cam = np.linalg.inv(t_cam_to_world)
-    R = t_world_to_cam[:3, :3]
-    t = t_world_to_cam[:3, 3]
-    pts_cam = (R @ world_pts.T).T + t[None, :]
-    u = pts_cam[:, 0] / pts_cam[:, 2] * K[0, 0] + K[0, 2]
-    v = pts_cam[:, 1] / pts_cam[:, 2] * K[1, 1] + K[1, 2]
-    return np.column_stack([u, v])
+def _pairwise_objective_px2(cams: list[str], keypoints: dict, reproj_keypoints: dict) -> float:
+    total = 0.0
+    for dst in cams:
+        for src in cams:
+            if src == dst:
+                continue
+            diff = keypoints[dst].astype(np.float64) - reproj_keypoints[dst][src]
+            total += float(np.sum(diff ** 2))
+    return total
 
 def fine_tune_world_frame(
     wf: WorldFrame,
     keypoints: dict,
-    tag_size_m: float,
+    world_pts: np.ndarray,
     iters: int = 400,
     huber_delta_px: float = 2.0,
 ) -> WorldFrame:
-    """Bundle adjustment on camera extrinsics against the *known* 3D tag corners.
+    """Bundle adjustment on camera extrinsics against fixed 3D tag corners.
 
-    The table AprilTag is the calibration target: its 4 corners in world frame are
-    fully determined by `T_ARUCO` (tag->world) and the physical `tag_size_m`. We
-    treat those world points as fixed ground truth and optimize each camera's
-    world->cam extrinsic so that projecting the 3D corners reproduces the observed
-    pixel detections in every camera.
+    `world_pts` (4, 3) are the tag corners expressed in the current world frame
+    of `wf`. They are treated as ground-truth structure; only the 3 cameras'
+    extrinsics are optimized. Reprojection error against the observed pixel
+    detections in every camera is minimized.
 
     Params: 18 = 3 cameras x (rvec[3], tvec[3]) for world->cam.
     Residuals: 24 = 3 cameras x 4 corners x 2 (u, v).
@@ -89,17 +95,13 @@ def fine_tune_world_frame(
     for T in (wf.t_cam1, wf.t_cam2, wf.t_cam3):
         det = float(np.linalg.det(T[:3, :3]))
         assert np.isclose(det, 1.0, atol=1e-6), (
-            f"Camera extrinsic is not a proper rotation (det={det:.6f}); "
-            "check T_ARUCO and detection pipeline for reflections."
+            f"Camera extrinsic is not a proper rotation (det={det:.6f})."
         )
     t_world_to_cam_init = [
         np.linalg.inv(wf.t_cam1),
         np.linalg.inv(wf.t_cam2),
         np.linalg.inv(wf.t_cam3),
     ]
-
-    # Ground-truth 3D structure: fixed corners of the table tag in world frame.
-    world_pts = _table_tag_world_corners(tag_size_m)  # (4, 3)
 
     x0 = np.zeros(18, dtype=np.float64)
     for i in range(3):
@@ -155,7 +157,7 @@ def fine_tune_world_frame(
         f"(delta={obj_before - obj_after:.3f}, success={result.success})"
     )
     if obj_after >= obj_before:
-        print("[CALIB] BA did not improve reprojection; keeping initial world frame")
+        print("[CALIB] BA did not improve reprojection; keeping initial extrinsics")
         return wf
 
     return WorldFrame(
@@ -169,23 +171,53 @@ def fine_tune_world_frame(
         t_pose=wf.t_pose,
     )
 
-def _pairwise_objective_px2(cams: list[str], keypoints: dict, reproj_keypoints: dict) -> float:
-    total = 0.0
-    for dst in cams:
-        for src in cams:
-            if src == dst:
-                continue
-            diff = keypoints[dst].astype(np.float64) - reproj_keypoints[dst][src]
-            total += float(np.sum(diff ** 2))
-    return total
+def _resolve_tag(args) -> tuple[int, float, str]:
+    """Map --tag flag to (tag_id, tag_size_m, label)."""
+    if args.tag == "table":
+        return TABLE_TAG_ID, args.table_tag_size_m, "table"
+    if args.tag == "tee":
+        return TEE_TAG_ID, args.tee_tag_size_m, "tee"
+    raise ValueError(f"Unknown --tag value: {args.tag}")
+
+def _build_extrinsics_from_ref_cam(
+    cams: list[str],
+    ref_cam: str,
+    t_tag_to_cam: dict,
+    intrinsics: dict,
+) -> WorldFrame:
+    """Build an unanchored WorldFrame with world = ref-cam frame.
+
+    t_camN_in_world = inv(t_world_to_camN) where
+        t_world_to_camN = T_camRef_to_camN = T_tag_to_camN @ inv(T_tag_to_camRef)
+    so t_camRef_in_world = identity by construction.
+    """
+    inv_ref = np.linalg.inv(t_tag_to_cam[ref_cam])
+    t_cam_in_world = {}
+    for cam in cams:
+        t_world_to_cam = t_tag_to_cam[cam] @ inv_ref
+        t_cam_in_world[cam] = np.linalg.inv(t_world_to_cam)
+
+    # Slot mapping: top→cam1, corner→cam2, side→cam3.
+    return WorldFrame(
+        t_aruco=np.eye(4, dtype=np.float64),  # sentinel: unanchored
+        K_cam1=intrinsics["top"][0],
+        K_cam2=intrinsics["corner"][0],
+        K_cam3=intrinsics["side"][0],
+        t_cam1=t_cam_in_world["top"],
+        t_cam2=t_cam_in_world["corner"],
+        t_cam3=t_cam_in_world["side"],
+    )
 
 def calibrate(args):
-    # 1. build WorldFrame with april detections (wf = build_world_frame(april_dets, T_ARUCO))
-    table_tag_size_m = args.table_tag_size_m
-    print(f"[CALIB] using tag id={TABLE_TAG_ID} size={table_tag_size_m:.4f} m")
+    tag_id, tag_size_m, tag_label = _resolve_tag(args)
+    print(f"[CALIB] using {tag_label} tag id={tag_id} size={tag_size_m:.4f} m")
+    print(f"[CALIB] reference camera = {args.ref_cam} (world frame = its pose)")
+    if args.ref_cam not in args.cams:
+        raise ValueError(f"--ref-cam {args.ref_cam!r} not in --cams {args.cams}")
+
     pipelines, intrinsics = init_cameras(args.cams)
-    time.sleep(1) # give cameras a brief moment to start producing stable frames
-    april_dets = {}
+    time.sleep(1)  # give cameras a brief moment to start producing stable frames
+    t_tag_to_cam = {}
     keypoints = {}
     keypoint_depths = {}
     color_images = {}
@@ -195,46 +227,35 @@ def calibrate(args):
             K, dist = intrinsics[cam]
             print(f"[{cam}] K: {K}")
 
-            # get all necessary data for calibration =====================
             color_image, _ = get_rgbd_frames(pipelines[cam], cam, retries=4, timeout_ms=10000)
-            detections, cam_corners = detect_apriltags(color_image, K, dist, table_tag_size_m)
+            detections, cam_corners = detect_apriltags(color_image, K, dist, tag_size_m)
 
-            t_table_to_cam = get_tag_transform_by_id(detections, TABLE_TAG_ID)
-            if t_table_to_cam is None:
-                raise RuntimeError(f"[{cam}] Table tag id={TABLE_TAG_ID} not detected during calibration")
-            april_dets[cam] = t_table_to_cam
+            t = get_tag_transform_by_id(detections, tag_id)
+            if t is None:
+                raise RuntimeError(
+                    f"[{cam}] {tag_label} tag id={tag_id} not detected during calibration"
+                )
+            t_tag_to_cam[cam] = t
 
-            # keypoints (4 corners) from detected table tag.
-            if len(cam_corners) == 0:
-                raise RuntimeError(f"[{cam}] No AprilTag corner set returned by detector")
-            # Keep subpixel precision for BA reprojection error.
-            cam_corners = cam_corners[0][0].astype(np.float64)  # (4, 2)
-            keypoints[cam] = cam_corners
-            # Use pose-derived metric corner depths (meters) to match reproject() contract.
-            keypoint_depths[cam] = _corner_depths_from_tag_pose(t_table_to_cam, table_tag_size_m)
+            corners_px = get_tag_corners_by_id(detections, tag_id)
+            if corners_px is None:
+                raise RuntimeError(f"[{cam}] No corner set returned for tag id={tag_id}")
+            keypoints[cam] = corners_px  # subpixel, (4, 2) float64
+            keypoint_depths[cam] = _corner_depths_from_tag_pose(t, tag_size_m)
             color_images[cam] = color_image.copy()
     finally:
         for pipe in pipelines.values():
             pipe.stop()
 
-    print(f"[CALIB] keypoints (april tag corners)====")
-    for cam in keypoints:
+    print(f"[CALIB] keypoints ({tag_label} tag corners)====")
+    for cam in args.cams:
         print(f"[{cam}] {keypoints[cam]}")
     print("================================")
 
-    april_dets = AprilDetections(
-        cam1=april_dets["top"],
-        cam2=april_dets["corner"],
-        cam3=april_dets["side"],
-    )
-    intrinsics = Intrinsics(
-        cam1=intrinsics["top"][0],
-        cam2=intrinsics["corner"][0],
-        cam3=intrinsics["side"][0],
-    )
-    wf = WorldFrame.build_world_frame(april_dets, T_ARUCO, intrinsics)
+    wf = _build_extrinsics_from_ref_cam(args.cams, args.ref_cam, t_tag_to_cam, intrinsics)
+    # Fixed 3D structure for BA: tag corners expressed in the ref-cam world.
+    world_pts = _tag_corners_in_frame(t_tag_to_cam[args.ref_cam], tag_size_m)
 
-    # Report baseline quality before any refinement.
     reproj_keypoints_initial = _compute_reproj_keypoints(wf, args.cams, keypoints, keypoint_depths)
     print("[CALIB] pairwise reprojection errors before fine-tune:")
     _print_reprojection_errors(args.cams, keypoints, reproj_keypoints_initial)
@@ -244,7 +265,7 @@ def calibrate(args):
         wf = fine_tune_world_frame(
             wf,
             keypoints,
-            table_tag_size_m,
+            world_pts,
             iters=args.fine_tune_iters,
         )
 
@@ -255,7 +276,7 @@ def calibrate(args):
         print("[CALIB] WARNING: pairwise objective worsened after BA")
     print("[CALIB] pairwise reprojection errors after fine-tune:")
 
-    print(f"[CALIB] reprojected keypoints (april tag corners)====")
+    print(f"[CALIB] reprojected keypoints ({tag_label} tag corners)====")
     for dst in args.cams:
         for src in args.cams:
             if src == dst:
@@ -318,24 +339,43 @@ def visualize_keypoints(wf: WorldFrame, keypoints: dict, reproj_keypoints: dict,
 
 def main(args):
     wf, keypoints, reproj_keypoints, color_images = calibrate(args)
+    print(
+        f"[CALIB] saving UNANCHORED extrinsics (world = '{args.ref_cam}' camera frame). "
+        f"Run anchor.py to produce a robot/world wf.npz."
+    )
     wf.print_world_coordinates()
 
     if not args.no_save:
         wf.save(args.output_path)
+        print(f"[CALIB] wrote {args.output_path}")
 
     if not args.no_plot:
         wf.plot()
-
         visualize_keypoints(wf, keypoints, reproj_keypoints, color_images)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compute multi-camera extrinsics from a single AprilTag observation. "
+            "Output is an unanchored WorldFrame (world = reference camera). "
+            "Run anchor.py afterwards to get a robot-frame wf.npz."
+        )
+    )
     parser.add_argument("--cams", nargs="+", default=["top", "corner", "side"])
+    parser.add_argument(
+        "--tag", choices=["table", "tee"], default="table",
+        help="Which AprilTag to calibrate against. Default: table.",
+    )
+    parser.add_argument(
+        "--ref-cam", default="top",
+        help="Reference camera; defines the world frame of the unanchored output.",
+    )
     parser.add_argument("--table_tag_size_m", type=float, default=0.1651)
+    parser.add_argument("--tee_tag_size_m", type=float, default=0.0445)
     parser.add_argument("--no-save", action="store_true")
     parser.add_argument("--no-plot", action="store_true")
     parser.add_argument("--no-fine-tune", action="store_true")
     parser.add_argument("--fine-tune-iters", type=int, default=4000)
-    parser.add_argument("--output-path", type=str, default="wf.npz")
+    parser.add_argument("--output-path", type=str, default="extrinsics.npz")
     args = parser.parse_args()
     main(args)

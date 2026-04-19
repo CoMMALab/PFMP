@@ -17,76 +17,11 @@ from camera import (
 )
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
+from tee import draw_frame, draw_t_shape, box_faces_local, transform_points 
 
-def _draw_frame(ax, T, label: str, axis_scale: float = 0.07) -> None:
-    pos = T[:3, 3]
-    ax.text(*pos, label, fontsize=9)
-    for i, c in enumerate(["r", "g", "b"]):
-        axis_vec = T[:3, i] * axis_scale
-        ax.quiver(pos[0], pos[1], pos[2], axis_vec[0], axis_vec[1], axis_vec[2], color=c, normalize=False)
-
-
-def _box_faces_local(xmin, xmax, ymin, ymax, zmin, zmax):
-    verts = np.array(
-        [
-            [xmin, ymin, zmin],
-            [xmax, ymin, zmin],
-            [xmax, ymax, zmin],
-            [xmin, ymax, zmin],
-            [xmin, ymin, zmax],
-            [xmax, ymin, zmax],
-            [xmax, ymax, zmax],
-            [xmin, ymax, zmax],
-        ],
-        dtype=np.float64,
-    )
-    faces = [
-        [0, 1, 2, 3],
-        [4, 5, 6, 7],
-        [0, 1, 5, 4],
-        [1, 2, 6, 5],
-        [2, 3, 7, 6],
-        [3, 0, 4, 7],
-    ]
-    return verts, faces
-
-
-def _transform_points(T, points):
-    pts_h = np.hstack((points, np.ones((points.shape[0], 1), dtype=np.float64)))
-    return (T @ pts_h.T).T[:, :3]
-
-
-def _draw_t_shape(ax, T, color: str, alpha: float, label: str) -> None:
-    # Match tee.py visual convention: 180 deg local yaw flip for rendering.
-    yaw_flip = np.eye(4, dtype=np.float64)
-    yaw_flip[:3, :3] = np.array([[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
-    T_draw = T @ yaw_flip
-
-    half_w = TEE_WIDTH_M / 2.0
-    half_t = TEE_THICKNESS_M / 2.0
-    stem_half_w = TEE_THICKNESS_M / 2.0
-    stem_len = TEE_LENGTH_M - TEE_THICKNESS_M
-
-    top_verts, top_faces = _box_faces_local(-half_w, half_w, 0.0, TEE_THICKNESS_M, -half_t, half_t)
-    stem_verts, stem_faces = _box_faces_local(-stem_half_w, stem_half_w, -stem_len, 0.0, -half_t, half_t)
-
-    for verts, faces in [(top_verts, top_faces), (stem_verts, stem_faces)]:
-        verts_w = _transform_points(T_draw, verts)
-        poly = Poly3DCollection(
-            [[verts_w[i] for i in face] for face in faces],
-            facecolors=color,
-            edgecolors=color,
-            linewidths=0.8,
-            alpha=alpha,
-        )
-        ax.add_collection3d(poly)
-
-    _draw_frame(ax, T_draw, label, axis_scale=0.05)
-
-
-def _update_tee_plot(ax, wf: WorldFrame, raw_tee_world, mean_tee_world):
+def update_tee_plot(ax, wf: WorldFrame, raw_tee_world, mean_tee_world):
     ax.cla()
-    _draw_frame(ax, np.eye(4, dtype=np.float64), "world")
+    draw_frame(ax, np.eye(4, dtype=np.float64), "world")
 
     raw_colors = {"top": "tab:red", "corner": "tab:green", "side": "tab:blue"}
     all_points = [np.zeros(3)]
@@ -100,11 +35,11 @@ def _update_tee_plot(ax, wf: WorldFrame, raw_tee_world, mean_tee_world):
         ax.text(p[0], p[1], p[2], f"cam_{cam_name}", fontsize=8)
 
     for cam_name, T in raw_tee_world:
-        _draw_t_shape(ax, T, raw_colors.get(cam_name, "gray"), alpha=0.18, label=f"tee_{cam_name}")
+        draw_t_shape(ax, T, raw_colors.get(cam_name, "gray"), alpha=0.18, label=f"tee_{cam_name}")
         all_points.append(T[:3, 3])
 
     if mean_tee_world is not None:
-        _draw_t_shape(ax, mean_tee_world, "orange", alpha=0.35, label="tee_mean")
+        draw_t_shape(ax, mean_tee_world, "orange", alpha=0.35, label="tee_mean")
         all_points.append(mean_tee_world[:3, 3])
 
     pts = np.array(all_points, dtype=np.float64)
@@ -140,6 +75,11 @@ def main() -> None:
     args = parser.parse_args()
 
     wf = WorldFrame.load(args.wf)
+    if not wf.is_anchored():
+        raise RuntimeError(
+            f"{args.wf} is unanchored (t_aruco = I). Run anchor.py to produce a "
+            "robot/world-anchored wf.npz before running the live feed."
+        )
     cam_to_world = {"top": wf.t_cam1, "corner": wf.t_cam2, "side": wf.t_cam3}
 
     cams = ["top", "corner", "side"]
@@ -248,7 +188,7 @@ def main() -> None:
             cv2.imshow(window_name, np.hstack(panels))
             if plot_enabled and ax is not None and fig is not None:
                 mean_T = fuse_yaw_only_transforms_world(tee_transforms_world)
-                _update_tee_plot(ax, wf, raw_tee_world, mean_T)
+                update_tee_plot(ax, wf, raw_tee_world, mean_T)
                 fig.canvas.draw_idle()
                 plt.pause(0.001)
 

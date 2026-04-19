@@ -99,6 +99,15 @@ class WorldFrame(NamedTuple):
             t_pose=data["t_pose"] if "t_pose" in data else None,
         )
 
+    def is_anchored(self) -> bool:
+        """True if t_aruco is a non-identity transform (i.e. anchored to robot/world).
+
+        calibrate.py writes t_aruco = I as a sentinel for "unanchored extrinsics
+        only"; anchor.py writes t_aruco = T_ARUCO. Downstream consumers that
+        depend on robot/world coordinates should refuse unanchored files.
+        """
+        return not np.allclose(self.t_aruco, np.eye(4), atol=1e-8)
+
     def _K_cam(self, cam: int) -> np.ndarray:
         return {1: self.K_cam1, 2: self.K_cam2, 3: self.K_cam3}[cam]
 
@@ -349,6 +358,92 @@ def get_tag_transform_by_id(detections, tag_id):
         if det_id == tag_id:
             return T
     return None
+
+def get_tag_corners_by_id(detections, tag_id):
+    """Return AprilTag corners (4, 2) for a specific tag id, or None if missing."""
+    for det_id, _, corners, _, _ in detections:
+        if det_id == tag_id:
+            return corners[0].astype(np.float64)
+    return None
+
+def _wf_intrinsics_by_cam_name(wf: WorldFrame, cam_name: str) -> np.ndarray:
+    return {"top": wf.K_cam1, "corner": wf.K_cam2, "side": wf.K_cam3}[cam_name]
+
+def _wf_t_cam_by_cam_name(wf: WorldFrame, cam_name: str) -> np.ndarray:
+    return {"top": wf.t_cam1, "corner": wf.t_cam2, "side": wf.t_cam3}[cam_name]
+
+def multi_view_tag_pnp(
+    wf: WorldFrame,
+    observations,
+    tag_size_m: float,
+    yaw_only: bool = False,
+    verbose: bool = False,
+):
+    """Estimate T_tag_to_world from multiple camera corner observations.
+
+    Args:
+        wf: WorldFrame containing per-camera intrinsics and cam->world extrinsics.
+        observations: iterable of (cam_name, corners_px) where corners_px is (4, 2).
+        tag_size_m: Physical tag size in meters.
+        yaw_only: If True, project each estimate to yaw-only in world before fusing.
+        verbose: If True, print per-camera diagnostics.
+    """
+    s = tag_size_m / 2.0
+    obj_points = np.array(
+        [[-s, s, 0.0], [s, s, 0.0], [s, -s, 0.0], [-s, -s, 0.0]],
+        dtype=np.float64,
+    )
+    dist = np.zeros(5, dtype=np.float64)
+    transforms_world = []
+
+    for cam_name, corners_px in observations:
+        if cam_name not in ("top", "corner", "side"):
+            if verbose:
+                print(f"[WARN] multi_view_tag_pnp: unknown camera '{cam_name}', skipping")
+            continue
+
+        img_points = np.asarray(corners_px, dtype=np.float64).reshape(-1, 2)
+        if img_points.shape != (4, 2):
+            if verbose:
+                print(
+                    f"[WARN] multi_view_tag_pnp: {cam_name} corners shape {img_points.shape}, "
+                    "expected (4, 2); skipping"
+                )
+            continue
+
+        K = _wf_intrinsics_by_cam_name(wf, cam_name)
+        ok, rvec, tvec = cv2.solvePnP(
+            obj_points,
+            img_points,
+            K,
+            dist,
+            flags=cv2.SOLVEPNP_IPPE_SQUARE,
+        )
+        if not ok:
+            if verbose:
+                print(f"[WARN] multi_view_tag_pnp: solvePnP failed for {cam_name}")
+            continue
+
+        t_tag_to_cam = pose_to_4x4(rvec, tvec)
+        t_tag_to_world = _wf_t_cam_by_cam_name(wf, cam_name) @ t_tag_to_cam
+        if yaw_only:
+            t_tag_to_world = enforce_world_z_yaw_only(t_tag_to_world)
+        transforms_world.append(t_tag_to_world)
+
+        if verbose:
+            print(f"[ANCHOR][PnP] {cam_name}: t={t_tag_to_world[:3, 3]}")
+
+    if not transforms_world:
+        return None
+
+    fused = (
+        fuse_yaw_only_transforms_world(transforms_world)
+        if yaw_only
+        else average_transforms(transforms_world)
+    )
+    if verbose and fused is not None:
+        print(f"[ANCHOR][PnP] fused from {len(transforms_world)} camera(s): t={fused[:3, 3]}")
+    return fused
 
 def average_transforms(transforms):
     """Average 4x4 rigid transforms (mean t, SVD-mean R)."""

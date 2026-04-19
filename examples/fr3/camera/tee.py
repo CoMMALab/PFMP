@@ -2,98 +2,88 @@ import time
 import numpy as np
 import cv2
 from camera import *
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+def draw_frame(ax, T, label, axis_scale=0.07):
+    pos = T[:3, 3]
+    ax.text(*pos, label, fontsize=9)
+    for i, c in enumerate(["r", "g", "b"]):
+        axis_vec = T[:3, i] * axis_scale
+        ax.quiver(pos[0], pos[1], pos[2], axis_vec[0], axis_vec[1], axis_vec[2], color=c, normalize=False)
+
+def box_faces_local(xmin, xmax, ymin, ymax, zmin, zmax):
+    verts = np.array(
+        [
+            [xmin, ymin, zmin],
+            [xmax, ymin, zmin],
+            [xmax, ymax, zmin],
+            [xmin, ymax, zmin],
+            [xmin, ymin, zmax],
+            [xmax, ymin, zmax],
+            [xmax, ymax, zmax],
+            [xmin, ymax, zmax],
+        ],
+        dtype=np.float64,
+    )
+    faces = [
+        [0, 1, 2, 3],  # bottom
+        [4, 5, 6, 7],  # top
+        [0, 1, 5, 4],
+        [1, 2, 6, 5],
+        [2, 3, 7, 6],
+        [3, 0, 4, 7],
+    ]
+    return verts, faces
+
+
+def transform_points(T, points):
+    pts_h = np.hstack((points, np.ones((points.shape[0], 1), dtype=np.float64)))
+    return (T @ pts_h.T).T[:, :3]
+
+def draw_t_shape(ax, T, color, alpha, label):
+    half_w = TEE_WIDTH_M / 2.0
+    half_t = TEE_THICKNESS_M / 2.0
+    stem_half_w = TEE_THICKNESS_M / 2.0
+    stem_len = TEE_LENGTH_M - TEE_THICKNESS_M  # total length stays 8in with 2in top thickness
+
+    # Tag origin is at the junction where top and stem meet.
+    # Top bar extends in +Y; stem extends in -Y.
+    top_verts, top_faces = box_faces_local(
+        -half_w, half_w, 0.0, TEE_THICKNESS_M, -half_t, half_t
+    )
+    stem_verts, stem_faces = box_faces_local(
+        -stem_half_w, stem_half_w, -stem_len, 0.0, -half_t, half_t
+    )
+
+    for verts, faces in [(top_verts, top_faces), (stem_verts, stem_faces)]:
+        verts_w = transform_points(T, verts)
+        poly = Poly3DCollection(
+            [[verts_w[i] for i in face] for face in faces],
+            facecolors=color,
+            edgecolors=color,
+            linewidths=0.8,
+            alpha=alpha,
+        )
+        ax.add_collection3d(poly)
+
+    draw_frame(ax, T, label, axis_scale=0.05)
 
 def plot_tee_world(wf: WorldFrame, raw_tee_world, mean_tee_world: np.array):
     """Plot raw and average Tee poses in world frame with robot/world origin."""
     fig = plt.figure()
     ax = fig.add_subplot(111, projection="3d")
 
-    def draw_frame(T, label, axis_scale=0.07):
-        pos = T[:3, 3]
-        ax.text(*pos, label, fontsize=9)
-        for i, c in enumerate(["r", "g", "b"]):
-            axis_vec = T[:3, i] * axis_scale
-            ax.quiver(pos[0], pos[1], pos[2], axis_vec[0], axis_vec[1], axis_vec[2], color=c, normalize=False)
-
-    def box_faces_local(xmin, xmax, ymin, ymax, zmin, zmax):
-        verts = np.array(
-            [
-                [xmin, ymin, zmin],
-                [xmax, ymin, zmin],
-                [xmax, ymax, zmin],
-                [xmin, ymax, zmin],
-                [xmin, ymin, zmax],
-                [xmax, ymin, zmax],
-                [xmax, ymax, zmax],
-                [xmin, ymax, zmax],
-            ],
-            dtype=np.float64,
-        )
-        faces = [
-            [0, 1, 2, 3],  # bottom
-            [4, 5, 6, 7],  # top
-            [0, 1, 5, 4],
-            [1, 2, 6, 5],
-            [2, 3, 7, 6],
-            [3, 0, 4, 7],
-        ]
-        return verts, faces
-
-    def transform_points(T, points):
-        pts_h = np.hstack((points, np.ones((points.shape[0], 1), dtype=np.float64)))
-        return (T @ pts_h.T).T[:, :3]
-
-    def draw_t_shape(T, color, alpha, label):
-        # Visualization-only flip: rotate Tee 180 deg about its local Z (yaw).
-        yaw_flip = np.eye(4, dtype=np.float64)
-        yaw_flip[:3, :3] = np.array(
-            [
-                [-1.0,  0.0, 0.0],
-                [ 0.0, -1.0, 0.0],
-                [ 0.0,  0.0, 1.0],
-            ],
-            dtype=np.float64,
-        )
-        T_draw = T @ yaw_flip
-
-        half_w = TEE_WIDTH_M / 2.0
-        half_t = TEE_THICKNESS_M / 2.0
-        stem_half_w = TEE_THICKNESS_M / 2.0
-        stem_len = TEE_LENGTH_M - TEE_THICKNESS_M  # total length stays 8in with 2in top thickness
-
-        # Tag origin is at the junction where top and stem meet.
-        # Top bar extends in +Y; stem extends in -Y.
-        top_verts, top_faces = box_faces_local(
-            -half_w, half_w, 0.0, TEE_THICKNESS_M, -half_t, half_t
-        )
-        stem_verts, stem_faces = box_faces_local(
-            -stem_half_w, stem_half_w, -stem_len, 0.0, -half_t, half_t
-        )
-
-        for verts, faces in [(top_verts, top_faces), (stem_verts, stem_faces)]:
-            verts_w = transform_points(T_draw, verts)
-            poly = Poly3DCollection(
-                [[verts_w[i] for i in face] for face in faces],
-                facecolors=color,
-                edgecolors=color,
-                linewidths=0.8,
-                alpha=alpha,
-            )
-            ax.add_collection3d(poly)
-
-        draw_frame(T_draw, label, axis_scale=0.05)
-
     # World/robot origin: only draw a single 3-axis frame (no point marker).
-    draw_frame(np.eye(4, dtype=np.float64), "world")
+    draw_frame(ax, np.eye(4, dtype=np.float64), "world")
 
     # Use consistent colors for each camera and its Tee estimate.
     raw_colors = {"top": "tab:red", "corner": "tab:green", "side": "tab:blue"}
     for cam_name, T in raw_tee_world:
         c = raw_colors.get(cam_name, "gray")
-        draw_t_shape(T, c, alpha=0.18, label=f"tee_{cam_name}")
+        draw_t_shape(ax, T, c, alpha=0.18, label=f"tee_{cam_name}")
 
-    # Average/fused Tee pose in world frame.
-    draw_t_shape(mean_tee_world, "orange", alpha=0.35, label="tee_mean")
+    # Average/fused Tee pose in world framaxe.
+    draw_t_shape(ax, mean_tee_world, "orange", alpha=0.35, label="tee_mean")
 
     # Optional context: camera centers (same color as corresponding Tee estimate).
     all_points = [np.zeros(3)]
@@ -127,6 +117,11 @@ Localize the tee in the world frame.
 """
 def localize_tee(args):
     wf = WorldFrame.load("wf.npz")
+    if not wf.is_anchored():
+        raise RuntimeError(
+            "wf.npz is unanchored (t_aruco = I). Run anchor.py to produce a "
+            "robot/world-anchored wf.npz before localizing the tee."
+        )
     # Saved world frame stores camera-to-world transforms.
     cam_to_world = {
         "top": wf.t_cam1,
