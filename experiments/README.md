@@ -25,7 +25,6 @@ Prints a `latex_booktabs` cost table and shows a scatter plot per method.
 |--------|------|
 | `CartPole.yaml` | Inverted cart-pole |
 | `DoubleCartPole.yaml` | Double inverted cart-pole |
-| `Drone.yaml` | Quadrotor stabilization |
 | `Walker.yaml` | Bipedal walker |
 
 ### Algorithms
