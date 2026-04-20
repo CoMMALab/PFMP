@@ -23,7 +23,10 @@ import time
 import argparse
 import numpy as np
 from camera import *
+from viz import print_world_coordinates, plot_worldframe
 
+import matplotlib
+matplotlib.use('TkAgg')
 
 # Camera label -> WorldFrame slot index (cam1=top, cam2=corner, cam3=side).
 CAM_TO_T = {
@@ -131,14 +134,14 @@ def anchor(args):
         t_cam3=rebase(extr.t_cam3),
         t_pose=extr.t_pose,
     )
-    wf.print_world_coordinates()
+    print_world_coordinates(wf)
 
     if not args.no_save:
         wf.save(args.output_path)
         print(f"[ANCHOR] wrote {args.output_path}")
 
     if not args.no_plot:
-        wf.plot()
+        plot_worldframe(wf)
 
 
 if __name__ == "__main__":

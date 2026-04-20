@@ -4,6 +4,10 @@ import numpy as np
 import cv2
 from scipy.optimize import least_squares
 from camera import *
+from viz import print_world_coordinates, plot_worldframe
+
+import matplotlib
+matplotlib.use('TkAgg')
 
 """
 Compute per-camera extrinsics from a single multi-view AprilTag observation.
@@ -343,14 +347,14 @@ def main(args):
         f"[CALIB] saving UNANCHORED extrinsics (world = '{args.ref_cam}' camera frame). "
         f"Run anchor.py to produce a robot/world wf.npz."
     )
-    wf.print_world_coordinates()
+    print_world_coordinates(wf)
 
     if not args.no_save:
         wf.save(args.output_path)
         print(f"[CALIB] wrote {args.output_path}")
 
     if not args.no_plot:
-        wf.plot()
+        plot_worldframe(wf)
         visualize_keypoints(wf, keypoints, reproj_keypoints, color_images)
 
 if __name__ == "__main__":

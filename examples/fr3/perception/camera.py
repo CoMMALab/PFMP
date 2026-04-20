@@ -6,14 +6,22 @@ from typing import NamedTuple, Optional
 import pyrealsense2 as rs
 import numpy as np
 import cv2
-import argparse
-import time
-import matplotlib
-matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from utils import (
+    average_transforms,
+    enforce_world_z_yaw_only,
+    fuse_yaw_only_transforms_world,
+    pose_to_4x4,
+)
 
+class AprilDetections(NamedTuple):
+    cam1: np.array
+    cam2: np.array
+    cam3: np.array
+
+class Intrinsics(NamedTuple):
+    cam1: np.array
+    cam2: np.array
+    cam3: np.array
 
 SERIAL_NUMS = {
                 # "top": "234322070408", # old
@@ -29,16 +37,6 @@ APRILTAG_DETECTOR = cv2.aruco.ArucoDetector(APRILTAG_DICT, APRILTAG_PARAMS)
 TABLE_TAG_ID = 0
 TEE_TAG_ID = 2
 
-class AprilDetections(NamedTuple):
-    cam1: np.array
-    cam2: np.array
-    cam3: np.array
-
-class Intrinsics(NamedTuple):
-    cam1: np.array
-    cam2: np.array
-    cam3: np.array
-
 # tag_to_world (T_R^A): 180 deg about world Z, then translate to tag origin.
 T_ARUCO = np.array([
     [-1.0,  0.0,  0.0,  0.379],
@@ -48,11 +46,6 @@ T_ARUCO = np.array([
 ])
 assert np.isclose(np.linalg.det(T_ARUCO[:3, :3]), 1.0), \
     "T_ARUCO rotation must be a proper rotation (det = +1); diag(-1,1,1) is a reflection."
-
-INCH_TO_M = 0.0254
-TEE_WIDTH_M = 8.0 * INCH_TO_M
-TEE_LENGTH_M = 8.0 * INCH_TO_M
-TEE_THICKNESS_M = 2.0 * INCH_TO_M
 
 class WorldFrame(NamedTuple):
     t_aruco: np.array
@@ -163,70 +156,6 @@ class WorldFrame(NamedTuple):
             (self.t_cam3 @ p)[:3],
         ])
 
-    def plot(self, ps: Optional[np.array] = None):
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection="3d")
-
-        ax.set_xlim(-0.5, 0.5)
-        ax.set_ylim(-0.5, 0.5)
-        ax.set_zlim(-0.5, 0.5)
-
-        def draw_vec(T, label, color, axis_scale=0.05):
-            pos = T[:3, 3]
-            ax.quiver(0, 0, 0, *pos, color=color, normalize=False)
-            ax.text(*pos, label, fontsize=8)
-            for i, c in enumerate(["r", "g", "b"]):
-                ax.quiver(*pos, *T[:3, i], color=c, length=axis_scale, normalize=False)
-
-        ax.scatter([0], [0], [0], c="k", s=40)
-        draw_vec(self.t_aruco, "aruco", "k")
-        draw_vec(self.t_cam1,  "cam1",  "r")
-        draw_vec(self.t_cam2,  "cam2",  "g")
-        draw_vec(self.t_cam3,  "cam3",  "b")
-        if self.t_pose is not None:
-            draw_vec(self.t_pose, "pose", "m")
-
-        if ps is not None:
-            ax.scatter(ps[:, 0], ps[:, 1], ps[:, 2], c="k", s=10)
-
-        ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
-        plt.tight_layout()
-        plt.show()
-
-    def print_world_coordinates(self):
-        """Print key object coordinates in world frame (meters)."""
-        objects = [
-            ("robot/world", np.array([0.0, 0.0, 0.0], dtype=np.float64)),
-            ("aruco", self.t_aruco[:3, 3]),
-            ("cam1", self.t_cam1[:3, 3]),
-            ("cam2", self.t_cam2[:3, 3]),
-            ("cam3", self.t_cam3[:3, 3]),
-        ]
-        print("\nWorld-frame coordinates (meters):")
-        for name, p in objects:
-            print(f"  {name:12s} -> x={p[0]: .4f}, y={p[1]: .4f}, z={p[2]: .4f}")
-
-def test_world():
-    def make_cam(tx, ty, tz, angle_z):
-        c, s = np.cos(angle_z), np.sin(angle_z)
-        return np.array([
-            [ c, -s, 0, tx],
-            [ s,  c, 0, ty],
-            [ 0,  0, 1, tz],
-            [ 0,  0, 0,  1],
-        ], dtype=float)
-
-    fake_cam1 = make_cam(  0.0, -0.25, 0.25, 0.0)
-    fake_cam2 = make_cam(-0.15,  0.0 ,  0.5, 0.0)
-    fake_cam3 = make_cam(  0.0,  0.25, 0.25, 0.0)
-
-    dets = AprilDetections(cam1=fake_cam1, cam2=fake_cam2, cam3=fake_cam3)
-    wf = WorldFrame.build_world_frame(dets, T_ARUCO)
-    print("cam1 world:\n", wf.t_cam1)
-    print("cam2 world:\n", wf.t_cam2)
-    print("cam3 world:\n", wf.t_cam3)
-    wf.plot()
-
 def start_pipeline(serial):
     # Start pipeline for one camera.
     print(f"Starting camera: {serial}")
@@ -247,13 +176,6 @@ def start_pipeline(serial):
     dist = np.array(intr.coeffs, dtype=np.float64)
     print(f"Camera started: {serial}")
     return pipe, K, dist
-
-def pose_to_4x4(rvec, tvec):
-    R, _ = cv2.Rodrigues(rvec)
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = R
-    T[:3, 3] = tvec.flatten()
-    return T
 
 def _pose_from_detections(corners, ids, K, dist, tag_size_m):
     if ids is None:
@@ -315,7 +237,6 @@ def detect_apriltags(color_image, K, dist, tag_size_m, staged=True, return_debug
     debug["stage"] = 3
 
     return (detections, corners, debug) if return_debug else (detections, corners)
-
 
 def get_rgbd_frames(pipe, cam_name, retries=5, timeout_ms=5000, colorize_depth=False):
     frames = None
@@ -444,66 +365,3 @@ def multi_view_tag_pnp(
     if verbose and fused is not None:
         print(f"[ANCHOR][PnP] fused from {len(transforms_world)} camera(s): t={fused[:3, 3]}")
     return fused
-
-def average_transforms(transforms):
-    """Average 4x4 rigid transforms (mean t, SVD-mean R)."""
-    if not transforms:
-        return None
-    translations = np.array([T[:3, 3] for T in transforms], dtype=np.float64)
-    mean_t = translations.mean(axis=0)
-
-    Rs = np.array([T[:3, :3] for T in transforms], dtype=np.float64)
-    U, _, Vt = np.linalg.svd(Rs.mean(axis=0))
-    mean_R = U @ Vt
-    if np.linalg.det(mean_R) < 0:
-        Vt[-1] *= -1
-        mean_R = U @ Vt
-
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = mean_R
-    T[:3, 3] = mean_t
-    return T
-
-def rotation_matrix_to_rpy_zyx_deg(R):
-    """Return roll/pitch/yaw in degrees using ZYX convention."""
-    sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
-    singular = sy < 1e-6
-    if not singular:
-        roll = np.arctan2(R[2, 1], R[2, 2])
-        pitch = np.arctan2(-R[2, 0], sy)
-        yaw = np.arctan2(R[1, 0], R[0, 0])
-    else:
-        roll = np.arctan2(-R[1, 2], R[1, 1])
-        pitch = np.arctan2(-R[2, 0], sy)
-        yaw = 0.0
-    return np.rad2deg(np.array([roll, pitch, yaw], dtype=np.float64))
-
-def enforce_world_z_yaw_only(T):
-    """Project a pose to yaw-only rotation about +world-Z, preserving translation."""
-    yaw = np.arctan2(T[1, 0], T[0, 0])
-    c, s = np.cos(yaw), np.sin(yaw)
-    T_proj = np.eye(4, dtype=np.float64)
-    T_proj[:3, :3] = np.array(
-        [
-            [c, -s, 0.0],
-            [s,  c, 0.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
-    T_proj[:3, 3] = T[:3, 3]
-    return T_proj
-
-def fuse_yaw_only_transforms_world(transforms):
-    """Fuse yaw-only poses with circular-mean yaw and mean translation."""
-    if not transforms:
-        return None
-    translations = np.array([T[:3, 3] for T in transforms], dtype=np.float64)
-    mean_t = translations.mean(axis=0)
-    yaws = np.array([np.arctan2(T[1, 0], T[0, 0]) for T in transforms], dtype=np.float64)
-    mean_yaw = np.arctan2(np.sin(yaws).mean(), np.cos(yaws).mean())
-    c, s = np.cos(mean_yaw), np.sin(mean_yaw)
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
-    T[:3, 3] = mean_t
-    return T
