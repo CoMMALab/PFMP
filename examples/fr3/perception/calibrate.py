@@ -354,7 +354,7 @@ def main(args):
         print(f"[CALIB] wrote {args.output_path}")
 
     if not args.no_plot:
-        plot_worldframe(wf)
+        plot_worldframe(wf, viz_tool=args.viz_tool)
         visualize_keypoints(wf, keypoints, reproj_keypoints, color_images)
 
 if __name__ == "__main__":
@@ -378,6 +378,12 @@ if __name__ == "__main__":
     parser.add_argument("--tee_tag_size_m", type=float, default=0.0445)
     parser.add_argument("--no-save", action="store_true")
     parser.add_argument("--no-plot", action="store_true")
+    parser.add_argument(
+        "--viz-tool",
+        choices=["mpl", "o3d"],
+        default="mpl",
+        help="3D visualization backend for world-frame plot (default: mpl).",
+    )
     parser.add_argument("--no-fine-tune", action="store_true")
     parser.add_argument("--fine-tune-iters", type=int, default=4000)
     parser.add_argument("--output-path", type=str, default="extrinsics.npz")

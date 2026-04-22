@@ -264,6 +264,12 @@ def get_rgbd_frames(pipe, cam_name, retries=5, timeout_ms=5000, colorize_depth=F
         depth_image = np.asanyarray(depth_frame.get_data())
     return color_image, depth_image
 
+def get_depth_scale(pipe) -> float:
+    """Return metric scale (meters per raw depth unit) for an active pipeline."""
+    profile = pipe.get_active_profile()
+    sensor = profile.get_device().first_depth_sensor()
+    return float(sensor.get_depth_scale())
+
 def init_cameras(cams: list[str]):
     pipelines = {}
     intrinsics = {}

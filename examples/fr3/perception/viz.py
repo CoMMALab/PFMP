@@ -4,6 +4,7 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+import open3d as o3d
 
 from tee import (
     TEE_CENTER_OFFSET_X_M,
@@ -16,8 +17,10 @@ from tee import (
 )
 from camera import WorldFrame
 
+def plot_worldframe(wf: WorldFrame, ps: Optional[np.ndarray] = None, viz_tool: str = "mpl"):
+    if viz_tool == "o3d":
+        return plot_worldframe_o3d(wf, ps)
 
-def plot_worldframe(wf: WorldFrame, ps: Optional[np.ndarray] = None):
     fig = plt.figure()
     ax = fig.add_subplot(111, projection="3d")
     ax.set_xlim(-0.5, 0.5)
@@ -47,6 +50,51 @@ def plot_worldframe(wf: WorldFrame, ps: Optional[np.ndarray] = None):
     ax.set_zlabel("Z")
     plt.tight_layout()
     plt.show()
+
+
+def _o3d_frame(T: np.ndarray, size: float = 0.05):
+    frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=size)
+    frame.transform(T)
+    return frame
+
+
+def _o3d_points(points: np.ndarray, color=(0.0, 0.0, 0.0)):
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+    color_arr = np.asarray(color, dtype=np.float64)
+    if color_arr.ndim == 2 and color_arr.shape[0] == len(points) and color_arr.shape[1] == 3:
+        colors = color_arr
+    else:
+        colors = np.tile(color_arr.reshape(1, 3), (len(points), 1))
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+    return pcd
+
+
+def _o3d_line(a: np.ndarray, b: np.ndarray, color=(0.2, 0.2, 0.2)):
+    line = o3d.geometry.LineSet()
+    pts = np.array([a, b], dtype=np.float64)
+    line.points = o3d.utility.Vector3dVector(pts)
+    line.lines = o3d.utility.Vector2iVector(np.array([[0, 1]], dtype=np.int32))
+    line.colors = o3d.utility.Vector3dVector(np.array([color], dtype=np.float64))
+    return line
+
+
+def plot_worldframe_o3d(wf: WorldFrame, ps: Optional[np.ndarray] = None):
+    geoms = []
+
+    origin = np.zeros(3, dtype=np.float64)
+    geoms.append(_o3d_frame(np.eye(4), size=0.08))
+    for T in [wf.t_aruco, wf.t_cam1, wf.t_cam2, wf.t_cam3]:
+        geoms.append(_o3d_frame(T, size=0.06))
+        geoms.append(_o3d_line(origin, T[:3, 3], color=(0.4, 0.4, 0.4)))
+    if wf.t_pose is not None:
+        geoms.append(_o3d_frame(wf.t_pose, size=0.06))
+        geoms.append(_o3d_line(origin, wf.t_pose[:3, 3], color=(0.8, 0.2, 0.8)))
+
+    if ps is not None and len(ps) > 0:
+        geoms.append(_o3d_points(ps, color=(0.0, 0.0, 0.0)))
+
+    o3d.visualization.draw_geometries(geoms, window_name="World Frame")
 
 
 def print_world_coordinates(wf: WorldFrame):
@@ -126,6 +174,30 @@ def draw_t_shape(ax, T, color, alpha, label):
 
 
 def plot_tee_world(wf: WorldFrame, raw_tee_world, mean_tee_world):
+    return plot_tee_world_with_backend(
+        wf,
+        raw_tee_world,
+        mean_tee_world,
+        viz_tool="mpl",
+        world_point_clouds=None,
+    )
+
+
+def plot_tee_world_with_backend(
+    wf: WorldFrame,
+    raw_tee_world,
+    mean_tee_world,
+    viz_tool: str = "mpl",
+    world_point_clouds=None,
+):
+    if viz_tool == "o3d":
+        return plot_tee_world_o3d(
+            wf,
+            raw_tee_world,
+            mean_tee_world,
+            world_point_clouds=world_point_clouds,
+        )
+
     fig = plt.figure()
     ax = fig.add_subplot(111, projection="3d")
     update_tee_plot(ax, wf, raw_tee_world, mean_tee_world, title="Tee Poses in World Frame")
@@ -219,6 +291,82 @@ def _tee_box_vertices_local():
         dtype=np.float64,
     )
     return top_verts + offset, stem_verts + offset
+
+
+def _box_triangle_faces():
+    # Two triangles per box face.
+    return np.array(
+        [
+            [0, 1, 2], [0, 2, 3],
+            [4, 5, 6], [4, 6, 7],
+            [0, 1, 5], [0, 5, 4],
+            [1, 2, 6], [1, 6, 5],
+            [2, 3, 7], [2, 7, 6],
+            [3, 0, 4], [3, 4, 7],
+        ],
+        dtype=np.int32,
+    )
+
+
+def _o3d_mesh_from_box_vertices(vertices: np.ndarray, color):
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(vertices.astype(np.float64))
+    mesh.triangles = o3d.utility.Vector3iVector(_box_triangle_faces())
+    mesh.compute_vertex_normals()
+    mesh.paint_uniform_color(np.array(color, dtype=np.float64))
+    return mesh
+
+
+def _o3d_tee_meshes(T: np.ndarray, color):
+    top_verts_local, stem_verts_local = _tee_box_vertices_local()
+    top_verts = _transform_points(T, top_verts_local)
+    stem_verts = _transform_points(T, stem_verts_local)
+    return [
+        _o3d_mesh_from_box_vertices(top_verts, color),
+        _o3d_mesh_from_box_vertices(stem_verts, color),
+    ]
+
+
+def plot_tee_world_o3d(
+    wf: WorldFrame,
+    raw_tee_world,
+    mean_tee_world,
+    world_point_clouds=None,
+):
+    geoms = []
+    raw_colors = {
+        "top": (0.9, 0.2, 0.2),
+        "corner": (0.2, 0.8, 0.2),
+        "side": (0.2, 0.4, 0.9),
+    }
+    cam_entries = [("top", wf.t_cam1), ("corner", wf.t_cam2), ("side", wf.t_cam3)]
+
+    geoms.append(_o3d_frame(np.eye(4), size=0.08))
+    for cam_name, T in cam_entries:
+        geoms.append(_o3d_frame(T, size=0.06))
+        geoms.append(_o3d_points(np.array([T[:3, 3]]), color=raw_colors[cam_name]))
+
+    for cam_name, T in raw_tee_world:
+        geoms.extend(_o3d_tee_meshes(T, raw_colors.get(cam_name, (0.5, 0.5, 0.5))))
+
+    if mean_tee_world is not None:
+        geoms.extend(_o3d_tee_meshes(mean_tee_world, (1.0, 0.55, 0.1)))
+
+    if world_point_clouds:
+        for entry in world_point_clouds:
+            if len(entry) == 3:
+                cam_name, points, color = entry
+            else:
+                cam_name = "pc"
+                points, color = entry
+            if points is not None and len(points) > 0:
+                geoms.append(_o3d_points(points, color=color))
+                center = np.mean(points, axis=0)
+                label_frame = np.eye(4, dtype=np.float64)
+                label_frame[:3, 3] = center
+                geoms.append(_o3d_frame(label_frame, size=0.02))
+
+    o3d.visualization.draw_geometries(geoms, window_name="Tee Poses in World Frame")
 
 
 def draw_tee_wireframe_on_image(

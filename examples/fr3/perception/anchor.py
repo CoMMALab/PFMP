@@ -141,7 +141,7 @@ def anchor(args):
         print(f"[ANCHOR] wrote {args.output_path}")
 
     if not args.no_plot:
-        plot_worldframe(wf)
+        plot_worldframe(wf, viz_tool=args.viz_tool)
 
 
 if __name__ == "__main__":
@@ -157,6 +157,12 @@ if __name__ == "__main__":
     parser.add_argument("--output-path", type=str, default="wf.npz")
     parser.add_argument("--no-save", action="store_true")
     parser.add_argument("--no-plot", action="store_true")
+    parser.add_argument(
+        "--viz-tool",
+        choices=["mpl", "o3d"],
+        default="mpl",
+        help="3D visualization backend for world-frame plot (default: mpl).",
+    )
     parser.add_argument(
         "--no-multiview",
         action="store_true",
