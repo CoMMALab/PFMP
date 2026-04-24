@@ -16,13 +16,13 @@ WorldFrame (wf.npz) ready for use — no separate anchor step needed.
 """
 
 CAM_ORDER = ["top", "corner", "side"]  # matches WorldFrame cam1/cam2/cam3
-DEPTH_SCALE_M = 1e-3   # RealSense: raw depth units → metres
 
 def fit_ransac(
     wf: WorldFrame,
     depth: np.ndarray,
     cam: str,
     corners_cam: np.ndarray,       # (4, 3) PnP corners in camera frame
+    depth_scale: float,
     radius_m: float = 0.4,
     min_inliers: int = 500,
     n_iters: int = 100,
@@ -35,7 +35,7 @@ def fit_ransac(
     """
     K = wf._K_cam(CAM_ORDER.index(cam) + 1)
     H, W = depth.shape
-    d = depth.astype(np.float64) * DEPTH_SCALE_M
+    d = depth.astype(np.float64) * depth_scale
     valid = (d > 0.01) & np.isfinite(d)
 
     ys, xs = np.mgrid[0:H, 0:W]
@@ -173,14 +173,17 @@ def calibrate(args):
     detector = AprilDetector(tag_id=tag_id, tag_size_m=tag_size_m)
     color_images = {}
     depth_images = {}
+    depth_scales = {}
     try:
         for cam in args.cams:
             K, dist = intrinsics[cam]
             serial = SERIAL_NUMS[cam]
+            depth_scales[cam] = get_depth_scale(pipelines[cam])
+            print(f"[{cam}] depth scale: {depth_scales[cam]:.6f} m/unit")
             ok = False
             for attempt in range(60):
                 rgbd = get_rgbd_frames(pipelines[cam], cam, retries=4, timeout_ms=10000)
-                ok, detector = detector.detect(serial, rgbd, K, dist)
+                ok, detector = detector.detect(serial, rgbd, K, dist, depth_scale=depth_scales[cam])
                 if ok:
                     break
                 print(f"[{cam}] attempt {attempt + 1}/60: tag not detected, retrying...")
@@ -200,7 +203,7 @@ def calibrate(args):
     planes = {}
     for cam in args.cams:
         corners_cam = detector.corners[SERIAL_NUMS[cam]]
-        result = fit_ransac(wf, depth_images[cam], cam, corners_cam)
+        result = fit_ransac(wf, depth_images[cam], cam, corners_cam, depth_scale=depth_scales[cam])
         if result is not None:
             planes[cam] = result  # (normal, d, pts_cam, inlier_mask)
 

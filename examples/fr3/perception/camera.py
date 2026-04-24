@@ -257,6 +257,7 @@ def get_rgbd_frames(pipe, cam_name, retries=5, timeout_ms=5000, colorize_depth=F
         print(f"[WARN] {cam_name}: failed to capture frame after {retries} attempts")
         return None
 
+    frames = rs.align(rs.stream.color).process(frames)
     depth_frame = frames.get_depth_frame()
     color_frame = frames.get_color_frame()
 
