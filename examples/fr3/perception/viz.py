@@ -1,10 +1,12 @@
 from typing import Optional
 
 import cv2
+import matplotlib
+matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import numpy as np
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-import open3d as o3d
+# import open3d as o3d
 
 from tee import (
     TEE_CENTER_OFFSET_X_M,

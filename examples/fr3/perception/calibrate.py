@@ -133,6 +133,12 @@ def visualize_keypoints(wf: WorldFrame, keypoints: dict, reproj_keypoints: dict,
     cv2.destroyWindow("Calibration Keypoints: detected (green) + reprojected")
 
 def main(args):
+    if args.only_plot:
+        wf = WorldFrame.load(args.output_path)
+        print_world_coordinates(wf)
+        plot_worldframe(wf, viz_tool="mpl")
+        return
+
     wf, keypoints, reproj_keypoints, color_images = calibrate(args)
     print("[CALIB] saving anchored WorldFrame (world = robot frame via T_ARUCO).")
     print_world_coordinates(wf)
@@ -159,6 +165,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--table-tag-size-m", type=float, default=0.1651)
     parser.add_argument("--tee-tag-size-m", type=float, default=0.0445)
+    parser.add_argument("--only-plot", action="store_true",
+        help="Skip calibration; load --output-path and plot it.")
     parser.add_argument("--no-save", action="store_true")
     parser.add_argument("--no-plot", action="store_true")
     parser.add_argument(

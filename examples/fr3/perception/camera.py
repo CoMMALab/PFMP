@@ -49,21 +49,30 @@ class AprilDetector(NamedTuple):
     def detect(self, serial: str, rgbd: tuple[np.ndarray, np.ndarray], K: np.ndarray, dist: np.ndarray, depth_scale: float = 1e-3) -> "tuple[bool, AprilDetector]":
         """Detect self.tag_id in rgbd and append result keyed by serial.
 
-        Corners are stored as (4, 3) in camera frame via depth backprojection.
+        Corners are stored as (4, 3) in camera frame, derived from PnP rather than
+        raw depth at corner pixels (depth is unreliable at tag edges).
         Returns (True, updated_detector) on success, (False, self) if tag not found.
         """
-        color, depth = rgbd
+        color, _ = rgbd
         gray = cv2.cvtColor(color, cv2.COLOR_BGR2GRAY)
         raw_corners, ids, _ = _BASE_DETECTOR.detectMarkers(gray)
         if ids is not None:
+            s = self.tag_size_m / 2.0
+            obj_pts = np.array(
+                [[-s, s, 0.0], [s, s, 0.0], [s, -s, 0.0], [-s, -s, 0.0]],
+                dtype=np.float64,
+            )
             for i, tid in enumerate(ids.flatten()):
                 if tid == self.tag_id:
                     px = raw_corners[i][0].astype(np.float64)  # (4, 2)
-                    us, vs = px[:, 0].astype(int), px[:, 1].astype(int)
-                    d = depth[vs, us].astype(np.float64) * depth_scale
-                    x = (px[:, 0] - K[0, 2]) / K[0, 0] * d
-                    y = (px[:, 1] - K[1, 2]) / K[1, 1] * d
-                    corners_3d = np.column_stack([x, y, d])      # (4, 3) in cam frame
+                    ok, rvec, tvec = cv2.solvePnP(
+                        obj_pts, px, K, dist, flags=cv2.SOLVEPNP_IPPE_SQUARE
+                    )
+                    if not ok:
+                        return False, self
+                    R, _ = cv2.Rodrigues(rvec)
+                    # 3D corners in camera frame via PnP pose — more stable than raw depth
+                    corners_3d = (obj_pts @ R.T) + tvec.ravel()  # (4, 3)
                     return True, self._replace(
                         corners={**self.corners, serial: corners_3d},
                         K={**self.K, serial: K},
