@@ -6,33 +6,13 @@ from typing import NamedTuple, Optional
 import pyrealsense2 as rs
 import numpy as np
 import cv2
+from calibrate import AprilDetector
 from utils import (
     average_transforms,
     enforce_world_z_yaw_only,
     fuse_yaw_only_transforms_world,
     pose_to_4x4,
 )
-
-class AprilDetections(NamedTuple):
-    cam1: np.array
-    cam2: np.array
-    cam3: np.array
-
-class Intrinsics(NamedTuple):
-    cam1: np.array
-    cam2: np.array
-    cam3: np.array
-
-SERIAL_NUMS = {
-                # "top": "234322070408", # old
-                "top": "817512070808", #austin's replacement
-                "corner": "234322070144",
-                "side": "234322070341",
-            }
-
-APRILTAG_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
-APRILTAG_PARAMS = cv2.aruco.DetectorParameters()
-APRILTAG_DETECTOR = cv2.aruco.ArucoDetector(APRILTAG_DICT, APRILTAG_PARAMS)
 
 TABLE_TAG_ID = 0
 TEE_TAG_ID = 2
@@ -47,6 +27,14 @@ T_ARUCO = np.array([
 assert np.isclose(np.linalg.det(T_ARUCO[:3, :3]), 1.0), \
     "T_ARUCO rotation must be a proper rotation (det = +1); diag(-1,1,1) is a reflection."
 
+SERIAL_NUMS = {
+    # "top": "234322070408", # old
+    "top": "817512070808", #austin's replacement
+    "corner": "234322070144",
+    "side": "234322070341",
+}
+
+
 class WorldFrame(NamedTuple):
     t_aruco: np.array
     K_cam1: np.array
@@ -58,15 +46,45 @@ class WorldFrame(NamedTuple):
     t_pose: Optional[np.array] = None
 
     @staticmethod
-    def build_world_frame(dets: AprilDetections, t_aruco: np.array, intrs: Intrinsics) -> "Self":
-        # T_world_cam = T_world_aruco @ inv(T_cam_aruco)
-        t_cam1 = t_aruco @ np.linalg.inv(dets.cam1)
-        t_cam2 = t_aruco @ np.linalg.inv(dets.cam2)
-        t_cam3 = t_aruco @ np.linalg.inv(dets.cam3)
+    def anchor(det: AprilDetector, t_april_to_robot: np.ndarray) -> "WorldFrame":
+        """Build an anchored WorldFrame from per-camera AprilTag detections.
 
-        return WorldFrame(t_aruco=t_aruco,
-            K_cam1=intrs.cam1, K_cam2=intrs.cam2, K_cam3=intrs.cam3,
-            t_cam1=t_cam1, t_cam2=t_cam2, t_cam3=t_cam3,
+        For each camera, Procrustes-registers the depth-backprojected corners
+        (camera frame) against the known tag corners in robot frame to get T_cam_to_world.
+        """
+        s = det.tag_size_m / 2.0
+        local_corners = np.array(
+            [[-s, s, 0.0], [s, s, 0.0], [s, -s, 0.0], [-s, -s, 0.0]],
+            dtype=np.float64,
+        )
+        local_h = np.column_stack([local_corners, np.ones(4)])
+        pts_world = (t_april_to_robot @ local_h.T).T[:, :3]   # (4, 3) in robot frame
+
+        serial_to_name = {v: k for k, v in SERIAL_NUMS.items()}
+        t_cams = {}
+        for serial, pts_cam in det.corners.items():
+            mu_w = pts_world.mean(axis=0)
+            mu_c = pts_cam.mean(axis=0)
+            H = (pts_cam - mu_c).T @ (pts_world - mu_w)
+            U, _, Vt = np.linalg.svd(H)
+            R = Vt.T @ U.T
+            if np.linalg.det(R) < 0:
+                Vt[-1] *= -1
+                R = Vt.T @ U.T
+            t = mu_w - R @ mu_c
+            T = np.eye(4, dtype=np.float64)
+            T[:3, :3] = R
+            T[:3, 3] = t
+            t_cams[serial_to_name[serial]] = T
+
+        return WorldFrame(
+            t_aruco=t_april_to_robot,
+            K_cam1=det.K[SERIAL_NUMS["top"]],
+            K_cam2=det.K[SERIAL_NUMS["corner"]],
+            K_cam3=det.K[SERIAL_NUMS["side"]],
+            t_cam1=t_cams["top"],
+            t_cam2=t_cams["corner"],
+            t_cam3=t_cams["side"],
         )
 
     def save(self, path: str):
@@ -176,67 +194,6 @@ def start_pipeline(serial):
     dist = np.array(intr.coeffs, dtype=np.float64)
     print(f"Camera started: {serial}")
     return pipe, K, dist
-
-def _pose_from_detections(corners, ids, K, dist, tag_size_m):
-    if ids is None:
-        return []
-    s = tag_size_m / 2.0
-    obj_points = np.array(
-        [[-s, s, 0], [s, s, 0], [s, -s, 0], [-s, -s, 0]],
-        dtype=np.float64,
-    )
-    detections = []
-    for i, tag_id in enumerate(ids.flatten()):
-        img_points = corners[i][0].astype(np.float64)
-        ok, rvec, tvec = cv2.solvePnP(
-            obj_points, img_points, K, dist, flags=cv2.SOLVEPNP_IPPE_SQUARE
-        )
-        if not ok:
-            continue
-        detections.append((int(tag_id), pose_to_4x4(rvec, tvec), corners[i], rvec, tvec))
-    return detections
-
-def _staged_preprocess_images(color_image):
-    gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
-    blur = cv2.GaussianBlur(enhanced, (0, 0), 1.0)
-    enhanced = cv2.addWeighted(enhanced, 1.35, blur, -0.35, 0.0)
-    return gray, enhanced
-
-def detect_apriltags(color_image, K, dist, tag_size_m, staged=True, return_debug=False):
-    gray, enhanced = _staged_preprocess_images(color_image)
-    debug = {"gray": gray, "enhanced": enhanced, "stage": 0}
-
-    # Stage 1: raw grayscale.
-    corners, ids, _ = APRILTAG_DETECTOR.detectMarkers(gray)
-    detections = _pose_from_detections(corners, ids, K, dist, tag_size_m)
-    if detections:
-        debug["stage"] = 1
-        return (detections, corners, debug) if return_debug else (detections, corners)
-    if not staged:
-        return ([], [], debug) if return_debug else ([], [])
-
-    # Stage 2: CLAHE + mild unsharp mask.
-    corners, ids, _ = APRILTAG_DETECTOR.detectMarkers(enhanced)
-    detections = _pose_from_detections(corners, ids, K, dist, tag_size_m)
-    if detections:
-        debug["stage"] = 2
-        return (detections, corners, debug) if return_debug else (detections, corners)
-
-    # Stage 3: upscale fallback for small/far tags.
-    scale = 1.5
-    up = cv2.resize(enhanced, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-    corners, ids, _ = APRILTAG_DETECTOR.detectMarkers(up)
-    if ids is None:
-        debug["stage"] = 3
-        return ([], [], debug) if return_debug else ([], [])
-    for c in corners:
-        c[0] /= scale
-    detections = _pose_from_detections(corners, ids, K, dist, tag_size_m)
-    debug["stage"] = 3
-
-    return (detections, corners, debug) if return_debug else (detections, corners)
 
 def get_rgbd_frames(pipe, cam_name, retries=5, timeout_ms=5000, colorize_depth=False):
     frames = None
