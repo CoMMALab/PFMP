@@ -21,14 +21,16 @@ def fit_ransac(
     wf: WorldFrame,
     depth: np.ndarray,
     cam: str,
+    corners_cam: np.ndarray,       # (4, 3) PnP corners in camera frame
+    radius_m: float = 0.4,
     min_inliers: int = 500,
     n_iters: int = 100,
     thresh_m: float = 0.005,
 ) -> "tuple[np.ndarray, float] | None":
     """Fit a plane to the table surface in camera frame via RANSAC.
 
-    Returns (normal, d) where normal·x = d defines the plane, or None if
-    fewer than min_inliers agree on any candidate.
+    Only considers depth points within radius_m of the tag center (mean of corners),
+    discarding background clutter. Returns (normal, d) where normal·x = d, or None.
     """
     K = wf._K_cam(CAM_TO_IDX[cam])
     H, W = depth.shape
@@ -41,6 +43,9 @@ def fit_ransac(
         (ys - K[1, 2]) / K[1, 1] * d,
         d,
     ], axis=-1)[valid]   # (N, 3) in camera frame
+
+    tag_center = corners_cam.mean(axis=0)
+    pts = pts[np.linalg.norm(pts - tag_center, axis=1) < radius_m]
 
     N = len(pts)
     if N < min_inliers:
@@ -121,7 +126,8 @@ def calibrate(args):
     # 3. Fit table plane per camera via RANSAC (in camera frame)
     planes = {}
     for cam in args.cams:
-        result = fit_ransac(wf, depth_images[cam], cam)
+        corners_cam = detector.corners[SERIAL_NUMS[cam]]
+        result = fit_ransac(wf, depth_images[cam], cam, corners_cam)
         if result is not None:
             planes[cam] = result
 
