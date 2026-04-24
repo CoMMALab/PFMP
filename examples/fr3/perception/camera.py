@@ -133,6 +133,18 @@ class WorldFrame(NamedTuple):
             t_cam3=t_cams["side"],
         )
 
+    def update(self, x: np.ndarray) -> "WorldFrame":
+        """Return a new WorldFrame with extrinsics set from x (18,): 3 × (rvec[3], tvec[3]) world→cam."""
+        t_cams = []
+        for i in range(3):
+            R, _ = cv2.Rodrigues(x[6*i : 6*i+3].reshape(3, 1))
+            t = x[6*i+3 : 6*i+6]
+            T_world_to_cam = np.eye(4, dtype=np.float64)
+            T_world_to_cam[:3, :3] = R
+            T_world_to_cam[:3, 3] = t
+            t_cams.append(np.linalg.inv(T_world_to_cam))
+        return self._replace(t_cam1=t_cams[0], t_cam2=t_cams[1], t_cam3=t_cams[2])
+
     def save(self, path: str):
         arrays = dict(t_aruco=self.t_aruco,
             K_cam1=self.K_cam1, K_cam2=self.K_cam2, K_cam3=self.K_cam3,
@@ -210,15 +222,6 @@ class WorldFrame(NamedTuple):
         v = pts_dst[:, 1] / pts_dst[:, 2] * K_dst[1, 1] + K_dst[1, 2]
         return np.column_stack([u, v])
 
-    def into(self, p: np.array) -> np.array:
-        """Transform a homogeneous (4,) point from each camera frame into world frame.
-        Returns (3, 3) world-space xyz for cam1, cam2, cam3.
-        """
-        return np.stack([
-            (self.t_cam1 @ p)[:3],
-            (self.t_cam2 @ p)[:3],
-            (self.t_cam3 @ p)[:3],
-        ])
 
 def start_pipeline(serial):
     # Start pipeline for one camera.

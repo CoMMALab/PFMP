@@ -4,6 +4,8 @@ import numpy as np
 import cv2
 from camera import *
 from viz import print_world_coordinates
+from scipy.optimize import least_squares
+
 
 """
 Compute anchored per-camera extrinsics from a single multi-view AprilTag observation.
@@ -13,8 +15,7 @@ corners to the known tag geometry in robot frame (T_ARUCO). Outputs an anchored
 WorldFrame (wf.npz) ready for use — no separate anchor step needed.
 """
 
-# Camera label -> WorldFrame slot index (cam1=top, cam2=corner, cam3=side).
-CAM_TO_IDX = {"top": 1, "corner": 2, "side": 3}
+CAM_ORDER = ["top", "corner", "side"]  # matches WorldFrame cam1/cam2/cam3
 DEPTH_SCALE_M = 1e-3   # RealSense: raw depth units → metres
 
 def fit_ransac(
@@ -32,7 +33,7 @@ def fit_ransac(
     Only considers depth points within radius_m of the tag center (mean of corners),
     discarding background clutter. Returns (normal, d) where normal·x = d, or None.
     """
-    K = wf._K_cam(CAM_TO_IDX[cam])
+    K = wf._K_cam(CAM_ORDER.index(cam) + 1)
     H, W = depth.shape
     d = depth.astype(np.float64) * DEPTH_SCALE_M
     valid = (d > 0.01) & np.isfinite(d)
@@ -84,73 +85,72 @@ def fit_ransac(
     print(f"[RANSAC] {cam}: {best_count} inliers, normal={normal}, d={d_fit:.4f}m")
     return normal, d_fit, pts, inlier_mask   # pts in camera frame
 
+def reprojection_loss(wf: WorldFrame, world_pts: np.ndarray, keypoints: dict) -> np.ndarray:
+    """Reprojection residuals for tag corners across all cameras.
 
-def planar_refine(wf: WorldFrame, planes: dict) -> WorldFrame:
-    """Refine camera extrinsics using per-camera RANSAC table plane fits.
-
-    For each camera with a fitted plane:
-      1. Adjust z translation so the plane passes through the expected table height.
-      2. Rotate about the inlier centroid (world frame) to align the plane normal
-         to the known table normal from T_ARUCO.
-
-    x, y, and yaw are left unchanged — those are well-constrained by Procrustes.
+    Returns (24,): 3 cams × 4 corners × 2 (u, v).
     """
-    table_normal_world = wf.t_aruco[:3, 2]           # expected table normal in world
-    d_expected = table_normal_world @ wf.t_aruco[:3, 3]  # expected plane offset
+    cam_order = CAM_ORDER
+    res = []
+    for i, cam in enumerate(cam_order):
+        K = wf._K_cam(i + 1)
+        T_world_to_cam = np.linalg.inv(wf._t_cam(i + 1))
+        pts_cam = (world_pts @ T_world_to_cam[:3, :3].T) + T_world_to_cam[:3, 3]
+        u = pts_cam[:, 0] / pts_cam[:, 2] * K[0, 0] + K[0, 2]
+        v = pts_cam[:, 1] / pts_cam[:, 2] * K[1, 1] + K[1, 2]
+        res.append((np.column_stack([u, v]) - keypoints[cam]).ravel())
+    return np.concatenate(res)
 
+
+def planar_loss(wf: WorldFrame, planes: dict) -> np.ndarray:
+    """Planar residuals for RANSAC inliers across all cameras.
+
+    table_normal and table_d are implicit in wf.t_aruco.
+    Returns (N_inliers_total,): one signed distance residual per inlier point.
+    """
+    table_normal = wf.t_aruco[:3, 2]
+    table_d = table_normal @ wf.t_aruco[:3, 3]
     cam_to_t = {"top": wf.t_cam1, "corner": wf.t_cam2, "side": wf.t_cam3}
-    refined = {}
+    res = []
+    for cam, (_, _, pts_cam, inlier_mask) in planes.items():
+        inlier_pts = pts_cam[inlier_mask]
+        pts_h = np.column_stack([inlier_pts, np.ones(len(inlier_pts))])
+        pts_world = (cam_to_t[cam] @ pts_h.T).T[:, :3]
+        res.append(pts_world @ table_normal - table_d)
+    return np.concatenate(res)
 
-    for cam, (normal_cam, d_cam, pts_cam, inlier_mask) in planes.items():
-        T = cam_to_t[cam].copy()
-        R = T[:3, :3]
-        t = T[:3, 3]
 
-        n_world = R @ normal_cam
-        d_world = d_cam + n_world @ t
+def bundle_adjust(wf: WorldFrame, world_pts: np.ndarray, keypoints: dict, planes: dict) -> WorldFrame:
+    """Refine camera extrinsics via joint least squares over image reprojection + planar residuals.
 
-        # Step 1: shift camera along world z to match expected table height
-        if abs(n_world[2]) > 0.1:
-            delta_z = (d_expected - d_world) / n_world[2]
-            t = t.copy()
-            t[2] += delta_z
-            T = T.copy()
-            T[:3, 3] = t
+    Params: 18 = 3 cameras × (rvec[3], tvec[3]) world→cam.
+    Residuals: reprojection_loss (24,) + planar_loss (N_inliers,).
+    """
+    def residuals(x):
+        wf_x = wf.update(x)
+        return np.concatenate([
+            reprojection_loss(wf_x, world_pts, keypoints),
+            planar_loss(wf_x, planes),
+        ])
 
-        # Step 2: rotate camera about inlier centroid to align plane normal
-        n_world = R @ normal_cam   # recompute after z shift (R unchanged)
-        cos_a = np.clip(n_world @ table_normal_world, -1.0, 1.0)
-        if abs(cos_a) < 1.0 - 1e-6:
-            axis = np.cross(n_world, table_normal_world)
-            axis /= np.linalg.norm(axis)
-            angle = np.arccos(cos_a)
-            # Rodrigues rotation matrix
-            K = np.array([[    0, -axis[2],  axis[1]],
-                          [ axis[2],     0, -axis[0]],
-                          [-axis[1],  axis[0],    0]])
-            R_corr = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
+    # Initialise x from current extrinsics
+    x0 = np.zeros(18)
+    for i in range(3):
+        T_world_to_cam = np.linalg.inv(wf._t_cam(i + 1))
+        rvec, _ = cv2.Rodrigues(T_world_to_cam[:3, :3])
+        x0[6*i : 6*i+3] = rvec.ravel()
+        x0[6*i+3 : 6*i+6] = T_world_to_cam[:3, 3]
 
-            # Pivot about inlier centroid in world frame
-            pts_h = np.column_stack([pts_cam, np.ones(len(pts_cam))])
-            centroid = (T @ pts_h[inlier_mask].T).T[:, :3].mean(axis=0)
+    r0 = residuals(x0)
+    print(f"[BA] start: reproj={np.linalg.norm(r0[:24]):.3f}px  planar={np.linalg.norm(r0[24:]):.4f}m")
 
-            T_corr = np.eye(4)
-            T_corr[:3, :3] = R_corr
-            T_corr[:3, 3] = centroid - R_corr @ centroid
-            T = T_corr @ T
+    result = least_squares(residuals, x0, method="trf", verbose=0)
 
-        refined[cam] = T
-        print(f"[REFINE] {cam}: normal alignment cos={cos_a:.4f}, "
-              f"z_shift={delta_z if abs(n_world[2]) > 0.1 else 0.0:.4f}m")
+    r1 = result.x
+    rf = residuals(r1)
+    print(f"[BA]   end: reproj={np.linalg.norm(rf[:24]):.3f}px  planar={np.linalg.norm(rf[24:]):.4f}m  success={result.success}")
 
-    return WorldFrame(
-        t_aruco=wf.t_aruco,
-        K_cam1=wf.K_cam1, K_cam2=wf.K_cam2, K_cam3=wf.K_cam3,
-        t_cam1=refined.get("top",    wf.t_cam1),
-        t_cam2=refined.get("corner", wf.t_cam2),
-        t_cam3=refined.get("side",   wf.t_cam3),
-        t_pose=wf.t_pose,
-    )
+    return wf.update(result.x)
 
 
 def calibrate(args):
@@ -203,7 +203,7 @@ def calibrate(args):
 
     # 4. Refine extrinsics using fitted planes (z, pitch, roll per camera)
     if planes:
-        wf = planar_refine(wf, planes)
+        wf = bundle_adjust(wf, planes)
 
     # 5. Recover 2D keypoints from stored 3D camera-frame corners for visualization
     keypoints = {}
@@ -225,7 +225,7 @@ def calibrate(args):
             if src == dst:
                 continue
             reproj_keypoints[dst][src] = wf.reproject(
-                keypoints[src], keypoint_depths[src], CAM_TO_IDX[src], CAM_TO_IDX[dst],
+                keypoints[src], keypoint_depths[src], CAM_ORDER.index(src) + 1, CAM_ORDER.index(dst) + 1,
             )
 
     # L2 distance (pixels) between observed and reprojected corners for each src->dst pair.
@@ -262,7 +262,7 @@ def visualize_keypoints(wf: WorldFrame, keypoints: dict, reproj_keypoints: dict,
         "side": (0, 165, 255),   # orange
     }
     detected_color = (0, 255, 0)  # green
-    order = ["top", "corner", "side"]
+    order = CAM_ORDER
 
     vis_panels = []
     for dst in order:
@@ -379,7 +379,7 @@ if __name__ == "__main__":
             "Outputs a robot-frame wf.npz directly (no separate anchor step needed)."
         )
     )
-    parser.add_argument("--cams", nargs="+", default=["top", "corner", "side"])
+    parser.add_argument("--cams", nargs="+", default=CAM_ORDER)
     parser.add_argument(
         "--tag", choices=["table", "tee"], default="table",
         help="Which AprilTag to calibrate against. Default: table.",
