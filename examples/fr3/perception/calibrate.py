@@ -391,7 +391,7 @@ def main(args):
         print(f"[CALIB] wrote {args.output_path}")
 
     if not args.no_plot:
-        visualize_keypoints(wf, keypoints, reproj_keypoints, color_images)
+        visualize_keypoints(keypoints, reproj_keypoints, color_images)
         visualize_planes_meshcat(wf, planes)
 
 if __name__ == "__main__":
