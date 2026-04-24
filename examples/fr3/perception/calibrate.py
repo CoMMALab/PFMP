@@ -15,42 +15,6 @@ WorldFrame (wf.npz) ready for use — no separate anchor step needed.
 
 # Camera label -> WorldFrame slot index (cam1=top, cam2=corner, cam3=side).
 CAM_TO_IDX = {"top": 1, "corner": 2, "side": 3}
-APRILTAG_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
-APRILTAG_PARAMS = cv2.aruco.DetectorParameters()
-BASE_DETECTOR = cv2.aruco.ArucoDetector(APRILTAG_DICT, APRILTAG_PARAMS)
-
-
-class AprilDetector(NamedTuple):
-    tag_id: int
-    tag_size_m: float
-    corners: dict[str, np.ndarray] = {}  # serial -> (4, 3) corners in camera frame
-    K:       dict[str, np.ndarray] = {}  # serial -> (3, 3) camera matrix
-    dist:    dict[str, np.ndarray] = {}  # serial -> (5,) distortion coefficients
-
-    def detect(self, serial: str, rgbd: tuple[np.ndarray, np.ndarray], K: np.ndarray, dist: np.ndarray, depth_scale: float = 1e-3) -> "tuple[bool, AprilDetector]":
-        """Detect self.tag_id in rgbd and append result keyed by serial.
-
-        Corners are stored as (4, 3) in camera frame via depth backprojection.
-        Returns (True, updated_detector) on success, (False, self) if tag not found.
-        """
-        color, depth = rgbd
-        gray = cv2.cvtColor(color, cv2.COLOR_BGR2GRAY)
-        raw_corners, ids, _ = BASE_DETECTOR.detectMarkers(gray)
-        if ids is not None:
-            for i, tid in enumerate(ids.flatten()):
-                if tid == self.tag_id:
-                    px = raw_corners[i][0].astype(np.float64)  # (4, 2)
-                    us, vs = px[:, 0].astype(int), px[:, 1].astype(int)
-                    d = depth[vs, us].astype(np.float64) * depth_scale
-                    x = (px[:, 0] - K[0, 2]) / K[0, 0] * d
-                    y = (px[:, 1] - K[1, 2]) / K[1, 1] * d
-                    corners_3d = np.column_stack([x, y, d])      # (4, 3) in cam frame
-                    return True, self._replace(
-                        corners={**self.corners, serial: corners_3d},
-                        K={**self.K, serial: K},
-                        dist={**self.dist, serial: dist},
-                    )
-        return False, self
 
 def calibrate(args):
     tag_configs = {
