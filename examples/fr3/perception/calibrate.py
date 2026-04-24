@@ -3,7 +3,7 @@ import argparse
 import numpy as np
 import cv2
 from camera import *
-from viz import print_world_coordinates, plot_worldframe
+from viz import print_world_coordinates
 
 """
 Compute anchored per-camera extrinsics from a single multi-view AprilTag observation.
@@ -263,7 +263,7 @@ def main(args):
     if args.only_plot:
         wf = WorldFrame.load(args.output_path)
         print_world_coordinates(wf)
-        plot_worldframe(wf, viz_tool="mpl")
+        visualize_planes_meshcat(wf, {})
         return
 
     wf, keypoints, reproj_keypoints, color_images, planes = calibrate(args)
@@ -275,7 +275,6 @@ def main(args):
         print(f"[CALIB] wrote {args.output_path}")
 
     if not args.no_plot:
-        plot_worldframe(wf, viz_tool=args.viz_tool)
         visualize_keypoints(wf, keypoints, reproj_keypoints, color_images)
         visualize_planes_meshcat(wf, planes)
 
