@@ -126,11 +126,14 @@ def bundle_adjust(wf: WorldFrame, world_pts: np.ndarray, keypoints: dict, planes
     Params: 18 = 3 cameras × (rvec[3], tvec[3]) world→cam.
     Residuals: reprojection_loss (24,) + planar_loss (N_inliers,).
     """
+    n_planar = sum(mask.sum() for _, _, _, mask in planes.values())
+    planar_weight = float(np.sqrt(24.0 / max(n_planar, 1)))
+
     def residuals(x):
         wf_x = wf.update(x)
         return np.concatenate([
             reprojection_loss(wf_x, world_pts, keypoints),
-            planar_loss(wf_x, planes),
+            planar_weight * planar_loss(wf_x, planes),
         ])
 
     # Initialise x from current extrinsics
@@ -201,11 +204,7 @@ def calibrate(args):
         if result is not None:
             planes[cam] = result  # (normal, d, pts_cam, inlier_mask)
 
-    # 4. Refine extrinsics using fitted planes (z, pitch, roll per camera)
-    if planes:
-        wf = bundle_adjust(wf, planes)
-
-    # 5. Recover 2D keypoints from stored 3D camera-frame corners for visualization
+    # 4. Recover 2D keypoints and world_pts for BA and visualization
     keypoints = {}
     keypoint_depths = {}
     for cam in args.cams:
@@ -218,6 +217,16 @@ def calibrate(args):
         ])
         keypoint_depths[cam] = pts_cam[:, 2]
 
+    s = tag_size_m / 2.0
+    world_pts = (T_ARUCO @ np.column_stack([
+        [[-s, s, 0.], [s, s, 0.], [s, -s, 0.], [-s, -s, 0.]],
+        np.ones(4),
+    ]).T).T[:, :3]
+
+    # 5. Refine extrinsics via joint BA over reprojection + planar residuals
+    if planes:
+        wf = bundle_adjust(wf, world_pts, keypoints, planes)
+
     # Unproject each src camera's tag corners into world, then project into every dst camera.
     reproj_keypoints = {dst: {} for dst in args.cams}
     for src in args.cams:
@@ -229,7 +238,7 @@ def calibrate(args):
             )
 
     # L2 distance (pixels) between observed and reprojected corners for each src->dst pair.
-    print("[CALIB] pairwise reprojection errors (Procrustes):")
+    print("[CALIB] pairwise reprojection errors (post-BA):")
     for dst in args.cams:
         for src in args.cams:
             if src == dst:
