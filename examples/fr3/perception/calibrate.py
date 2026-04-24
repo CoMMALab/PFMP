@@ -80,8 +80,9 @@ def fit_ransac(
     if normal @ best_normal < 0:
         normal = -normal
     d_fit = float(normal @ inliers.mean(axis=0))
+    inlier_mask = np.abs(pts @ normal - d_fit) < thresh_m
     print(f"[RANSAC] {cam}: {best_count} inliers, normal={normal}, d={d_fit:.4f}m")
-    return normal, d_fit
+    return normal, d_fit, pts, inlier_mask   # pts in camera frame
 
 def calibrate(args):
     tag_configs = {
@@ -129,7 +130,7 @@ def calibrate(args):
         corners_cam = detector.corners[SERIAL_NUMS[cam]]
         result = fit_ransac(wf, depth_images[cam], cam, corners_cam)
         if result is not None:
-            planes[cam] = result
+            planes[cam] = result  # (normal, d, pts_cam, inlier_mask)
 
     # 4. Recover 2D keypoints from stored 3D camera-frame corners for visualization
     keypoints = {}
@@ -235,19 +236,34 @@ def visualize_planes_meshcat(wf: WorldFrame, planes: dict):
     vis["aruco"].set_object(g.triad(scale=0.1))
     vis["aruco"].set_transform(wf.t_aruco)
 
-    # Fitted planes: draw a square patch centred at the closest point on the plane,
-    # oriented so its normal matches the fitted normal, transformed to world frame.
-    for cam, (normal_cam, d_cam) in planes.items():
+    # Per camera: fitted plane patch + point cloud (inliers bright, outliers dim).
+    for cam, (normal_cam, d_cam, pts_cam, inlier_mask) in planes.items():
         T_cam = cam_to_t[cam]
-        # Centre of plane patch in camera frame: closest point to origin
+        hex_color = cam_colors[cam]
+        rgb_bright = np.array([(hex_color >> 16) & 0xff,
+                                (hex_color >>  8) & 0xff,
+                                 hex_color        & 0xff], dtype=np.float32) / 255.0
+        rgb_dim = rgb_bright * 0.3
+
+        # Transform points to world frame
+        pts_h = np.column_stack([pts_cam, np.ones(len(pts_cam))])
+        pts_world = (T_cam @ pts_h.T).T[:, :3].astype(np.float32)
+
+        colors = np.where(inlier_mask[:, None], rgb_bright, rgb_dim).astype(np.float32)
+
+        # Subsample for meshcat performance
+        if len(pts_world) > 20_000:
+            idx = np.random.default_rng(0).choice(len(pts_world), 20_000, replace=False)
+            pts_world, colors = pts_world[idx], colors[idx]
+
+        vis[f"pts/{cam}"].set_object(g.PointCloud(pts_world.T, colors.T, size=0.003))
+
+        # Plane patch centred on tag, normal in world frame
         centre_cam = normal_cam * d_cam
         centre_world = (T_cam @ np.append(centre_cam, 1.0))[:3]
-
-        # Rotate plane normal (camera frame) to world frame
         normal_world = T_cam[:3, :3] @ normal_cam
         normal_world /= np.linalg.norm(normal_world)
 
-        # Build a transform that puts the xy-plane patch at centre_world, normal along z
         z = normal_world
         x = np.array([1.0, 0.0, 0.0]) if abs(z[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
         x -= x.dot(z) * z; x /= np.linalg.norm(x)
@@ -258,7 +274,7 @@ def visualize_planes_meshcat(wf: WorldFrame, planes: dict):
 
         vis[f"plane/{cam}"].set_object(
             g.Box([0.4, 0.4, 0.002]),
-            g.MeshLambertMaterial(color=cam_colors[cam], opacity=0.4, transparent=True),
+            g.MeshLambertMaterial(color=hex_color, opacity=0.4, transparent=True),
         )
         vis[f"plane/{cam}"].set_transform(R_patch)
 
