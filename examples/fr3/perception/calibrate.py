@@ -66,8 +66,10 @@ def fit_ransac(
     if best_count < min_inliers:
         return None
 
-    # Least-squares refit on inliers
+    # Least-squares refit on inliers (subsample to keep SVD tractable)
     inliers = pts[np.abs(pts @ best_normal - best_d) < thresh_m]
+    if len(inliers) > 10_000:
+        inliers = inliers[rng.choice(len(inliers), 10_000, replace=False)]
     _, _, Vt = np.linalg.svd(inliers - inliers.mean(axis=0))
     normal = Vt[-1]
     if normal @ best_normal < 0:
