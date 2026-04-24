@@ -249,6 +249,9 @@ def visualize_planes_meshcat(wf: WorldFrame, planes: dict):
         pts_h = np.column_stack([pts_cam, np.ones(len(pts_cam))])
         pts_world = (T_cam @ pts_h.T).T[:, :3].astype(np.float32)
 
+        # Anchor plane patch at the known tag origin in world frame
+        centre_world = wf.t_aruco[:3, 3]
+
         colors = np.where(inlier_mask[:, None], rgb_bright, rgb_dim).astype(np.float32)
 
         # Subsample for meshcat performance
@@ -257,10 +260,6 @@ def visualize_planes_meshcat(wf: WorldFrame, planes: dict):
             pts_world, colors = pts_world[idx], colors[idx]
 
         vis[f"pts/{cam}"].set_object(g.PointCloud(pts_world.T, colors.T, size=0.003))
-
-        # Plane patch centred on tag, normal in world frame
-        centre_cam = normal_cam * d_cam
-        centre_world = (T_cam @ np.append(centre_cam, 1.0))[:3]
         normal_world = T_cam[:3, :3] @ normal_cam
         normal_world /= np.linalg.norm(normal_world)
 
