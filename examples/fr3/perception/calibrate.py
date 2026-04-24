@@ -36,10 +36,15 @@ def calibrate(args):
         for cam in args.cams:
             K, dist = intrinsics[cam]
             serial = SERIAL_NUMS[cam]
-            rgbd = get_rgbd_frames(pipelines[cam], cam, retries=4, timeout_ms=10000)
-            ok, detector = detector.detect(serial, rgbd, K, dist)
+            ok = False
+            for attempt in range(60):
+                rgbd = get_rgbd_frames(pipelines[cam], cam, retries=4, timeout_ms=10000)
+                ok, detector = detector.detect(serial, rgbd, K, dist)
+                if ok:
+                    break
+                print(f"[{cam}] attempt {attempt + 1}/60: tag not detected, retrying...")
             if not ok:
-                raise RuntimeError(f"[{cam}] {args.tag} tag id={tag_id} not detected")
+                raise RuntimeError(f"[{cam}] {args.tag} tag id={tag_id} not detected after 60 attempts")
             print(f"[{cam}] detected, corners_3d:\n{detector.corners[serial]}")
             color_images[cam] = rgbd[0].copy()
     finally:
