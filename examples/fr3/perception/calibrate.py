@@ -189,9 +189,19 @@ def calibrate(args):
                 print(f"[{cam}] attempt {attempt + 1}/60: tag not detected, retrying...")
             if not ok:
                 raise RuntimeError(f"[{cam}] {args.tag} tag id={tag_id} not detected after 60 attempts")
+
+            # Average depth over several frames to reduce per-frame noise
+            n_depth_frames = 10
+            depth_acc = rgbd[1].astype(np.float64)
+            for _ in range(n_depth_frames - 1):
+                frame = get_rgbd_frames(pipelines[cam], cam, retries=4, timeout_ms=10000)
+                if frame is not None:
+                    depth_acc += frame[1].astype(np.float64)
+            depth_avg = (depth_acc / n_depth_frames).astype(np.uint16)
+
             print(f"[{cam}] detected, corners_3d:\n{detector.corners[serial]}")
             color_images[cam] = rgbd[0].copy()
-            depth_images[cam] = rgbd[1].copy()
+            depth_images[cam] = depth_avg
     finally:
         for pipe in pipelines.values():
             pipe.stop()
@@ -251,7 +261,7 @@ def calibrate(args):
 
     return wf, keypoints, reproj_keypoints, color_images, planes
 
-def visualize_keypoints(wf: WorldFrame, keypoints: dict, reproj_keypoints: dict, color_images: dict):
+def visualize_keypoints(keypoints: dict, reproj_keypoints: dict, color_images: dict):
     def draw_box(img, pts, color, label):
         pts = np.round(pts).astype(int)
         pts = pts.reshape(-1, 1, 2)
