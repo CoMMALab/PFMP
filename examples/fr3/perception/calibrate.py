@@ -84,6 +84,75 @@ def fit_ransac(
     print(f"[RANSAC] {cam}: {best_count} inliers, normal={normal}, d={d_fit:.4f}m")
     return normal, d_fit, pts, inlier_mask   # pts in camera frame
 
+
+def planar_refine(wf: WorldFrame, planes: dict) -> WorldFrame:
+    """Refine camera extrinsics using per-camera RANSAC table plane fits.
+
+    For each camera with a fitted plane:
+      1. Adjust z translation so the plane passes through the expected table height.
+      2. Rotate about the inlier centroid (world frame) to align the plane normal
+         to the known table normal from T_ARUCO.
+
+    x, y, and yaw are left unchanged — those are well-constrained by Procrustes.
+    """
+    table_normal_world = wf.t_aruco[:3, 2]           # expected table normal in world
+    d_expected = table_normal_world @ wf.t_aruco[:3, 3]  # expected plane offset
+
+    cam_to_t = {"top": wf.t_cam1, "corner": wf.t_cam2, "side": wf.t_cam3}
+    refined = {}
+
+    for cam, (normal_cam, d_cam, pts_cam, inlier_mask) in planes.items():
+        T = cam_to_t[cam].copy()
+        R = T[:3, :3]
+        t = T[:3, 3]
+
+        n_world = R @ normal_cam
+        d_world = d_cam + n_world @ t
+
+        # Step 1: shift camera along world z to match expected table height
+        if abs(n_world[2]) > 0.1:
+            delta_z = (d_expected - d_world) / n_world[2]
+            t = t.copy()
+            t[2] += delta_z
+            T = T.copy()
+            T[:3, 3] = t
+
+        # Step 2: rotate camera about inlier centroid to align plane normal
+        n_world = R @ normal_cam   # recompute after z shift (R unchanged)
+        cos_a = np.clip(n_world @ table_normal_world, -1.0, 1.0)
+        if abs(cos_a) < 1.0 - 1e-6:
+            axis = np.cross(n_world, table_normal_world)
+            axis /= np.linalg.norm(axis)
+            angle = np.arccos(cos_a)
+            # Rodrigues rotation matrix
+            K = np.array([[    0, -axis[2],  axis[1]],
+                          [ axis[2],     0, -axis[0]],
+                          [-axis[1],  axis[0],    0]])
+            R_corr = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
+
+            # Pivot about inlier centroid in world frame
+            pts_h = np.column_stack([pts_cam, np.ones(len(pts_cam))])
+            centroid = (T @ pts_h[inlier_mask].T).T[:, :3].mean(axis=0)
+
+            T_corr = np.eye(4)
+            T_corr[:3, :3] = R_corr
+            T_corr[:3, 3] = centroid - R_corr @ centroid
+            T = T_corr @ T
+
+        refined[cam] = T
+        print(f"[REFINE] {cam}: normal alignment cos={cos_a:.4f}, "
+              f"z_shift={delta_z if abs(n_world[2]) > 0.1 else 0.0:.4f}m")
+
+    return WorldFrame(
+        t_aruco=wf.t_aruco,
+        K_cam1=wf.K_cam1, K_cam2=wf.K_cam2, K_cam3=wf.K_cam3,
+        t_cam1=refined.get("top",    wf.t_cam1),
+        t_cam2=refined.get("corner", wf.t_cam2),
+        t_cam3=refined.get("side",   wf.t_cam3),
+        t_pose=wf.t_pose,
+    )
+
+
 def calibrate(args):
     tag_configs = {
         "table": (TABLE_TAG_ID, args.table_tag_size_m),
@@ -132,7 +201,11 @@ def calibrate(args):
         if result is not None:
             planes[cam] = result  # (normal, d, pts_cam, inlier_mask)
 
-    # 4. Recover 2D keypoints from stored 3D camera-frame corners for visualization
+    # 4. Refine extrinsics using fitted planes (z, pitch, roll per camera)
+    if planes:
+        wf = planar_refine(wf, planes)
+
+    # 5. Recover 2D keypoints from stored 3D camera-frame corners for visualization
     keypoints = {}
     keypoint_depths = {}
     for cam in args.cams:
