@@ -322,6 +322,10 @@ def visualize_planes_meshcat(wf: WorldFrame, planes: dict):
 
     cam_colors = {"top": 0xff0000, "corner": 0x00cc00, "side": 0x0000ff}
     cam_to_t = {SERIAL_NUMS_INV.get(s, s): T for s, T in wf.t_cams.items()}
+    print("[CALIB] meshcat color legend:")
+    print("  red   = top")
+    print("  green = corner")
+    print("  blue  = side")
 
     for cam, T in cam_to_t.items():
         vis[f"cam/{cam}"].set_object(
