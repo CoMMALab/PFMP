@@ -133,7 +133,7 @@ def bundle_adjust(wf: WorldFrame, world_pts: np.ndarray, keypoints: dict, planes
     n_cams = len(wf.t_cams)
     n_reproj = n_cams * 4 * 2
     n_planar = sum(mask.sum() for _, _, _, mask in planes.values())
-    planar_weight = float(np.sqrt(n_reproj / max(n_planar, 1)))
+    planar_weight = 20 * float(np.sqrt(n_reproj / max(n_planar, 1)))
 
     def residuals(x):
         wf_x = wf.update(x)
