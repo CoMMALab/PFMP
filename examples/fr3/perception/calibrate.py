@@ -160,6 +160,41 @@ def bundle_adjust(wf: WorldFrame, world_pts: np.ndarray, keypoints: dict, planes
     return wf.update(result.x)
 
 
+def finetune_xy(wf: WorldFrame, world_pts: np.ndarray, keypoints: dict, planes: dict) -> WorldFrame:
+    """Second-pass BA: fix rvec + tz, only free tx/ty per camera to snap x/y reprojection.
+
+    Planar loss has zero gradient for in-plane translation, so this pass doesn't
+    disturb the z/pitch/roll corrections from bundle_adjust.
+    """
+    from collections import OrderedDict
+    serials = list(wf.t_cams.keys())
+    n_cams = len(serials)
+
+    xy0 = np.zeros(2 * n_cams)
+    for i, serial in enumerate(serials):
+        xy0[2*i : 2*i+2] = np.linalg.inv(wf.t_cams[serial])[:2, 3]
+
+    def wf_from_xy(xy):
+        t_cams = OrderedDict()
+        for i, serial in enumerate(serials):
+            T_w2c = np.linalg.inv(wf.t_cams[serial]).copy()
+            T_w2c[0, 3] = xy[2*i]
+            T_w2c[1, 3] = xy[2*i+1]
+            t_cams[serial] = np.linalg.inv(T_w2c)
+        return wf._replace(t_cams=t_cams)
+
+    result = least_squares(
+        lambda xy: reprojection_loss(wf_from_xy(xy), world_pts, keypoints),
+        xy0, method="trf", verbose=0,
+    )
+
+    wf_out = wf_from_xy(result.x)
+    rf = reprojection_loss(wf_out, world_pts, keypoints)
+    pf = planar_loss(wf_out, planes)
+    print(f"[XY]  end: reproj={np.linalg.norm(rf):.3f}px  planar={np.linalg.norm(pf):.4f}m  success={result.success}")
+    return wf_out
+
+
 def calibrate(args):
     tag_configs = {
         "table": (TABLE_TAG_ID, args.table_tag_size_m),
@@ -244,6 +279,7 @@ def calibrate(args):
     # 5. Refine extrinsics via joint BA over reprojection + planar residuals
     if planes:
         wf = bundle_adjust(wf, world_pts, keypoints, planes)
+        wf = finetune_xy(wf, world_pts, keypoints, planes)
 
     # Unproject each src camera's tag corners into world, then project into every dst camera.
     reproj_keypoints = {dst: {} for dst in args.cams}
