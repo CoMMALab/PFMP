@@ -17,7 +17,7 @@ from tee import (
     TEE_XY_THICKNESS_M,
     TEE_Z_THICKNESS_M,
 )
-from camera import WorldFrame
+from camera import WorldFrame, SERIAL_NUMS_INV
 
 def plot_worldframe(wf: WorldFrame, ps: Optional[np.ndarray] = None, viz_tool: str = "mpl"):
     if viz_tool == "o3d":
@@ -36,11 +36,11 @@ def plot_worldframe(wf: WorldFrame, ps: Optional[np.ndarray] = None, viz_tool: s
         for i, c in enumerate(["r", "g", "b"]):
             ax.quiver(*pos, *T[:3, i], color=c, length=axis_scale, normalize=False)
 
+    colors = ["r", "g", "b", "c", "m", "y"]
     ax.scatter([0], [0], [0], c="k", s=40)
     draw_vec(wf.t_aruco, "aruco", "k")
-    draw_vec(wf.t_cam1, "cam1", "r")
-    draw_vec(wf.t_cam2, "cam2", "g")
-    draw_vec(wf.t_cam3, "cam3", "b")
+    for (serial, T), color in zip(wf.t_cams.items(), colors):
+        draw_vec(T, serial[-4:], color)
     if wf.t_pose is not None:
         draw_vec(wf.t_pose, "pose", "m")
 
@@ -86,7 +86,7 @@ def plot_worldframe_o3d(wf: WorldFrame, ps: Optional[np.ndarray] = None):
 
     origin = np.zeros(3, dtype=np.float64)
     geoms.append(_o3d_frame(np.eye(4), size=0.08))
-    for T in [wf.t_aruco, wf.t_cam1, wf.t_cam2, wf.t_cam3]:
+    for T in [wf.t_aruco] + list(wf.t_cams.values()):
         geoms.append(_o3d_frame(T, size=0.06))
         geoms.append(_o3d_line(origin, T[:3, 3], color=(0.4, 0.4, 0.4)))
     if wf.t_pose is not None:
@@ -104,9 +104,7 @@ def print_world_coordinates(wf: WorldFrame):
     objects = [
         ("robot/world", np.array([0.0, 0.0, 0.0], dtype=np.float64)),
         ("aruco", wf.t_aruco[:3, 3]),
-        ("cam1", wf.t_cam1[:3, 3]),
-        ("cam2", wf.t_cam2[:3, 3]),
-        ("cam3", wf.t_cam3[:3, 3]),
+        *((serial[-4:], T[:3, 3]) for serial, T in wf.t_cams.items()),
     ]
     print("\nWorld-frame coordinates (meters):")
     for name, p in objects:
@@ -219,7 +217,7 @@ def update_tee_plot(
 
     raw_colors = {"top": "tab:red", "corner": "tab:green", "side": "tab:blue"}
     all_points = [np.zeros(3)]
-    cam_entries = [("top", wf.t_cam1), ("corner", wf.t_cam2), ("side", wf.t_cam3)]
+    cam_entries = [(SERIAL_NUMS_INV.get(s, s), T) for s, T in wf.t_cams.items()]
 
     for cam_name, T in cam_entries:
         color = raw_colors[cam_name]
@@ -341,7 +339,7 @@ def plot_tee_world_o3d(
         "corner": (0.2, 0.8, 0.2),
         "side": (0.2, 0.4, 0.9),
     }
-    cam_entries = [("top", wf.t_cam1), ("corner", wf.t_cam2), ("side", wf.t_cam3)]
+    cam_entries = [(SERIAL_NUMS_INV.get(s, s), T) for s, T in wf.t_cams.items()]
 
     geoms.append(_o3d_frame(np.eye(4), size=0.08))
     for cam_name, T in cam_entries:

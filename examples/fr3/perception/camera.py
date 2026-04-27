@@ -2,6 +2,7 @@
 Camera utilities for RealSense cameras.
 """
 
+from collections import OrderedDict
 from typing import NamedTuple, Optional
 import pyrealsense2 as rs
 import numpy as np
@@ -26,12 +27,14 @@ T_ARUCO = np.array([
 assert np.isclose(np.linalg.det(T_ARUCO[:3, :3]), 1.0), \
     "T_ARUCO rotation must be a proper rotation (det = +1); diag(-1,1,1) is a reflection."
 
-SERIAL_NUMS = {
-    # "top": "234322070408", # old
-    "top": "817512070808", #austin's replacement
-    "corner": "234322070144",
-    "side": "234322070341",
-}
+# Ordered name -> serial mapping; insertion order defines CAM_ORDER downstream.
+SERIAL_NUMS: OrderedDict[str, str] = OrderedDict([
+    # ("top", "234322070408"),  # old top camera
+    ("top",    "817512070808"),
+    ("corner", "234322070144"),
+    ("side",   "234322070341"),
+])
+SERIAL_NUMS_INV: OrderedDict[str, str] = OrderedDict((v, k) for k, v in SERIAL_NUMS.items())
 
 
 _APRILTAG_DICT   = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
@@ -82,21 +85,17 @@ class AprilDetector(NamedTuple):
 
 
 class WorldFrame(NamedTuple):
-    t_aruco: np.array
-    K_cam1: np.array
-    K_cam2: np.array
-    K_cam3: np.array
-    t_cam1: np.array
-    t_cam2: np.array
-    t_cam3: np.array
-    t_pose: Optional[np.array] = None
+    t_aruco:  np.ndarray
+    Ks:       OrderedDict[str, np.ndarray]  # serial -> (3, 3) intrinsics
+    t_cams:   OrderedDict[str, np.ndarray]  # serial -> (4, 4) cam-to-world
+    t_pose:   Optional[np.ndarray] = None
 
     @staticmethod
     def anchor(det: AprilDetector, t_april_to_robot: np.ndarray) -> "WorldFrame":
         """Build an anchored WorldFrame from per-camera AprilTag detections.
 
-        For each camera, Procrustes-registers the depth-backprojected corners
-        (camera frame) against the known tag corners in robot frame to get T_cam_to_world.
+        For each camera, Procrustes-registers the PnP corners (camera frame)
+        against the known tag corners in robot frame to get T_cam_to_world.
         """
         s = det.tag_size_m / 2.0
         local_corners = np.array(
@@ -106,8 +105,7 @@ class WorldFrame(NamedTuple):
         local_h = np.column_stack([local_corners, np.ones(4)])
         pts_world = (t_april_to_robot @ local_h.T).T[:, :3]   # (4, 3) in robot frame
 
-        serial_to_name = {v: k for k, v in SERIAL_NUMS.items()}
-        t_cams = {}
+        t_cams, Ks = OrderedDict(), OrderedDict()
         for serial, pts_cam in det.corners.items():
             mu_w = pts_world.mean(axis=0)
             mu_c = pts_cam.mean(axis=0)
@@ -121,103 +119,73 @@ class WorldFrame(NamedTuple):
             T = np.eye(4, dtype=np.float64)
             T[:3, :3] = R
             T[:3, 3] = t
-            t_cams[serial_to_name[serial]] = T
+            t_cams[serial] = T
+            Ks[serial] = det.K[serial]
 
-        return WorldFrame(
-            t_aruco=t_april_to_robot,
-            K_cam1=det.K[SERIAL_NUMS["top"]],
-            K_cam2=det.K[SERIAL_NUMS["corner"]],
-            K_cam3=det.K[SERIAL_NUMS["side"]],
-            t_cam1=t_cams["top"],
-            t_cam2=t_cams["corner"],
-            t_cam3=t_cams["side"],
-        )
+        return WorldFrame(t_aruco=t_april_to_robot, Ks=Ks, t_cams=t_cams)
 
     def update(self, x: np.ndarray) -> "WorldFrame":
-        """Return a new WorldFrame with extrinsics set from x (18,): 3 × (rvec[3], tvec[3]) world→cam."""
-        t_cams = []
-        for i in range(3):
+        """Return a new WorldFrame with extrinsics from x (6*N,): N × (rvec[3], tvec[3]) world→cam.
+
+        Camera order follows self.t_cams insertion order.
+        """
+        t_cams = OrderedDict()
+        for i, serial in enumerate(self.t_cams):
             R, _ = cv2.Rodrigues(x[6*i : 6*i+3].reshape(3, 1))
             t = x[6*i+3 : 6*i+6]
             T_world_to_cam = np.eye(4, dtype=np.float64)
             T_world_to_cam[:3, :3] = R
             T_world_to_cam[:3, 3] = t
-            t_cams.append(np.linalg.inv(T_world_to_cam))
-        return self._replace(t_cam1=t_cams[0], t_cam2=t_cams[1], t_cam3=t_cams[2])
+            t_cams[serial] = np.linalg.inv(T_world_to_cam)
+        return self._replace(t_cams=t_cams)
 
     def save(self, path: str):
-        arrays = dict(t_aruco=self.t_aruco,
-            K_cam1=self.K_cam1, K_cam2=self.K_cam2, K_cam3=self.K_cam3,
-            t_cam1=self.t_cam1, t_cam2=self.t_cam2, t_cam3=self.t_cam3,
-        )
+        arrays = {"t_aruco": self.t_aruco, "cam_names": np.array(list(self.t_cams.keys()))}
+        for name in self.t_cams:
+            arrays[f"K_{name}"] = self.Ks[name]
+            arrays[f"t_{name}"] = self.t_cams[name]
         if self.t_pose is not None:
             arrays["t_pose"] = self.t_pose
         np.savez(path, **arrays)
 
     @staticmethod
     def load(path: str) -> "WorldFrame":
-        data = np.load(path)
+        data = np.load(path, allow_pickle=False)
+        serials = list(data["cam_names"])
+        Ks     = OrderedDict((s, data[f"K_{s}"]) for s in serials)
+        t_cams = OrderedDict((s, data[f"t_{s}"]) for s in serials)
         return WorldFrame(
             t_aruco=data["t_aruco"],
-            K_cam1=data["K_cam1"],
-            K_cam2=data["K_cam2"],
-            K_cam3=data["K_cam3"],
-            t_cam1=data["t_cam1"],
-            t_cam2=data["t_cam2"],
-            t_cam3=data["t_cam3"],
+            Ks=Ks,
+            t_cams=t_cams,
             t_pose=data["t_pose"] if "t_pose" in data else None,
         )
 
     def is_anchored(self) -> bool:
-        """True if t_aruco is a non-identity transform (i.e. anchored to robot/world).
-
-        calibrate.py writes t_aruco = I as a sentinel for "unanchored extrinsics
-        only"; anchor.py writes t_aruco = T_ARUCO. Downstream consumers that
-        depend on robot/world coordinates should refuse unanchored files.
-        """
         return not np.allclose(self.t_aruco, np.eye(4), atol=1e-8)
-
-    def _K_cam(self, cam: int) -> np.ndarray:
-        return {1: self.K_cam1, 2: self.K_cam2, 3: self.K_cam3}[cam]
-
-    def _t_cam(self, cam: int) -> np.ndarray:
-        return {1: self.t_cam1, 2: self.t_cam2, 3: self.t_cam3}[cam]
 
     def reproject(
         self,
         pts_px: np.ndarray,  # (N, 2) pixel coords in source camera
         depths: np.ndarray,  # (N,)   metric depth per point (metres)
-        src: int,            # source camera: 1, 2, or 3
-        dst: int,            # destination camera: 1, 2, or 3
+        src: str,            # source camera name
+        dst: str,            # destination camera name
     ) -> np.ndarray:         # (N, 2) pixel coords in destination camera
-        """Unproject pixel-space points from one camera to world, then project to another camera.
-
-        1. Back-project to 3-D in source camera frame: X = K_src^{-1} @ [u,v,1] * depth
-        2. Transform to world via T_cam_src_to_world.
-        3. Transform to destination camera frame.
-        4. Project with K_dst.
-        """
+        """Unproject pixel-space points from one camera to world, then project to another camera."""
         pts_px = np.asarray(pts_px, dtype=np.float64)
         depths = np.asarray(depths, dtype=np.float64).ravel()
 
-        # Back-project: normalised image coords × depth
-        K_src = self._K_cam(src)
-        fx, fy = K_src[0, 0], K_src[1, 1]
-        cx, cy = K_src[0, 2], K_src[1, 2]
-        xs = (pts_px[:, 0] - cx) / fx * depths
-        ys = (pts_px[:, 1] - cy) / fy * depths
-        pts_src = np.column_stack([xs, ys, depths])          # (N, 3)
+        serial_src, serial_dst = SERIAL_NUMS[src], SERIAL_NUMS[dst]
+        K_src = self.Ks[serial_src]
+        xs = (pts_px[:, 0] - K_src[0, 2]) / K_src[0, 0] * depths
+        ys = (pts_px[:, 1] - K_src[1, 2]) / K_src[1, 1] * depths
+        pts_src_h = np.column_stack([xs, ys, depths, np.ones(len(depths))])
+        pts_world = (self.t_cams[serial_src] @ pts_src_h.T).T[:, :3]
 
-        # Source camera frame → world
-        pts_src_h = np.column_stack([pts_src, np.ones(len(pts_src))])
-        pts_world = (self._t_cam(src) @ pts_src_h.T).T[:, :3]   # (N, 3)
-
-        # World → destination camera frame
         pts_world_h = np.column_stack([pts_world, np.ones(len(pts_world))])
-        pts_dst = (np.linalg.inv(self._t_cam(dst)) @ pts_world_h.T).T[:, :3]  # (N, 3)
+        pts_dst = (np.linalg.inv(self.t_cams[serial_dst]) @ pts_world_h.T).T[:, :3]
 
-        # Perspective project
-        K_dst = self._K_cam(dst)
+        K_dst = self.Ks[serial_dst]
         u = pts_dst[:, 0] / pts_dst[:, 2] * K_dst[0, 0] + K_dst[0, 2]
         v = pts_dst[:, 1] / pts_dst[:, 2] * K_dst[1, 1] + K_dst[1, 2]
         return np.column_stack([u, v])
@@ -301,10 +269,10 @@ def get_tag_corners_by_id(detections, tag_id):
     return None
 
 def _wf_intrinsics_by_cam_name(wf: WorldFrame, cam_name: str) -> np.ndarray:
-    return {"top": wf.K_cam1, "corner": wf.K_cam2, "side": wf.K_cam3}[cam_name]
+    return wf.Ks[SERIAL_NUMS[cam_name]]
 
 def _wf_t_cam_by_cam_name(wf: WorldFrame, cam_name: str) -> np.ndarray:
-    return {"top": wf.t_cam1, "corner": wf.t_cam2, "side": wf.t_cam3}[cam_name]
+    return wf.t_cams[SERIAL_NUMS[cam_name]]
 
 def multi_view_tag_pnp(
     wf: WorldFrame,
@@ -331,7 +299,7 @@ def multi_view_tag_pnp(
     transforms_world = []
 
     for cam_name, corners_px in observations:
-        if cam_name not in ("top", "corner", "side"):
+        if cam_name not in wf.t_cams:
             if verbose:
                 print(f"[WARN] multi_view_tag_pnp: unknown camera '{cam_name}', skipping")
             continue

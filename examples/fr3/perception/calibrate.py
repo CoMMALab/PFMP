@@ -15,7 +15,7 @@ corners to the known tag geometry in robot frame (T_ARUCO). Outputs an anchored
 WorldFrame (wf.npz) ready for use — no separate anchor step needed.
 """
 
-CAM_ORDER = ["top", "corner", "side"]  # matches WorldFrame cam1/cam2/cam3
+CAM_ORDER = list(SERIAL_NUMS.keys())  # insertion order from camera.py
 
 def fit_ransac(
     wf: WorldFrame,
@@ -33,7 +33,7 @@ def fit_ransac(
     Only considers depth points within radius_m of the tag center (mean of corners),
     discarding background clutter. Returns (normal, d) where normal·x = d, or None.
     """
-    K = wf._K_cam(CAM_ORDER.index(cam) + 1)
+    K = wf.Ks[SERIAL_NUMS[cam]]
     H, W = depth.shape
     d = depth.astype(np.float64) * depth_scale
     valid = (d > 0.01) & np.isfinite(d)
@@ -88,34 +88,35 @@ def fit_ransac(
 def reprojection_loss(wf: WorldFrame, world_pts: np.ndarray, keypoints: dict) -> np.ndarray:
     """Reprojection residuals for tag corners across all cameras.
 
-    Returns (24,): 3 cams × 4 corners × 2 (u, v).
+    keypoints: cam_name -> (4, 2) observed pixels.
+    Returns (8*N_cams,): N_cams × 4 corners × 2 (u, v).
     """
-    cam_order = CAM_ORDER
     res = []
-    for i, cam in enumerate(cam_order):
-        K = wf._K_cam(i + 1)
-        T_world_to_cam = np.linalg.inv(wf._t_cam(i + 1))
+    for cam, obs in keypoints.items():
+        serial = SERIAL_NUMS[cam]
+        K = wf.Ks[serial]
+        T_world_to_cam = np.linalg.inv(wf.t_cams[serial])
         pts_cam = (world_pts @ T_world_to_cam[:3, :3].T) + T_world_to_cam[:3, 3]
         u = pts_cam[:, 0] / pts_cam[:, 2] * K[0, 0] + K[0, 2]
         v = pts_cam[:, 1] / pts_cam[:, 2] * K[1, 1] + K[1, 2]
-        res.append((np.column_stack([u, v]) - keypoints[cam]).ravel())
+        res.append((np.column_stack([u, v]) - obs).ravel())
     return np.concatenate(res)
 
 
 def planar_loss(wf: WorldFrame, planes: dict) -> np.ndarray:
     """Planar residuals for RANSAC inliers across all cameras.
 
+    planes: serial -> (normal_cam, d_cam, pts_cam, inlier_mask).
     table_normal and table_d are implicit in wf.t_aruco.
     Returns (N_inliers_total,): one signed distance residual per inlier point.
     """
     table_normal = wf.t_aruco[:3, 2]
     table_d = table_normal @ wf.t_aruco[:3, 3]
-    cam_to_t = {"top": wf.t_cam1, "corner": wf.t_cam2, "side": wf.t_cam3}
     res = []
-    for cam, (_, _, pts_cam, inlier_mask) in planes.items():
+    for serial, (_, _, pts_cam, inlier_mask) in planes.items():
         inlier_pts = pts_cam[inlier_mask]
         pts_h = np.column_stack([inlier_pts, np.ones(len(inlier_pts))])
-        pts_world = (cam_to_t[cam] @ pts_h.T).T[:, :3]
+        pts_world = (wf.t_cams[serial] @ pts_h.T).T[:, :3]
         res.append(pts_world @ table_normal - table_d)
     return np.concatenate(res)
 
@@ -123,11 +124,13 @@ def planar_loss(wf: WorldFrame, planes: dict) -> np.ndarray:
 def bundle_adjust(wf: WorldFrame, world_pts: np.ndarray, keypoints: dict, planes: dict) -> WorldFrame:
     """Refine camera extrinsics via joint least squares over image reprojection + planar residuals.
 
-    Params: 18 = 3 cameras × (rvec[3], tvec[3]) world→cam.
-    Residuals: reprojection_loss (24,) + planar_loss (N_inliers,).
+    Params: 6*N_cams (N_cams × (rvec[3], tvec[3]) world→cam).
+    Residuals: reprojection_loss + planar_loss.
     """
+    n_cams = len(wf.t_cams)
+    n_reproj = n_cams * 4 * 2
     n_planar = sum(mask.sum() for _, _, _, mask in planes.values())
-    planar_weight = float(np.sqrt(24.0 / max(n_planar, 1)))
+    planar_weight = float(np.sqrt(n_reproj / max(n_planar, 1)))
 
     def residuals(x):
         wf_x = wf.update(x)
@@ -136,22 +139,20 @@ def bundle_adjust(wf: WorldFrame, world_pts: np.ndarray, keypoints: dict, planes
             planar_weight * planar_loss(wf_x, planes),
         ])
 
-    # Initialise x from current extrinsics
-    x0 = np.zeros(18)
-    for i in range(3):
-        T_world_to_cam = np.linalg.inv(wf._t_cam(i + 1))
+    x0 = np.zeros(6 * n_cams)
+    for i, serial in enumerate(wf.t_cams):
+        T_world_to_cam = np.linalg.inv(wf.t_cams[serial])
         rvec, _ = cv2.Rodrigues(T_world_to_cam[:3, :3])
         x0[6*i : 6*i+3] = rvec.ravel()
         x0[6*i+3 : 6*i+6] = T_world_to_cam[:3, 3]
 
     r0 = residuals(x0)
-    print(f"[BA] start: reproj={np.linalg.norm(r0[:24]):.3f}px  planar={np.linalg.norm(r0[24:]):.4f}m")
+    print(f"[BA] start: reproj={np.linalg.norm(r0[:n_reproj]):.3f}px  planar={np.linalg.norm(r0[n_reproj:]):.4f}m")
 
     result = least_squares(residuals, x0, method="trf", verbose=0)
 
-    r1 = result.x
-    rf = residuals(r1)
-    print(f"[BA]   end: reproj={np.linalg.norm(rf[:24]):.3f}px  planar={np.linalg.norm(rf[24:]):.4f}m  success={result.success}")
+    rf = residuals(result.x)
+    print(f"[BA]   end: reproj={np.linalg.norm(rf[:n_reproj]):.3f}px  planar={np.linalg.norm(rf[n_reproj:]):.4f}m  success={result.success}")
 
     return wf.update(result.x)
 
@@ -209,13 +210,14 @@ def calibrate(args):
     # 2. Build anchored WorldFrame directly via Procrustes registration
     wf = WorldFrame.anchor(detector, T_ARUCO)
 
-    # 3. Fit table plane per camera via RANSAC (in camera frame)
+    # 3. Fit table plane per camera via RANSAC (in camera frame), keyed by serial
     planes = {}
     for cam in args.cams:
-        corners_cam = detector.corners[SERIAL_NUMS[cam]]
+        serial = SERIAL_NUMS[cam]
+        corners_cam = detector.corners[serial]
         result = fit_ransac(wf, depth_images[cam], cam, corners_cam, depth_scale=depth_scales[cam])
         if result is not None:
-            planes[cam] = result  # (normal, d, pts_cam, inlier_mask)
+            planes[serial] = result  # (normal, d, pts_cam, inlier_mask)
 
     # 4. Recover 2D keypoints and world_pts for BA and visualization
     keypoints = {}
@@ -247,7 +249,7 @@ def calibrate(args):
             if src == dst:
                 continue
             reproj_keypoints[dst][src] = wf.reproject(
-                keypoints[src], keypoint_depths[src], CAM_ORDER.index(src) + 1, CAM_ORDER.index(dst) + 1,
+                keypoints[src], keypoint_depths[src], src, dst,
             )
 
     # L2 distance (pixels) between observed and reprojected corners for each src->dst pair.
@@ -319,7 +321,7 @@ def visualize_planes_meshcat(wf: WorldFrame, planes: dict):
     print(f"[CALIB] meshcat: {vis.url()}")
 
     cam_colors = {"top": 0xff0000, "corner": 0x00cc00, "side": 0x0000ff}
-    cam_to_t = {"top": wf.t_cam1, "corner": wf.t_cam2, "side": wf.t_cam3}
+    cam_to_t = {SERIAL_NUMS_INV.get(s, s): T for s, T in wf.t_cams.items()}
 
     for cam, T in cam_to_t.items():
         vis[f"cam/{cam}"].set_object(

@@ -6,6 +6,7 @@ import numpy as np
 from camera import (
     TEE_TAG_ID,
     WorldFrame,
+    SERIAL_NUMS_INV,
     detect_apriltags,
     get_rgbd_frames,
     init_cameras,
@@ -24,7 +25,7 @@ def main(args) -> None:
             f"{args.wf} is unanchored (t_aruco = I). Run anchor.py to produce a "
             "robot/world-anchored wf.npz before running the live feed."
         )
-    cam_to_world = {"top": wf.t_cam1, "corner": wf.t_cam2, "side": wf.t_cam3}
+    cam_to_world = {SERIAL_NUMS_INV[s]: T for s, T in wf.t_cams.items()}
 
     cams = ["top", "corner", "side"]
     pipelines, intrinsics = init_cameras(cams)

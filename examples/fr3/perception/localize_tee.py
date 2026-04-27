@@ -6,6 +6,7 @@ import numpy as np
 from camera import (
     TEE_TAG_ID,
     WorldFrame,
+    SERIAL_NUMS_INV,
     detect_apriltags,
     get_depth_scale,
     get_rgbd_frames,
@@ -83,11 +84,7 @@ def localize_tee(args):
             "robot/world-anchored wf.npz before localizing the tee."
         )
     # Saved world frame stores camera-to-world transforms.
-    cam_to_world = {
-        "top": wf.t_cam1,
-        "corner": wf.t_cam2,
-        "side": wf.t_cam3,
-    }
+    cam_to_world = {SERIAL_NUMS_INV[s]: T for s, T in wf.t_cams.items()}
     missing_pc_cams = [cam for cam in args.pc_cams if cam not in args.cams]
     if missing_pc_cams:
         print(
