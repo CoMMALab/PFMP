@@ -347,8 +347,8 @@ def visualize_planes_meshcat(wf: WorldFrame, planes: dict):
         pts_h = np.column_stack([pts_cam, np.ones(len(pts_cam))])
         pts_world = (T_cam @ pts_h.T).T[:, :3].astype(np.float32)
 
-        # Anchor plane patch at the known tag origin in world frame
-        centre_world = wf.t_aruco[:3, 3]
+        # Centre patch on inlier centroid — shows true position disagreement between cameras
+        centre_world = pts_world[inlier_mask].mean(axis=0)
 
         colors = np.where(inlier_mask[:, None], rgb_bright, rgb_dim).astype(np.float32)
 
