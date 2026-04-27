@@ -4,20 +4,65 @@ All coordinates are in the T-block's local body frame:
   - origin at stem center
   - +y points toward the cap (bar)
   - units: metres
+
+Dimensions are derived from the CAD model at models/T.stl.
 """
 
 import numpy as np
+from pathlib import Path
 
-# ── Dimensions ────────────────────────────────────────────────────────────────
-STEM_HALF = np.array([0.0225, 0.0675])   # (hx, hy)
-CAP_HALF  = np.array([0.0675, 0.0225])
-STEM_CTR  = np.array([0.0,    0.0   ])
-CAP_CTR   = np.array([0.0,    0.0675])
-THICKNESS = 0.045   # metres, physical block height
+# ── Load mesh and derive dimensions ───────────────────────────────────────────
 
-# Polygon outline, CCW, derived from dimension params
-_sc, _sh = np.array(STEM_CTR), np.array(STEM_HALF)
-_cc, _ch = np.array(CAP_CTR),  np.array(CAP_HALF)
+def _load_dims():
+    import trimesh
+    stl_path = Path(__file__).parent.parent.parent / "models" / "T.stl"
+    mesh = trimesh.load(str(stl_path))
+
+    # Unique 2D footprint vertices from the mesh (mm)
+    xy_mm = np.unique(np.round(mesh.vertices[:, :2], 1), axis=0)
+
+    # THICKNESS from z-extent (mm -> m)
+    thickness_m = float(mesh.extents[2]) * 1e-3
+
+    # Unique x and y values define the T outline.
+    x_vals = np.sort(np.unique(xy_mm[:, 0]))
+    y_vals = np.sort(np.unique(xy_mm[:, 1]))
+
+    # Stem: inner x bounds, lower y bounds. Cap: outer x bounds, upper y bounds.
+    stem_x = x_vals[1:3]           # inner two x values
+    cap_x  = np.array([x_vals[0], x_vals[-1]])
+    stem_y = y_vals[:2]            # lower two y values
+    cap_y  = y_vals[1:]            # upper two y values
+
+    # Convert mm -> m and compute body frame quantities
+    stem_x_m = stem_x * 1e-3
+    stem_y_m = stem_y * 1e-3
+    cap_x_m  = cap_x  * 1e-3
+    cap_y_m  = cap_y  * 1e-3
+
+    stem_ctr_m = np.array([(stem_x_m[0] + stem_x_m[1]) / 2,
+                            (stem_y_m[0] + stem_y_m[1]) / 2])
+    cap_ctr_m  = np.array([(cap_x_m[0]  + cap_x_m[1])  / 2,
+                            (cap_y_m[0]  + cap_y_m[1])  / 2])
+
+    stem_half_m = np.array([(stem_x_m[1] - stem_x_m[0]) / 2,
+                             (stem_y_m[1] - stem_y_m[0]) / 2])
+    cap_half_m  = np.array([(cap_x_m[1]  - cap_x_m[0])  / 2,
+                             (cap_y_m[1]  - cap_y_m[0])  / 2])
+
+    # Express cap center in body frame (stem center = origin)
+    cap_ctr_body = cap_ctr_m - stem_ctr_m
+
+    return stem_half_m, cap_half_m, cap_ctr_body, thickness_m
+
+
+STEM_HALF, CAP_HALF, CAP_CTR, THICKNESS = _load_dims()
+STEM_CTR = np.array([0.0, 0.0])
+
+# ── Polygon outline, CCW ───────────────────────────────────────────────────────
+
+_sc, _sh = STEM_CTR, STEM_HALF
+_cc, _ch = CAP_CTR,  CAP_HALF
 VERTS_LOCAL = np.array([
     [_sc[0] - _sh[0], _sc[1] - _sh[1]],  # stem bottom-left
     [_sc[0] + _sh[0], _sc[1] - _sh[1]],  # stem bottom-right
@@ -30,14 +75,13 @@ VERTS_LOCAL = np.array([
 ], dtype=np.float32)
 
 # AprilTag: outer border top edge is 4cm below the top of the T cap.
-# Tag center y = 0.09 - 0.04 - TEE_TAG_SIZE_M/2 = 0.02775m in body frame.
-# Tag lies flat on the top face (z = THICKNESS). Rotation assumed aligned with body frame.
 TEE_TAG_SIZE_M = 0.0445
+_cap_top_y = float(_cc[1] + _ch[1])
 TAG_IN_BODY = np.array([
-    [1, 0, 0, 0.0              ],
-    [0, 1, 0, 0.09 - 0.04 - TEE_TAG_SIZE_M / 2],
-    [0, 0, 1, THICKNESS        ],
-    [0, 0, 0, 1.0              ],
+    [1, 0, 0, 0.0                                    ],
+    [0, 1, 0, _cap_top_y - 0.04 - TEE_TAG_SIZE_M / 2],
+    [0, 0, 1, THICKNESS                              ],
+    [0, 0, 0, 1.0                                    ],
 ], dtype=np.float64)
 
 
@@ -76,34 +120,22 @@ def verts_world(t_xy: np.ndarray, t_angle: float) -> np.ndarray:
 
 def plot_wireframe(ax, t_xy: np.ndarray, t_angle: float,
                    z: float = 0.0, color: str = "darkorange", alpha: float = 0.7):
-    """Draw the T-block as a 3D wireframe on a Axes3D axes.
-
-    t_xy:    (2,) xy position of body origin in world frame
-    t_angle: rotation about z in radians
-    z:       height of the block's bottom face
-    """
-    xy_bot = verts_world(t_xy, t_angle)          # (8, 2)
+    """Draw the T-block as a 3D wireframe on a Axes3D axes."""
+    xy_bot = verts_world(t_xy, t_angle)
     z_bot  = np.full(len(xy_bot), z)
     z_top  = np.full(len(xy_bot), z + THICKNESS)
 
-    # Close the loop
     loop = np.append(np.arange(len(xy_bot)), 0)
+    ax.plot(xy_bot[loop, 0], xy_bot[loop, 1], z_bot[loop], color=color, alpha=alpha)
+    ax.plot(xy_bot[loop, 0], xy_bot[loop, 1], z_top[loop], color=color, alpha=alpha)
 
-    # Bottom and top outlines
-    ax.plot(xy_bot[loop, 0], xy_bot[loop, 1], z_bot[loop],  color=color, alpha=alpha)
-    ax.plot(xy_bot[loop, 0], xy_bot[loop, 1], z_top[loop],  color=color, alpha=alpha)
-
-    # Vertical edges at each vertex
     for x, y in xy_bot:
         ax.plot([x, x], [y, y], [z, z + THICKNESS], color=color, alpha=alpha * 0.6)
 
-    # AprilTag border on top face
     s = TEE_TAG_SIZE_M / 2.0
-    tag_corners_body = np.array([[-s, TAG_IN_BODY[1, 3] - s],
-                                  [ s, TAG_IN_BODY[1, 3] - s],
-                                  [ s, TAG_IN_BODY[1, 3] + s],
-                                  [-s, TAG_IN_BODY[1, 3] + s],
-                                  [-s, TAG_IN_BODY[1, 3] - s]])  # closed
+    tag_y = TAG_IN_BODY[1, 3]
+    tag_corners_body = np.array([[-s, tag_y - s], [s, tag_y - s],
+                                  [s, tag_y + s], [-s, tag_y + s], [-s, tag_y - s]])
     c, sv = np.cos(t_angle), np.sin(t_angle)
     R = np.array([[c, -sv], [sv, c]])
     tag_xy = (tag_corners_body @ R.T) + t_xy
@@ -112,6 +144,7 @@ def plot_wireframe(ax, t_xy: np.ndarray, t_angle: float,
 
 
 if __name__ == "__main__":
+    print(f"STEM_HALF={STEM_HALF}, CAP_HALF={CAP_HALF}, CAP_CTR={CAP_CTR}, THICKNESS={THICKNESS:.4f}m")
     import matplotlib
     matplotlib.use("TkAgg")
     import matplotlib.pyplot as plt
