@@ -2,6 +2,9 @@ import time
 import argparse
 import numpy as np
 import cv2
+import meshcat
+import meshcat.geometry as g
+
 from camera import *
 from viz import print_world_coordinates
 from scipy.optimize import least_squares
@@ -314,9 +317,6 @@ def visualize_keypoints(keypoints: dict, reproj_keypoints: dict, color_images: d
 
 def visualize_planes_meshcat(wf: WorldFrame, planes: dict):
     """Show camera frames and fitted table planes in meshcat."""
-    import meshcat
-    import meshcat.geometry as g
-
     vis = meshcat.Visualizer()
     print(f"[CALIB] meshcat: {vis.url()}")
 
@@ -334,9 +334,10 @@ def visualize_planes_meshcat(wf: WorldFrame, planes: dict):
     vis["aruco"].set_transform(wf.t_aruco)
 
     # Per camera: fitted plane patch + point cloud (inliers bright, outliers dim).
-    for cam, (normal_cam, d_cam, pts_cam, inlier_mask) in planes.items():
-        T_cam = cam_to_t[cam]
-        hex_color = cam_colors[cam]
+    for serial, (normal_cam, d_cam, pts_cam, inlier_mask) in planes.items():
+        cam = SERIAL_NUMS_INV.get(serial, serial)
+        T_cam = wf.t_cams[serial]
+        hex_color = cam_colors.get(cam, 0x888888)
         rgb_bright = np.array([(hex_color >> 16) & 0xff,
                                 (hex_color >>  8) & 0xff,
                                  hex_color        & 0xff], dtype=np.float32) / 255.0
