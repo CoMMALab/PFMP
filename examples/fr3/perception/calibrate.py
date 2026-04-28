@@ -133,7 +133,7 @@ def bundle_adjust(wf: WorldFrame, world_pts: np.ndarray, keypoints: dict, planes
     n_cams = len(wf.t_cams)
     n_reproj = n_cams * 4 * 2
     n_planar = sum(mask.sum() for _, _, _, mask in planes.values())
-    planar_weight = 20 * float(np.sqrt(n_reproj / max(n_planar, 1)))
+    planar_weight = 100 * float(np.sqrt(n_reproj / max(n_planar, 1)))
 
     def residuals(x):
         wf_x = wf.update(x)
@@ -172,15 +172,15 @@ def finetune_xy(wf: WorldFrame, world_pts: np.ndarray, keypoints: dict, planes: 
 
     xy0 = np.zeros(2 * n_cams)
     for i, serial in enumerate(serials):
-        xy0[2*i : 2*i+2] = np.linalg.inv(wf.t_cams[serial])[:2, 3]
+        xy0[2*i : 2*i+2] = wf.t_cams[serial][:2, 3]
 
     def wf_from_xy(xy):
         t_cams = OrderedDict()
         for i, serial in enumerate(serials):
-            T_w2c = np.linalg.inv(wf.t_cams[serial]).copy()
-            T_w2c[0, 3] = xy[2*i]
-            T_w2c[1, 3] = xy[2*i+1]
-            t_cams[serial] = np.linalg.inv(T_w2c)
+            T = wf.t_cams[serial].copy()
+            T[0, 3] = xy[2*i]
+            T[1, 3] = xy[2*i+1]
+            t_cams[serial] = T
         return wf._replace(t_cams=t_cams)
 
     result = least_squares(
@@ -348,7 +348,8 @@ def visualize_keypoints(keypoints: dict, reproj_keypoints: dict, color_images: d
     canvas = np.hstack(panels)
     cv2.imshow("Calibration Keypoints: detected (green) + reprojected", canvas)
     print("Calibration reprojection view shown. Press any key to close.")
-    cv2.waitKey(0)
+    while cv2.waitKey(0) & 0xff != ord('q'):
+        pass
     cv2.destroyWindow("Calibration Keypoints: detected (green) + reprojected")
 
 def visualize_planes_meshcat(wf: WorldFrame, planes: dict):
