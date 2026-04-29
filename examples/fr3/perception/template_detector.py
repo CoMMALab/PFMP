@@ -21,35 +21,36 @@ def template_match_T(
     body_yaw: float,
     body_z: float,
     dx: float = 0.015, dy: float = 0.015, dyaw: float = 0.2,
-    nx: int = 5, ny: int = 5, nyaw: int = 9,
+    n_samples: int = 200,
+    seed: int = 0,
 ):
-    """Enumerate (x, y, yaw) grid around initial estimate, score by IoU with mask.
+    """Monte Carlo search over (x, y, yaw) around initial estimate, scored by IoU.
 
+    Samples x, y from uniform(-dx, dx) and yaw from von Mises centered on body_yaw.
     Returns (best_xy, best_yaw, best_iou, best_template_mask).
     """
     import cv2
     from geom_tee import verts_world
     T_w2c = np.linalg.inv(frame.t_cams[serial])
     H, W = mask.shape
+    rng = np.random.default_rng(seed)
 
-    xs   = body_xy[0] + np.linspace(-dx, dx, nx)
-    ys   = body_xy[1] + np.linspace(-dy, dy, ny)
-    yaws = body_yaw   + np.linspace(-dyaw, dyaw, nyaw)
+    xs   = body_xy[0] + rng.uniform(-dx,   dx,   n_samples)
+    ys   = body_xy[1] + rng.uniform(-dy,   dy,   n_samples)
+    yaws = rng.vonmises(body_yaw, kappa=1.0 / max(dyaw**2, 1e-6), size=n_samples)
 
     best_iou, best_xy, best_yaw, best_tmpl = -1.0, body_xy, body_yaw, None
 
-    for x in xs:
-        for y in ys:
-            for yaw in yaws:
-                verts_px = project(verts_world(np.array([x, y]), yaw), body_z, T_w2c, K)
-                tmpl = np.zeros((H, W), dtype=np.uint8)
-                cv2.fillPoly(tmpl, [verts_px], 1)
-                tmpl = tmpl.astype(bool)
-                inter = (mask & tmpl).sum()
-                union = (mask | tmpl).sum()
-                iou = inter / union if union > 0 else 0.0
-                if iou > best_iou:
-                    best_iou, best_xy, best_yaw, best_tmpl = iou, np.array([x, y]), yaw, tmpl
+    for x, y, yaw in zip(xs, ys, yaws):
+        verts_px = project(verts_world(np.array([x, y]), yaw), body_z, T_w2c, K)
+        tmpl = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillPoly(tmpl, [verts_px], 1)
+        tmpl = tmpl.astype(bool)
+        inter = (mask & tmpl).sum()
+        union = (mask | tmpl).sum()
+        iou = inter / union if union > 0 else 0.0
+        if iou > best_iou:
+            best_iou, best_xy, best_yaw, best_tmpl = iou, np.array([x, y]), yaw, tmpl
 
     return best_xy, best_yaw, best_iou, best_tmpl
 

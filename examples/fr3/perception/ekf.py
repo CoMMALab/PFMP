@@ -104,6 +104,16 @@ class EKF(NamedTuple):
 
         return ekf
 
+    @property
+    def is_lost(self, xy_sigma_thresh: float = 0.10) -> bool:
+        """True when xy uncertainty exceeds threshold — trigger reinitialization."""
+        return float(max(self.cov[0,0], self.cov[1,1]) ** 0.5) > xy_sigma_thresh
+
+    def reset(self, xy: np.ndarray) -> "EKF":
+        """Reinitialize from a coarse xy estimate, keeping current yaw."""
+        mean = np.array([xy[0], xy[1], self.mean[2]])
+        return self._replace(mean=mean, cov=np.diag([0.05, 0.05, 0.5]))
+
 def wrap_angle(a: float) -> float:
     return (a + np.pi) % (2.0 * np.pi) - np.pi
 

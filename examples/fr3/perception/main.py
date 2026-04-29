@@ -494,6 +494,18 @@ def main():
                     print(f"appended {name}")
                     print(detections)
 
+            if ekf.is_lost:
+                seed_xy = segmentation_median_world_xy(
+                    mask=mask,
+                    depth=depth,
+                    K=K_top,
+                    T_c2w=wf.t_cams[serial_top],
+                    depth_scale=depth_scale,
+                )
+                if seed_xy is not None:
+                    ekf = ekf.reset(seed_xy)
+                    print(f"[EKF] lost — reset to segmentation seed xy={seed_xy}")
+
             best_xy, best_yaw, best_iou, _ = template_match_T(
                 mask=mask,
                 frame=wf,
