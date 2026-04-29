@@ -14,22 +14,27 @@ def project(verts_w, body_z, T_w2c, K):
 
 def template_match_T(
     mask: np.ndarray,
-    frame: WorldFrame,
+    ekf,                   # EKF NamedTuple — provides mean, cov, frame
     serial: str,
     K: np.ndarray,
-    body_xy: np.ndarray,
-    body_yaw: float,
     body_z: float,
-    dx: float = 0.015, dy: float = 0.015, dyaw: float = 0.2,
+    k: float = 3.0,       # search radius in sigma units
     nx: int = 5, ny: int = 5, nyaw: int = 9,
 ):
-    """Enumerate (x, y, yaw) grid around initial estimate, score by IoU with mask.
+    """Enumerate (x, y, yaw) grid around EKF mean, scaled by covariance sigma.
 
     Returns (best_xy, best_yaw, best_iou, best_template_mask).
     """
     import cv2
     from geom_tee import verts_world
-    T_w2c = np.linalg.inv(frame.t_cams[serial])
+
+    body_xy  = ekf.mean[:2]
+    body_yaw = ekf.mean[2]
+    dx   = k * float(np.sqrt(ekf.cov[0, 0]))
+    dy   = k * float(np.sqrt(ekf.cov[1, 1]))
+    dyaw = k * float(np.sqrt(ekf.cov[2, 2]))
+
+    T_w2c = np.linalg.inv(ekf.frame.t_cams[serial])
     H, W = mask.shape
 
     xs   = body_xy[0] + np.linspace(-dx, dx, nx)
