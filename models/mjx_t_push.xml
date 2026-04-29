@@ -6,14 +6,17 @@
   <geom type="box" name="workspace"
       pos="0.395 0.0 0.001" size="0.295 0.675 0.001"
       rgba="0.7 0.7 0.7 0.25" contype="0" conaffinity="0" group="2"/>
-  <body name="t_block" pos="0.6 0 0.045">
-      <freejoint/>
-      <!-- T stem -->
-      <geom type="box" name="t_stem" size="0.0225 0.0675 0.0225"
+  <!-- T dimensions from CAD (models/T.stl): STEM_HALF=[0.025,0.075], CAP_HALF=[0.1,0.025], CAP_CTR=[0,0.1], THICKNESS=0.040 -->
+  <body name="t_block" pos="0 0 0.020">
+      <joint name="t_x"   type="slide" axis="1 0 0" damping="5.0"/>
+      <joint name="t_y"   type="slide" axis="0 1 0" damping="5.0"/>
+      <joint name="t_yaw" type="hinge" axis="0 0 1" damping="0.05"/>
+      <!-- T stem: STEM_HALF[0]=0.025, STEM_HALF[1]=0.075, THICKNESS/2=0.020 -->
+      <geom type="box" name="t_stem" size="0.025 0.075 0.020"
           rgba="1 0.5 0 1" condim="3"
           friction="1 .03 .003" contype="2" conaffinity="1" solref="0.01 1"/>
-      <!-- T bar -->
-      <geom type="box" name="t_bar" size="0.0675 0.0225 0.0225" pos="0 0.0675 0"
+      <!-- T bar: CAP_HALF[0]=0.1, CAP_HALF[1]=0.025, pos y=CAP_CTR[1]=0.1 -->
+      <geom type="box" name="t_bar" size="0.1 0.025 0.020" pos="0 0.1 0"
           rgba="1 0.5 0 1" condim="3"
           friction="1 .03 .003" contype="2" conaffinity="1" solref="0.01 1"/>
       <site name="t_com" pos="0 0 0" size="0.004" rgba="0.1 0.9 0.1 0.6"/>
@@ -23,7 +26,7 @@
   <keyframe>
     <key name="home"
         qpos="0 -0.785398 0 -2.356194 0 1.570796 0.785398
-              0.50 0.00 0.03  1 0 0 0"/>
+              0.5 0.0 0.0"/>
   </keyframe>
 
 </mujoco>

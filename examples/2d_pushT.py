@@ -397,7 +397,7 @@ def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REP
 
         if method == 'mppi':
             total_costs = jnp.sum(costs, axis=1)
-            temperature = float(jnp.std(total_costs)) * MPPI_TEMPERATURE
+            temperature = float(jnp.std(jnp.where(jnp.isfinite(total_costs), total_costs, 0.0))) * MPPI_TEMPERATURE
             # mppi_update expects (num_knots, particles, action) / (num_knots, particles)
             theta, _ = mppi_update(theta, trajs.transpose(1, 0, 2), costs.T, max(temperature, 1e-6))
         elif method == 'cem':
@@ -415,7 +415,7 @@ def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REP
                 theta_i = theta._replace(u_stdev=float(sigmas.mean()))
                 trajs_i, costs_i = ctrl.run_sis(subkey_i, x, theta_i)
                 total_costs_i = jnp.sum(costs_i, axis=1)
-                temperature = float(jnp.std(total_costs_i)) * MPPI_TEMPERATURE
+                temperature = float(jnp.std(jnp.where(jnp.isfinite(total_costs_i), total_costs_i, 0.0))) * MPPI_TEMPERATURE
                 theta, _ = mppi_update(theta, trajs_i.transpose(1, 0, 2), costs_i.T, max(temperature, 1e-6))
         elif method == 'ps':
             theta, _ = ps_update(theta, trajs, costs)
@@ -526,11 +526,11 @@ def _build_scenario(seed: int, distance: float | None, n_obs_override: int | Non
 
     if distance is not None:
         half       = distance * T_WIDTH / 2.0
-        t_xy_0     = np.array([-half * 0.5, -half * 0.5])
+        t_xy_0     = np.array([-half + T_MARGIN, -half + T_MARGIN])
         t_angle_0  = rng.uniform(-np.pi, np.pi)
-        goal_xy    = np.array([ half * 0.5,  half * 0.5])
+        goal_xy    = np.array([ half - T_MARGIN,  half - T_MARGIN])
         goal_angle = rng.uniform(-np.pi, np.pi)
-        n_obs      = max(0, int(distance) - 2) if n_obs_override is None else n_obs_override
+        n_obs      = max(0, int(distance) - 3) if n_obs_override is None else n_obs_override
         if n_obs > 0:
             obstacles = _random_obstacles_arena(rng, n_obs, half,
                                                 size_lo=T_WIDTH * 0.3, size_hi=T_WIDTH * 0.8,
@@ -577,7 +577,7 @@ def _build_scenario(seed: int, distance: float | None, n_obs_override: int | Non
         t_ws_min, t_ws_max = ws_min, ws_max
 
     r_xy_0 = np.clip(t_xy_0 - np.array([0.12, 0.0]),
-                     WORKSPACE_MIN + 0.05, WORKSPACE_MAX - 0.05)
+                     ws_min + 0.05, ws_max - 0.05)
     x0 = jnp.array([
         t_xy_0[0], t_xy_0[1], t_angle_0,
         0.0, 0.0, 0.0,
@@ -619,6 +619,8 @@ def main():
                         help='Use fixed narrow-corridor obstacles (legacy default)')
     parser.add_argument('--n-obs', type=int, default=None,
                         help='Number of random obstacles (ignored with --corridor/--distance)')
+    parser.add_argument('--out', type=str, default=None,
+                        help='Write batch results as JSON to this path.')
     parser.add_argument('--distance', type=float, default=None,
                         help='Arena size as multiple of T-width. T fixed bottom-left, goal top-right.')
     parser.add_argument('--batch', type=int, default=None, metavar='N',
@@ -727,6 +729,10 @@ def main():
         rows = [[m, f"{sum(results[m])}/{args.batch}",
                  f"{100*sum(results[m])/args.batch:.1f}%"] for m, *_ in methods]
         print(tabulate(rows, headers=["Method", "Successes", "Rate"], tablefmt="rounded_outline"))
+        if args.out:
+            import json
+            with open(args.out, "w") as f:
+                json.dump({m: v for m, v in results.items()}, f)
         return
 
     x0, theta, ws_min, ws_max, n_replans = _build_scenario(

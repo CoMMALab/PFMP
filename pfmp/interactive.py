@@ -7,7 +7,7 @@ import mujoco.viewer
 import numpy as np
 from mujoco import mjx
 from pfmp.interpolate import Jet2, hermite_spline
-from pfmp.algorithm import ps_update
+from pfmp.algorithm import ps_update, ess
 from hydrax.utils.video import VideoRecorder
 from typing import Optional, Any
 
@@ -173,6 +173,9 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             if family == "pfmp":
                 (key, subkey) = jax.random.split(key)
                 (trajs, costs) = replan(subkey, mjx_data, theta)
+                total_costs = jnp.sum(costs, axis=1)
+                ess_val = ess(costs)
+                print(f"cost min={float(total_costs.min()):.3f} max={float(total_costs.max()):.3f} std={float(total_costs.std()):.3f}  ESS/K={float(ess_val):.3f}")
                 theta, _ = ps_update(theta, trajs, costs)
             else:
                 policy_params, rollouts = replan(mjx_data, policy_params)
@@ -195,6 +198,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                 us = np.asarray(interp(tq, tk, knots))[0]  # (ss, nu)
 
             # simulate the system between spline replanning steps
+            print(f"T qpos: {mj_data.qpos[7:10]}, mean[0]: {np.array(theta.mean[0])}")
             for i in range(sim_steps_per_replan):
                 step_start = time.time()
 

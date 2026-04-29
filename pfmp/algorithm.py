@@ -49,6 +49,19 @@ def get_field_info(x):
     raise TypeError(f"Unsupported state type: {type(x)}")
 
 # Predictive Sampling
+def ess(costs: jax.Array) -> jax.Array:
+    """Effective Sample Size normalised to [0, 1] from costs shaped (particles,) or (particles, horizon).
+
+    1.0 = uniform weights (maximum diversity).
+    1/N = fully degenerate (one particle dominates).
+    """
+    total = jnp.sum(costs, axis=1) if costs.ndim == 2 else costs
+    n = total.shape[0]
+    ws = jnp.exp(-(total - jnp.min(total)))
+    ps = ws / jnp.sum(ws)
+    return (1.0 / jnp.sum(ps ** 2)) / n
+
+
 def ps_update(theta: PyTree, trajs: jax.Array, costs: jax.Array):
     best_idx = jnp.argmin(jnp.sum(costs, axis=1))
     new_mean = jax.tree.map(lambda u: u[best_idx], trajs)

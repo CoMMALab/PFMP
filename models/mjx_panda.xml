@@ -111,8 +111,8 @@
     <mesh file="hand_2.obj"/>
     <mesh file="hand_3.obj"/>
     <mesh file="hand_4.obj"/>
-    <mesh file="finger_0.obj"/>
-    <mesh file="finger_1.obj"/>
+    <!-- <mesh file="finger_0.obj"/>
+    <mesh file="finger_1.obj"/> -->
   </asset>
 
   <worldbody>
@@ -214,30 +214,31 @@
                       <geom mesh="hand_2" material="black" class="visual"/>
                       <geom mesh="hand_3" material="white" class="visual"/>
                       <geom mesh="hand_4" material="off_white" class="visual"/>
-                      <geom mesh="hand_c" class="collision"/>
-                      <geom name="hand_capsule" type="capsule"
-                       class="collision" conaffinity="1" size="0.04 0.06"
-                       quat="1 1 0 0" pos="0 0 0.03"/>
                       <site name="gripper" pos="0 0 0.1"/>
-                      <body name="left_finger" pos="0 0 0.0584">
-                        <inertial mass="0.015" pos="0 0 0" diaginertia="2.375e-6 2.375e-6 7.5e-7"/>
-                        <geom mesh="finger_0" material="off_white" class="visual"/>
-                        <geom mesh="finger_1" material="black" class="visual"/>
-                        <geom mesh="finger_0" class="collision"/>
-                        <geom class="fingertip_pad_collision_1"/>
-                        <geom class="fingertip_pad_collision_2"/>
-                        <geom class="fingertip_pad_collision_3"/>
-                        <geom name="left_finger_pad" class="fingertip_pad_collision_4"/>
-                      </body>
-                      <body name="right_finger" pos="0 0 0.0584" quat="0 0 0 1">
-                        <inertial mass="0.015" pos="0 0 0" diaginertia="2.375e-6 2.375e-6 7.5e-7"/>
-                        <geom mesh="finger_0" material="off_white" class="visual"/>
-                        <geom mesh="finger_1" material="black" class="visual"/>
-                        <geom mesh="finger_0" class="collision"/>
-                        <geom class="fingertip_pad_collision_1"/>
-                        <geom class="fingertip_pad_collision_2"/>
-                        <geom class="fingertip_pad_collision_3"/>
-                        <geom name="right_finger_pad" class="fingertip_pad_collision_4"/>
+                      <body name="push_cylinder" pos="0 0 0.065">
+                        <!-- visual -->
+                        <geom name="push_cylinder_visual"
+                              type="cylinder"
+                              group="0"
+                              size="0.004 0.04125"
+                              pos="0 0 0.04125"
+                              rgba="0.9 0.9 0.9 1"
+                              contype="0"
+                              conaffinity="0"/>
+
+                        <!-- collision: capsule (MJX supports capsule-box, not cylinder-box) -->
+                        <geom name="push_cylinder_collision"
+                              type="capsule"
+                              group="4"
+                              size="0.004 0.04125"
+                              pos="0 0 0.04125"
+                              rgba="1 0 0 0.35"
+                              contype="1"
+                              conaffinity="1"
+                              condim="3"
+                              solimp="0.75 0.9 0.001"
+                              solref="0.05 1"
+                              friction="0.2 0.001 0.0001"/>
                       </body>
                     </body>
                   </body>

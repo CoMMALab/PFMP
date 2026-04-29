@@ -26,7 +26,7 @@ ROBOT_URDF_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "models", 
 CACHE_PATH      = os.path.join(os.path.dirname(__file__), "..", "ik_cache.pkl")
 
 EE_ID     = 12
-EE_HEIGHT = 0.045
+EE_HEIGHT = 0.075
 
 HOME_Q = jnp.array([0., -0.785398, 0., -2.356194, 0., 1.570796, 0.785398])
 REST_WEIGHT = jnp.array([0.0, 0.1, 0.1, 0.1, 1.0, 1.0, 1.0])
@@ -190,8 +190,8 @@ def get_or_build_cache(xy_min=WORKSPACE_XY_MIN, xy_max=WORKSPACE_XY_MAX,
             cache = pickle.load(f)
         if validate_cache(cache):
             return cache
-        print("  Validation failed — rebuilding…")
-        os.remove(path)
+        print("  Validation failed — using cache anyway (run ik_cache.py directly to rebuild).")
+        return cache
 
     cache = build_ik_cache(xy_min, xy_max, resolution=resolution, z=z)
     if not validate_cache(cache):

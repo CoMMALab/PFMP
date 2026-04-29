@@ -1,8 +1,6 @@
 """
 T-block pushing task using PFMP with Panda robot.
 
-Refactored to use the new PFMP API with Jet2 controls and cached IK.
-
 Real world workspace is 53' 1/8" x 23' 1/4"
 """
 
@@ -16,8 +14,11 @@ import mujoco
 import numpy as np
 from mujoco import mjx
 
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from geom_tee import STEM_HALF, CAP_HALF, CAP_CTR
+
 import pfmp
-from pfmp.interpolate import Jet2
 
 from ik_cache import (
     IKCache, ik_from_cache, get_or_build_cache,
@@ -28,7 +29,7 @@ from ik_cache import (
 # Configuration
 # ===============================
 
-SCENE_XML_PATH = os.path.expanduser("~/src/PFMP/models/mjx_t_push.xml")
+SCENE_XML_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "models", "mjx_t_push.xml")
 
 # T-block qpos offset in the MuJoCo state
 T_QPOS_OFFSET = 7
@@ -49,7 +50,7 @@ class PushParams(NamedTuple):
     pos_weight: float
     angle_weight: float
     u_stdev: float
-    du_stdev: float
+    gripper_site_id: int
 
 
 # ===============================
@@ -58,32 +59,19 @@ class PushParams(NamedTuple):
 
 
 @jax.jit
-def quat_yaw_wxyz(q: jax.Array) -> jax.Array:
-    """Extract yaw angle from quaternion (w, x, y, z)."""
-    w, x, y, z = q
-    siny_cosp = 2.0 * (w * z + x * y)
-    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-    return jnp.arctan2(siny_cosp, cosy_cosp)
-
-
 @jax.jit
 def angle_wrap(a: jax.Array) -> jax.Array:
-    """Wrap angle to (-pi, pi]."""
     return (a + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
 
 
 @jax.jit
 def compute_error(th: PushParams, t_qpos: jax.Array) -> jax.Array:
-    """Compute position and angle error for T-block."""
-    t_xy = t_qpos[:2]
-    t_quat = t_qpos[3:7]
-    t_yaw = quat_yaw_wxyz(t_quat)
-
-    x_err = t_xy[0] - th.goal_xy[0]
-    y_err = t_xy[1] - th.goal_xy[1]
-    ang_err = angle_wrap(t_yaw - th.goal_angle)
-
-    return jnp.array([x_err, y_err, ang_err])
+    """Compute [x_err, y_err, yaw_err] for T-block. t_qpos = [x, y, yaw]."""
+    return jnp.array([
+        t_qpos[0] - th.goal_xy[0],
+        t_qpos[1] - th.goal_xy[1],
+        angle_wrap(t_qpos[2] - th.goal_angle),
+    ])
 
 
 # ===============================
@@ -91,65 +79,59 @@ def compute_error(th: PushParams, t_qpos: jax.Array) -> jax.Array:
 # ===============================
 
 
-def dynamics(x: mjx.Data, u: Jet2, th: PushParams, t: float) -> Tuple[mjx.Data, jax.Array]:
-    """
-    Dynamics function for the pushing task.
-
-    Uses cached IK for fast lookup.
-    """
-    # Extract target position from Jet2
-    target_xy = u.u  # (2,) array
-
-    # Fast IK lookup from cache
-    target_qpos = ik_from_cache(target_xy, th)
-
-    # Step simulation with computed joint targets
-    x_next = mjx.step(th.mjx_model, x.replace(ctrl=target_qpos))
-
-    return x_next, target_xy
+PROPOSAL_MIX   = 0.5   # probability of directed (vs random local) sample
+STEP_LEN_VEL   = 0.05  # step size toward T per knot (m)
+PUSH_OVERSHOOT = 1.0   # multiplier on step toward T centroid
 
 
-def running_cost(x: mjx.Data, u: Jet2, th: PushParams, t: float) -> jax.Array:
-    """Running cost penalizing distance from goal."""
-    t_qpos = x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 7]
-    error = compute_error(th, t_qpos)
+def dynamics(x: mjx.Data, u: jax.Array, th: PushParams, t: float) -> Tuple[mjx.Data, jax.Array]:
+    """Step MuJoCo with IK-resolved joint targets for the given EE waypoint."""
+    target_qpos = ik_from_cache(u, th.ik_cache)
+    ctrl = x.ctrl.at[:7].set(target_qpos)
+    x_next = mjx.step(th.mjx_model, x.replace(ctrl=ctrl))
+    return x_next, u
 
-    pos_cost = th.pos_weight * (error[0] ** 2 + error[1] ** 2)
-    angle_cost = th.angle_weight * error[2] ** 2
 
-    return pos_cost + angle_cost
+def running_cost(x: mjx.Data, u: jax.Array, th: PushParams, t: float) -> jax.Array:
+    t_qpos    = x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 3]
+    error     = compute_error(th, t_qpos)
+    err_pos   = jnp.linalg.norm(error[:2])
+    err_angle = jnp.abs(error[2])
+    aw = th.angle_weight * jnp.clip(1.0 - err_pos / 0.25, 0.0, 1.0)
+    return th.pos_weight * err_pos ** 2 + aw * err_angle ** 2
 
 
 def terminal_cost(x: mjx.Data, th: PushParams) -> jax.Array:
-    """Terminal cost for final state."""
-    t_qpos = x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 7]
-    error = compute_error(th, t_qpos)
-
-    pos_cost = 10.0 * th.pos_weight * (error[0] ** 2 + error[1] ** 2)
-    angle_cost = 10.0 * th.angle_weight * error[2] ** 2
-
-    return pos_cost + angle_cost
+    t_qpos    = x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 3]
+    error     = compute_error(th, t_qpos)
+    err_pos   = jnp.linalg.norm(error[:2])
+    err_angle = jnp.abs(error[2])
+    aw = th.angle_weight * jnp.clip(1.0 - err_pos / 0.25, 0.0, 1.0)
+    return 10.0 * (th.pos_weight * err_pos + aw * err_angle)
 
 
-def init_control(key: jax.Array, x: mjx.Data, th: PushParams) -> Jet2:
-    """Initialize control near current T-block position."""
-    key1, key2 = jax.random.split(key)
-
-    t_xy = x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 2]
-    u = t_xy + jax.random.normal(key1, (2,)) * th.u_stdev
-    du = jax.random.normal(key2, (2,)) * th.du_stdev
-
-    return Jet2(u=u, du=du)
+def init_control(key: jax.Array, _x: mjx.Data, th: PushParams) -> jax.Array:
+    """Initialize at current EE position (from warm-started mean) with small noise."""
+    r_xy = th.mean[0]
+    return r_xy + jax.random.normal(key, (2,)) * th.u_stdev * 0.1
 
 
-def proposal(key: jax.Array, x: mjx.Data, u: Jet2, th: PushParams, t: float) -> Jet2:
-    """Proposal distribution for control sampling."""
-    key1, key2 = jax.random.split(key)
+def proposal(key: jax.Array, x: mjx.Data, u: jax.Array, th: PushParams, t: float) -> jax.Array:
+    """Mixture: directed toward T centroid (50%) or random walk from current u (50%).
+    Near the goal, noise is reduced to let the plan stabilize.
+    """
+    key_mix, key_a, key_b = jax.random.split(key, 3)
+    t_xy      = x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 2]
 
-    u_next = u.u + jax.random.normal(key1, (2,)) * th.u_stdev
-    du_next = u.du + jax.random.normal(key2, (2,)) * th.du_stdev
+    # err_pos = jnp.linalg.norm(t_xy - th.goal_xy)
+    # stdev = th.u_stdev * jnp.where(err_pos < 0.05, 0.2, 1.0)
 
-    return Jet2(u=u_next, du=du_next)
+    direction = t_xy - u
+    dist      = jnp.linalg.norm(direction) + 1e-7
+    directed  = u + (direction / dist) * (jnp.minimum(dist, STEP_LEN_VEL) * PUSH_OVERSHOOT)
+    directed  = directed + jax.random.normal(key_a, (2,)) * th.u_stdev
+    random_loc = u + jax.random.normal(key_b, (2,)) * th.u_stdev * 2.0
+    return jnp.where(jax.random.uniform(key_mix) < PROPOSAL_MIX, directed, random_loc)
 
 
 # ===============================
@@ -169,9 +151,9 @@ def add_goal_T(
     if user_scn.ngeom + 2 > user_scn.maxgeom:
         return
 
-    stem_half = np.array([0.0225, 0.0675, thickness], dtype=float)
-    bar_half = np.array([0.0675, 0.0225, thickness], dtype=float)
-    bar_off_y = 0.0675
+    stem_half = np.array([STEM_HALF[0], STEM_HALF[1], thickness], dtype=float)
+    bar_half  = np.array([CAP_HALF[0],  CAP_HALF[1],  thickness], dtype=float)
+    bar_off_y = float(CAP_CTR[1])
 
     x, y = np.asarray(goal_xy, dtype=float)
     pos_world = np.array([x, y, float(z_shadow)], dtype=float)
@@ -209,6 +191,9 @@ def load_scene(xml_path: str):
     if key_id >= 0:
         mujoco.mj_resetDataKeyframe(mj_model, mj_data, key_id)
 
+    print(f"Loading model from: {xml_path}")
+    cyl_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_GEOM, "push_cylinder_visual")
+    print(f"push_cylinder_visual geom id: {cyl_id} (−1 = not found)")
     return mj_model, mj_data
 
 
@@ -231,33 +216,44 @@ def main():
         xy_max=WORKSPACE_XY_MAX,
         resolution=args.cache_resolution,
         z=EE_HEIGHT,
-        verbose=True
     )
 
     # Task configuration
-    horizon = 4.0
+    horizon = 6.0
     num_knots = 8
     particles = 4096
 
-    # Create parameters
-    theta = PushParams(
-        mean=jnp.zeros((num_knots, 2)),
-        mjx_model=mjx.put_model(mj_model),
-        ik_cache=ik_cache,
-        goal_xy=jnp.array([0.35, 0.15]),
-        goal_angle=np.pi/3,
-        pos_weight=3.0,
-        angle_weight=0.5,
-        u_stdev=0.05,
-        du_stdev=0.1,
-    )
-
     # Initial end-effector position
     init_xy = jnp.array([0.5, -0.2])
-
-    # Get initial joint config from cache
-    q0 = ik_from_cache(init_xy, theta)
+    q0 = ik_from_cache(init_xy, ik_cache)
     mj_data.qpos[:7] = np.array(q0)
+
+    # Initialize mean trajectory: linear interp from EE to T-block position.
+    gripper_site_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_SITE, "gripper")
+    mujoco.mj_fwdPosition(mj_model, mj_data)
+    r_xy = jnp.array(mj_data.site_xpos[gripper_site_id, :2])
+
+    t_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, "t_block")
+    t_world_xy = mj_data.xpos[t_id, :2]
+    t_qpos_xy  = mj_data.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 2]
+    print(f"T world xy (xpos):  {t_world_xy}")
+    print(f"T qpos[7:9]:        {t_qpos_xy}")
+    t_xy = jnp.array(mj_data.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 2])
+    alphas = jnp.linspace(0.0, 1.0, num_knots)
+    init_mean = (1.0 - alphas[:, None]) * r_xy + alphas[:, None] * t_xy
+
+    # Create parameters
+    theta = PushParams(
+        mean=init_mean,
+        mjx_model=mjx.put_model(mj_model),
+        ik_cache=ik_cache,
+        goal_xy=jnp.array([0.45, 0.15]),
+        goal_angle=4*np.pi/3,
+        pos_weight=15.0,
+        angle_weight=1.5,
+        u_stdev=0.025,
+        gripper_site_id=gripper_site_id,
+    )
 
     # Create PFMP controller
     ctrl = pfmp.PFMP(
@@ -273,9 +269,23 @@ def main():
         ess_resample_thresh=0.5,
     )
 
+    z_traj = float(EE_HEIGHT)
+    traj_rgba = np.array([1.0, 0.5, 0.0, 1.0], dtype=np.float32)
+
     def goal_marker_callback(user_scn, theta):
         add_goal_T(user_scn, np.array(theta.goal_xy), float(theta.goal_angle),
                 rgba=(0.2, 0.8, 0.2, 0.5))
+        # Draw planned EE trajectory as orange line segments between knots.
+        knots = np.array(theta.mean)  # (num_knots, 2)
+        for k in range(len(knots) - 1):
+            if user_scn.ngeom >= user_scn.maxgeom:
+                break
+            p0 = np.array([knots[k, 0],   knots[k, 1],   z_traj], dtype=np.float64)
+            p1 = np.array([knots[k+1, 0], knots[k+1, 1], z_traj], dtype=np.float64)
+            geom = user_scn.geoms[user_scn.ngeom]
+            mujoco.mjv_connector(geom, mujoco.mjtGeom.mjGEOM_LINE, 2.0, p0, p1)
+            geom.rgba[:] = traj_rgba
+            user_scn.ngeom += 1
 
     # Run interactive simulation
     pfmp.run_interactive(
@@ -283,8 +293,8 @@ def main():
         theta,
         mj_model,
         mj_data,
-        ik_interp=ik_from_cache,
-        frequency=0.5,
+        ik_interp=lambda target, theta, mjx_data: ik_from_cache(target, ik_cache),
+        frequency=0.25,
         method=args.algorithm,
         fixed_camera_id=None,
         record_video=False,
