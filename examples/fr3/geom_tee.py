@@ -75,12 +75,12 @@ VERTS_LOCAL = np.array([
 ], dtype=np.float32)
 
 # AprilTag: outer border top edge is 4cm below the top of the T cap.
-TEE_TAG_SIZE_M = 0.0445
+TEE_TAG_SIZE_M = 0.0415
 _cap_top_y = float(_cc[1] + _ch[1])
 TAG_IN_BODY = np.array([
     [1, 0, 0, 0.0                                    ],
-    [0, 1, 0, _cap_top_y - 0.04 - TEE_TAG_SIZE_M / 2],
-    [0, 0, 1, THICKNESS                              ],
+    [0, 1, 0, _cap_top_y - 0.04 - TEE_TAG_SIZE_M / 2 ],
+    [0, 0, 1, THICKNESS/2                            ],
     [0, 0, 0, 1.0                                    ],
 ], dtype=np.float64)
 
@@ -150,8 +150,26 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     fig = plt.figure()
     ax  = fig.add_subplot(111, projection="3d")
-    plot_wireframe(ax, np.array([0.0, 0.0]), 0.0, z=-THICKNESS / 2)
+    t_angle = 0.5
+    plot_wireframe(ax, np.array([0.0, 0.0]), t_angle, z=-THICKNESS / 2)
+
+    # Draw body frame axes at origin (rotated by yaw)
+    c, s = np.cos(t_angle), np.sin(t_angle)
+    Ryaw = np.array([[c,-s,0],[s,c,0],[0,0,1]], dtype=float)
+    ax.quiver(0,0,0, *(Ryaw[:,0]*0.05), color='r', label='body x')
+    ax.quiver(0,0,0, *(Ryaw[:,1]*0.05), color='g', label='body y')
+    ax.quiver(0,0,0, *(Ryaw[:,2]*0.05), color='b', label='body z')
+
+    # Draw tag frame axes rotated by yaw
+    tag_pos_w = Ryaw @ TAG_IN_BODY[:3, 3]
+    tag_R_w   = Ryaw @ TAG_IN_BODY[:3, :3]
+    ax.quiver(*tag_pos_w, *tag_R_w[:, 0]*0.03, color='r', linestyle='dashed')
+    ax.quiver(*tag_pos_w, *tag_R_w[:, 1]*0.03, color='g', linestyle='dashed')
+    ax.quiver(*tag_pos_w, *tag_R_w[:, 2]*0.03, color='b', linestyle='dashed')
+    ax.scatter(*tag_pos_w, color='k', s=20, label='tag origin')
+
     ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
+    ax.legend(fontsize=7)
     lim = 0.15
     ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim); ax.set_zlim(-lim, lim)
     ax.set_box_aspect([1, 1, 1])
