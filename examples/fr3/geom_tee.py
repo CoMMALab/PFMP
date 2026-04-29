@@ -15,7 +15,7 @@ from pathlib import Path
 
 def _load_dims():
     import trimesh
-    stl_path = Path(__file__).parent.parent.parent / "models" / "T.stl"
+    stl_path = Path(__file__).resolve().parent.parent.parent / "models" / "T.stl"
     mesh = trimesh.load(str(stl_path))
 
     # Unique 2D footprint vertices from the mesh (mm)

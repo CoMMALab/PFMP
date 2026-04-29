@@ -32,7 +32,7 @@ SERIAL_NUMS: OrderedDict[str, str] = OrderedDict([
     # ("top", "234322070408"),  # old top camera
     # ("side",   "817512070808"),
     ("top",    "234322070341"),
-    ("corner", "234322070144"),
+    # ("corner", "234322070144"),
 ])
 SERIAL_NUMS_INV: OrderedDict[str, str] = OrderedDict((v, k) for k, v in SERIAL_NUMS.items())
 
