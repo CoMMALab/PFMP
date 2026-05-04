@@ -129,7 +129,8 @@ def main():
     # ── EKF init ──────────────────────────────────────────────────────────────
     ekf = EKF.init(wf)
 
-    q_prev = np.array(HOME_Q)
+    q_prev     = np.array(HOME_Q)
+    current_xy = np.array([0.5, -0.2])  # approximate home EE xy
 
     print("\nLoop running. Commands: xy <x> <y>  |  q (quit)")
     import cv2
@@ -140,9 +141,9 @@ def main():
                 wf, pipe, K_top, dist_top, serial_top, depth_scale, ekf
             )
 
-            print(f"[EKF] xy=({ekf.mean[0]:.3f}, {ekf.mean[1]:.3f})  "
-                  f"yaw={np.degrees(ekf.mean[2]):.1f}°  "
-                  f"sigma_xy=({np.sqrt(ekf.cov[0,0]):.3f}, {np.sqrt(ekf.cov[1,1]):.3f})")
+            # print(f"[EKF] xy=({ekf.mean[0]:.3f}, {ekf.mean[1]:.3f})  "
+            #       f"yaw={np.degrees(ekf.mean[2]):.1f}°  "
+            #       f"sigma_xy=({np.sqrt(ekf.cov[0,0]):.3f}, {np.sqrt(ekf.cov[1,1]):.3f})")
 
             overlay = color.copy()
             overlay[mask] = (overlay[mask] * 0.5 + np.array([0, 255, 0]) * 0.5).astype(np.uint8)
@@ -157,20 +158,33 @@ def main():
                 line = sys.stdin.readline().strip()
                 parts = line.split()
                 if parts and parts[0] == "xy" and len(parts) == 3:
-                    target_xy = np.array([float(parts[1]), float(parts[2])])
                     import jax.numpy as jnp
-                    target_q = np.array(ik_from_cache(jnp.array(target_xy), ik_cache))
-                    if robot is not None and check_jump(q_prev, target_q):
-                        robot.move(franky.JointMotion(target_q.tolist()))
-                        q_prev = target_q
-                        print(f"Moved to xy={target_xy}")
+                    target_xy = np.array([float(parts[1]), float(parts[2])])
+                    dist = np.linalg.norm(target_xy - current_xy)
+                    n_pts = max(2, int(np.ceil(dist / 0.03)))  # one point per 3cm
+                    waypoints_xy = [
+                        current_xy + (target_xy - current_xy) * t
+                        for t in np.linspace(0, 1, n_pts)[1:]  # skip start
+                    ]
+                    qs = [np.array(ik_from_cache(jnp.array(xy), ik_cache)) for xy in waypoints_xy]
+                    if robot is not None:
+                        robot.move(franky.JointWaypointMotion(
+                            [franky.JointWaypoint(q.tolist()) for q in qs]
+                        ))
+                        q_prev     = qs[-1]
+                        current_xy = target_xy
+                        print(f"Moved to xy={target_xy} via {n_pts-1} waypoints")
 
     finally:
         pipe.stop()
         cv2.destroyAllWindows()
         if robot is not None:
-            robot.move(franky.JointMotion(HOME_Q.tolist()))
-            print("Returned to home.")
+            try:
+                robot.recover_from_errors()
+                robot.move(franky.JointMotion(HOME_Q.tolist()))
+                print("Returned to home.")
+            except Exception as e:
+                print(f"[WARN] could not return to home: {e}")
 
 
 if __name__ == "__main__":
