@@ -8,7 +8,7 @@ import time
 import numpy as np
 import zmq
 
-from protocol import Command, decode_json, encode_json
+from .protocol import Command, decode_json, encode_json
 
 
 DEFAULT_COMMAND_ADDR = "tcp://localhost:5555"

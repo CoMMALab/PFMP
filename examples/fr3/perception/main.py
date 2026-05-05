@@ -73,8 +73,6 @@ def init_acquisition(
         body_z=THICKNESS / 2,
         dx=0.08,
         dy=0.08,
-        dyaw=np.pi,
-        nyaw=100,
     )
 
     if best_iou < 0.20:

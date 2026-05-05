@@ -27,6 +27,7 @@ dependencies = [
     "pyrealsense2",
     "opencv-python",
     "fire",
+    "meshcat",
 ]
 
 [tool.setuptools.packages.find]

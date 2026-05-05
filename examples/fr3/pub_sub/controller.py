@@ -8,7 +8,7 @@ from typing import Any, Sequence
 import numpy as np
 import zmq
 
-from protocol import Response, TeeBelief, Command, decode_json, encode_json
+from .protocol import Response, TeeBelief, Command, decode_json, encode_json
 
 
 class ControllerEndpoint:
