@@ -59,7 +59,6 @@ class PushParams(NamedTuple):
 
 
 @jax.jit
-@jax.jit
 def angle_wrap(a: jax.Array) -> jax.Array:
     return (a + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
 
@@ -196,6 +195,9 @@ def load_scene(xml_path: str):
     print(f"push_cylinder_visual geom id: {cyl_id} (−1 = not found)")
     return mj_model, mj_data
 
+def realtime():
+    pass
+
 
 def main():
     parser = argparse.ArgumentParser(description="T-block pushing with PFMP")
@@ -204,6 +206,7 @@ def main():
     subparsers = parser.add_subparsers(dest="algorithm", required=True)
     subparsers.add_parser("ps", help="Predictive Sampling (Sequential Importance Sampling)")
     subparsers.add_parser("sir", help="Sequential Importance Resampling")
+    subparsers.add_parser("realtime", help="Server Run")
     args = parser.parse_args()
 
     # Load scene
@@ -287,21 +290,24 @@ def main():
             geom.rgba[:] = traj_rgba
             user_scn.ngeom += 1
 
-    # Run interactive simulation
-    pfmp.run_interactive(
-        ctrl,
-        theta,
-        mj_model,
-        mj_data,
-        ik_interp=lambda target, theta, mjx_data: ik_from_cache(target, ik_cache),
-        frequency=0.25,
-        method=args.algorithm,
-        fixed_camera_id=None,
-        record_video=False,
-        record_traj=False,
-        max_step=8000,
-        goal_marker_fn=goal_marker_callback
-    )
+    if args.realtime:
+        pass
+    else:
+        # Run interactive simulation
+        pfmp.run_interactive(
+            ctrl,
+            theta,
+            mj_model,
+            mj_data,
+            ik_interp=lambda target, theta, mjx_data: ik_from_cache(target, ik_cache),
+            frequency=0.25,
+            method=args.algorithm,
+            fixed_camera_id=None,
+            record_video=False,
+            record_traj=False,
+            max_step=8000,
+            goal_marker_fn=goal_marker_callback
+        )
 
 
 if __name__ == "__main__":
