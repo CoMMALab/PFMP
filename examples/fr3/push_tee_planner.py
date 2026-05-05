@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from geom_tee import STEM_HALF, CAP_HALF, CAP_CTR
 
 import pfmp
+from pfmp.run_batch import Trajectory
 
 from ik_cache import (
     IKCache, ik_from_cache, get_or_build_cache,
@@ -195,9 +196,31 @@ def load_scene(xml_path: str):
     print(f"push_cylinder_visual geom id: {cyl_id} (−1 = not found)")
     return mj_model, mj_data
 
-def realtime():
+class Trajectory(NamedTuple):
+    qpos: np.ndarray  # (T, nq)
+    qvel: np.ndarray  # (T, nv)
+
+def simulate(
+    init_belief,
+    commands: list[Command],
+    push_params: PushParams,
+    interactive: bool = True
+) -> Trajectory:
     pass
 
+def debug_realtime(commands: list[Command], push_params: PushParams) -> Response:
+    # 1. setup planner client and controller endpoint
+    planner = PlannerClient(...)
+    controller = ControlEndpoint(...)
+
+    # 2. obtain EKF belief state from the controller endpoint
+    init_belief = None
+    # 3. initialize Mujoco with the EKF estimate
+    trajectory = simulate(init_belief, commands, push_params)
+
+    planner.send(commands)  # check actual API
+    res = controller.recv_response()
+    return trajectory, res
 
 def main():
     parser = argparse.ArgumentParser(description="T-block pushing with PFMP")
@@ -290,8 +313,9 @@ def main():
             geom.rgba[:] = traj_rgba
             user_scn.ngeom += 1
 
-    if args.realtime:
-        pass
+    if args.debug_realtime:
+        trajectory, res = debug_realtime()
+        # TODO: analysis on trajectory, res
     else:
         # Run interactive simulation
         pfmp.run_interactive(
