@@ -5,10 +5,27 @@ from camera import WorldFrame, SERIAL_NUMS
 
 def project(verts_w, body_z, T_w2c, K):
     """Project (N, 2) world xy verts at body_z into image pixel coords (N, 2) int."""
-    import cv2
-    pts3d = np.column_stack([verts_w, np.full(len(verts_w), body_z), np.ones(len(verts_w))])
+    fx = K[0, 0]
+    fy = K[1, 1]
+    cx = K[0, 2]
+    cy = K[1, 2]
+
+    pts3d = np.column_stack([
+        verts_w,
+        np.full(len(verts_w), body_z),
+        np.ones(len(verts_w)),
+    ])
+
     pts_cam = (T_w2c @ pts3d.T).T[:, :3]
-    px = pts_cam[:, :2] / pts_cam[:, 2:3] * np.array([K[0,0], K[1,1]]) + np.array([K[0,2], K[1,2]])
+
+    x = pts_cam[:, 0]
+    y = pts_cam[:, 1]
+    z = pts_cam[:, 2]
+
+    u = fx * (x / z) + cx
+    v = fy * (y / z) + cy
+
+    px = np.column_stack([u, v])
     return px.astype(np.int32)
 
 

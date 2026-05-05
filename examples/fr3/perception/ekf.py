@@ -85,7 +85,6 @@ class EKF(NamedTuple):
 
         mean_new = self.mean + K @ innov
         mean_new[2] = (mean_new[2] + np.pi) % (2 * np.pi) - np.pi
-        print(mean_new)
 
         I = np.eye(3)
         cov_new = (I - K) @ self.cov @ (I - K).T + K @ R @ K.T
