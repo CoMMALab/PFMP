@@ -20,6 +20,9 @@ from geom_tee import STEM_HALF, CAP_HALF, CAP_CTR
 
 import pfmp
 from pfmp.run_batch import Trajectory
+from pub_sub.protocol import Command, Response, TeeBelief
+from pub_sub.controller import ControllerEndpoint
+from pub_sub.planner import PlannerClient
 
 from ik_cache import (
     IKCache, ik_from_cache, get_or_build_cache,
@@ -201,22 +204,32 @@ class Trajectory(NamedTuple):
     qvel: np.ndarray  # (T, nv)
 
 def simulate(
-    init_belief,
+    init_belief: TeeBelief,
     commands: list[Command],
     push_params: PushParams,
+    steps_per_knot: int,
     interactive: bool = True
 ) -> Trajectory:
     pass
 
-def debug_realtime(commands: list[Command], push_params: PushParams) -> Response:
+def debug_realtime(
+    horizon: float,
+    commands: list[Command],
+    push_params: PushParams,
+    dt: float = 0.01
+) -> Response:
+    num_knots = len(commands)
+    step_len = horizon / (num_knots - 1)
+    steps_per_knot = int(step_len / dt)
+
     # 1. setup planner client and controller endpoint
     planner = PlannerClient(...)
-    controller = ControlEndpoint(...)
+    controller = ControllerEndpoint(...)
 
     # 2. obtain EKF belief state from the controller endpoint
     init_belief = None
     # 3. initialize Mujoco with the EKF estimate
-    trajectory = simulate(init_belief, commands, push_params)
+    trajectory = simulate(init_belief, commands, push_params, steps_per_knot)
 
     planner.send(commands)  # check actual API
     res = controller.recv_response()
