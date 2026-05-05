@@ -31,10 +31,10 @@ def plot_worldframe(wf: WorldFrame, ps: Optional[np.ndarray] = None, viz_tool: s
 
     def draw_vec(T, label, color, axis_scale=0.05):
         pos = T[:3, 3]
-        ax.quiver(0, 0, 0, *pos, color=color, normalize=False)
-        ax.text(*pos, label, fontsize=8)
+        ax.quiver(0, 0, 0, *pos, color=color, normalize=False, linewidth=2)
+        ax.text(*pos, label, fontsize=9, fontweight='bold')
         for i, c in enumerate(["r", "g", "b"]):
-            ax.quiver(*pos, *T[:3, i], color=c, length=axis_scale, normalize=False)
+            ax.quiver(*pos, *T[:3, i], color=c, length=axis_scale, normalize=False, linewidth=2)
 
     colors = ["r", "g", "b", "c", "m", "y"]
     ax.scatter([0], [0], [0], c="k", s=40)

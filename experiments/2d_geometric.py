@@ -113,9 +113,9 @@ def proposal(key, _x, _u, theta: Params, t):
 # =============================================================================
 
 BASELINE_COLORS = {
-    'ps':   ('crimson',    'indianred',      r'$\mathrm{argmax}$'),
-    'mppi': ('royalblue',  'cornflowerblue', r'$\mathbb{E}$'),
-    'cem':  ('darkorange', 'sandybrown',     r'$\mathbb{E}_\mathrm{elite}$'),
+    'ps':   ('crimson',    'indianred',      r"PS"),
+    'mppi': ('royalblue',  'cornflowerblue', r"MPPI"),
+    'cem':  ('darkorange', 'sandybrown',     r"CEM"),
 }
 NUM_CLOUD = 30   # particle paths shown per baseline per frame
 NUM_OUTER = 15   # default outer optimization iterations

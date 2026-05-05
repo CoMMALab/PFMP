@@ -352,67 +352,172 @@ def visualize_keypoints(keypoints: dict, reproj_keypoints: dict, color_images: d
         pass
     cv2.destroyWindow("Calibration Keypoints: detected (green) + reprojected")
 
+def set_thick_triad(vis_node, scale=0.12, thickness=0.008):
+    """
+    Draw a thick coordinate triad in meshcat using axis-aligned boxes.
+
+    X = red
+    Y = green
+    Z = blue
+
+    This avoids Cone/Sphere geometry and keeps the axes exactly aligned
+    with the parent frame.
+    """
+    import numpy as np
+    import meshcat.geometry as g
+
+    L = float(scale)
+    t = float(thickness)
+
+    axes = {
+        "x": {
+            "size": [L, t, t],
+            "pos": [L / 2.0, 0.0, 0.0],
+            "color": 0xff0000,
+        },
+        "y": {
+            "size": [t, L, t],
+            "pos": [0.0, L / 2.0, 0.0],
+            "color": 0x00cc00,
+        },
+        "z": {
+            "size": [t, t, L],
+            "pos": [0.0, 0.0, L / 2.0],
+            "color": 0x0000ff,
+        },
+    }
+
+    for axis, spec in axes.items():
+        T = np.eye(4)
+        T[:3, 3] = spec["pos"]
+
+        vis_node[axis].set_object(
+            g.Box(spec["size"]),
+            g.MeshLambertMaterial(color=spec["color"]),
+        )
+        vis_node[axis].set_transform(T)
+
+
 def visualize_planes_meshcat(wf: WorldFrame, planes: dict):
     """Show camera frames and fitted table planes in meshcat."""
+    import numpy as np
+    import meshcat
+    import meshcat.geometry as g
+
     vis = meshcat.Visualizer()
     print(f"[CALIB] meshcat: {vis.url()}")
 
-    cam_colors = {"top": 0xff0000, "corner": 0x00cc00, "side": 0x0000ff}
-    cam_to_t = {SERIAL_NUMS_INV.get(s, s): T for s, T in wf.t_cams.items()}
+    cam_colors = {
+        "top": 0xff0000,
+        "corner": 0x00cc00,
+        "side": 0x0000ff,
+    }
+
+    cam_to_t = {
+        SERIAL_NUMS_INV.get(s, s): T
+        for s, T in wf.t_cams.items()
+    }
+
     print("[CALIB] meshcat color legend:")
     print("  red   = top")
     print("  green = corner")
     print("  blue  = side")
+    print("  triad axes: X = red, Y = green, Z = blue")
 
+    # Camera coordinate frames
     for cam, T in cam_to_t.items():
-        vis[f"cam/{cam}"].set_object(
-            g.triad(scale=0.05),
+        set_thick_triad(
+            vis[f"cam/{cam}"],
+            scale=0.10,
         )
         vis[f"cam/{cam}"].set_transform(T)
 
-    # Table frame (T_ARUCO)
-    vis["aruco"].set_object(g.triad(scale=0.1))
+    # Table / ArUco frame
+    set_thick_triad(
+        vis["aruco"],
+        scale=0.14,
+    )
     vis["aruco"].set_transform(wf.t_aruco)
 
-    # Per camera: fitted plane patch + point cloud (inliers bright, outliers dim).
+    # Per camera: fitted plane patch + point cloud
     for serial, (normal_cam, d_cam, pts_cam, inlier_mask) in planes.items():
         cam = SERIAL_NUMS_INV.get(serial, serial)
         T_cam = wf.t_cams[serial]
+
         hex_color = cam_colors.get(cam, 0x888888)
-        rgb_bright = np.array([(hex_color >> 16) & 0xff,
-                                (hex_color >>  8) & 0xff,
-                                 hex_color        & 0xff], dtype=np.float32) / 255.0
+
+        rgb_bright = np.array([
+            (hex_color >> 16) & 0xff,
+            (hex_color >> 8) & 0xff,
+            hex_color & 0xff,
+        ], dtype=np.float32) / 255.0
+
         rgb_dim = rgb_bright * 0.3
 
         # Transform points to world frame
-        pts_h = np.column_stack([pts_cam, np.ones(len(pts_cam))])
+        pts_h = np.column_stack([
+            pts_cam,
+            np.ones(len(pts_cam)),
+        ])
         pts_world = (T_cam @ pts_h.T).T[:, :3].astype(np.float32)
 
-        # Centre patch on inlier centroid — shows true position disagreement between cameras
+        # Centre patch on inlier centroid —
+        # shows true position disagreement between cameras.
         centre_world = pts_world[inlier_mask].mean(axis=0)
 
-        colors = np.where(inlier_mask[:, None], rgb_bright, rgb_dim).astype(np.float32)
+        colors = np.where(
+            inlier_mask[:, None],
+            rgb_bright,
+            rgb_dim,
+        ).astype(np.float32)
 
         # Subsample for meshcat performance
         if len(pts_world) > 20_000:
-            idx = np.random.default_rng(0).choice(len(pts_world), 20_000, replace=False)
-            pts_world, colors = pts_world[idx], colors[idx]
+            idx = np.random.default_rng(0).choice(
+                len(pts_world),
+                20_000,
+                replace=False,
+            )
+            pts_world = pts_world[idx]
+            colors = colors[idx]
 
-        vis[f"pts/{cam}"].set_object(g.PointCloud(pts_world.T, colors.T, size=0.003))
+        vis[f"pts/{cam}"].set_object(
+            g.PointCloud(
+                pts_world.T,
+                colors.T,
+                size=0.003,
+            )
+        )
+
         normal_world = T_cam[:3, :3] @ normal_cam
         normal_world /= np.linalg.norm(normal_world)
 
         z = normal_world
-        x = np.array([1.0, 0.0, 0.0]) if abs(z[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-        x -= x.dot(z) * z; x /= np.linalg.norm(x)
+
+        x = (
+            np.array([1.0, 0.0, 0.0])
+            if abs(z[0]) < 0.9
+            else np.array([0.0, 1.0, 0.0])
+        )
+
+        x -= x.dot(z) * z
+        x /= np.linalg.norm(x)
+
         y = np.cross(z, x)
+
         R_patch = np.eye(4)
-        R_patch[:3, 0] = x; R_patch[:3, 1] = y; R_patch[:3, 2] = z
+        R_patch[:3, 0] = x
+        R_patch[:3, 1] = y
+        R_patch[:3, 2] = z
         R_patch[:3, 3] = centre_world
 
         vis[f"plane/{cam}"].set_object(
             g.Box([0.4, 0.4, 0.002]),
-            g.MeshLambertMaterial(color=hex_color, opacity=0.4, transparent=True),
+            g.MeshLambertMaterial(
+                color=hex_color,
+                opacity=0.4,
+                transparent=True,
+            ),
         )
         vis[f"plane/{cam}"].set_transform(R_patch)
 
