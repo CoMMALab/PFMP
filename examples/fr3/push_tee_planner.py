@@ -219,15 +219,18 @@ def debug_realtime(
     dt: float = 0.01
 ) -> Response:
     num_knots = len(commands)
-    step_len = horizon / (num_knots - 1)
-    steps_per_knot = int(step_len / dt)
+    step_len = horizon / (num_knots - 1) # in units of time
+    steps_per_knot = int(step_len / dt) # more like timesteps per step
 
     # 1. setup planner client and controller endpoint
-    planner = PlannerClient()
+    # PlannerClient is us
+    # ControllerEndpoint is the server, the franka
+    planner = PlannerClient() 
     controller = ControllerEndpoint()
 
     # 2. obtain EKF belief state from the controller endpoint
-    init_belief = None
+
+    init_belief = controller.
     # 3. initialize Mujoco with the EKF estimate
     trajectory = simulate(init_belief, commands, push_params, steps_per_knot)
 

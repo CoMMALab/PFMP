@@ -11,7 +11,7 @@ authors = [
     { name = "Zachary Kingston", email = "zkingston@purdue.edu" },
 ]
 dependencies = [
-    "jax[cuda12]",
+    "jax[cuda12]==0.10",
     "mujoco",
     "mujoco-mjx",
     "warp-lang",
