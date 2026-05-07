@@ -236,18 +236,160 @@ def _apply_response_to_mj(mj_model, mj_data, response: dict) -> Optional[np.ndar
     return mean
 
 
+# Hardcoded debug-realtime motion: y-sweep at x=SWEEP_X, from Y_LO to Y_HI.
+SWEEP_X = 0.5
+SWEEP_Y_LO = -0.15
+SWEEP_Y_HI = 0.15
+SWEEP_N_WP = 8
+
+
+def _make_sweep_waypoints() -> np.ndarray:
+    """Hardcoded EE waypoints: linear y-sweep across the workspace at x=SWEEP_X."""
+    ys = np.linspace(SWEEP_Y_LO, SWEEP_Y_HI, SWEEP_N_WP)
+    return np.stack([np.full_like(ys, SWEEP_X), ys], axis=1)
+
+
+def _exec_motion_sim(
+    mj_model: mujoco.MjModel,
+    mj_data: mujoco.MjData,
+    ik_cache,
+    waypoints: np.ndarray,
+    steps_per_wp: int = 500,
+    theta: Optional[PushParams] = None,
+    goal_marker_fn: Optional[callable] = None,
+) -> np.ndarray:
+    """Drive MuJoCo through the waypoints and record t-block pose at each.
+
+    Each waypoint sets the position-controller targets to ik_from_cache(xy) and
+    steps physics for `steps_per_wp` ticks. Returns an (N, 3) array of
+    [x, y, yaw] for the t-block at the end of each waypoint.
+    """
+    traj = []
+    with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
+        for i, wp in enumerate(waypoints):
+            target_q = np.asarray(ik_from_cache(jnp.asarray(wp), ik_cache))
+            mj_data.ctrl[:7] = target_q
+
+            for step in range(steps_per_wp):
+                mujoco.mj_step(mj_model, mj_data)
+                if (step % 5) == 0:
+                    if goal_marker_fn is not None and theta is not None:
+                        with viewer.lock():
+                            viewer.user_scn.ngeom = 0
+                            goal_marker_fn(viewer.user_scn, theta)
+                    viewer.sync()
+                if not viewer.is_running():
+                    break
+
+            tee = mj_data.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 3].copy()
+            traj.append(tee)
+            print(
+                f"  [sim ] wp {i+1:2d}/{len(waypoints)}: "
+                f"target_xy=({wp[0]:+.3f}, {wp[1]:+.3f})  "
+                f"tee=({tee[0]:+.3f}, {tee[1]:+.3f}, {np.degrees(tee[2]):+6.1f}°)"
+            )
+
+            if not viewer.is_running():
+                print("  [sim ] viewer closed; stopping early.")
+                break
+
+    return np.asarray(traj)
+
+
+def _exec_motion_real(
+    planner: PlannerClient,
+    waypoints: np.ndarray,
+    motion_timeout_s: float = 15.0,
+    ack_settle_s: float = 0.1,
+) -> np.ndarray:
+    """Send each waypoint to the controller and record the post-motion belief.
+
+    Sequencing inside the controller's main loop:
+        … perception → publish(seq=N) → recv_command → reply_command → execute_xy …
+    So when our send_command() returns with the ack, the publish at seq=N has
+    already happened. While execute_xy is blocking, no further publishes occur.
+    We wait briefly for that pre-motion publish to settle into our SUB queue,
+    drain to capture seq=N, then wait for a response with seq > N — that's the
+    next iteration's publish, which runs after execute_xy returns.
+    """
+    traj = []
+    for i, wp in enumerate(waypoints):
+        cmd = Command(xy=wp.tolist())
+        ack = planner.send_command(cmd)
+        if not ack.get("accepted", False):
+            print(f"  [real] wp {i+1}: command rejected: {ack}")
+            traj.append(np.full(3, np.nan))
+            continue
+        print(f"  [real] wp {i+1:2d}/{len(waypoints)}: sent xy=({wp[0]:+.3f}, {wp[1]:+.3f})")
+
+        # Capture the pre-motion seq AFTER the ack — the most recent publish at
+        # this point is the one that ran in the controller's iteration just
+        # before reply_command. Any seq strictly greater is post-motion.
+        time.sleep(ack_settle_s)
+        pre_motion_seq = -1
+        try:
+            pre, _rgb, _depth = planner.recv_response_latest(drain=True)
+            pre_motion_seq = int(pre.get("seq", -1))
+        except zmq.Again:
+            pass
+
+        belief = None
+        t0 = time.time()
+        while time.time() - t0 < motion_timeout_s:
+            try:
+                response, _rgb, _depth = planner.recv_response_latest(drain=True)
+            except zmq.Again:
+                time.sleep(0.05)
+                continue
+            seq = int(response.get("seq", -1))
+            if seq > pre_motion_seq:
+                beliefs = response.get("beliefs") or []
+                if beliefs:
+                    belief = np.asarray(beliefs[-1]["mean"], dtype=float)
+                break
+            time.sleep(0.05)
+
+        if belief is None:
+            print(f"  [real] wp {i+1}: no fresh belief within {motion_timeout_s}s")
+            belief = np.full(3, np.nan)
+        else:
+            print(
+                f"  [real] wp {i+1:2d}/{len(waypoints)}: "
+                f"tee=({belief[0]:+.3f}, {belief[1]:+.3f}, {np.degrees(belief[2]):+6.1f}°)"
+            )
+        traj.append(belief)
+
+    return np.asarray(traj)
+
+
+def _print_trajectory(label: str, waypoints: np.ndarray, traj: np.ndarray) -> None:
+    print(f"\n=== {label} t-block trajectory ===")
+    print(f"{'wp':>3}  {'cmd_x':>8} {'cmd_y':>8}    {'tee_x':>8} {'tee_y':>8} {'tee_yaw':>9}")
+    for i, (wp, p) in enumerate(zip(waypoints, traj)):
+        yaw_str = "    nan  " if np.isnan(p[2]) else f"{np.degrees(p[2]):+8.1f}°"
+        print(
+            f"{i+1:>3}  {wp[0]:+8.3f} {wp[1]:+8.3f}    "
+            f"{p[0]:+8.3f} {p[1]:+8.3f} {yaw_str}"
+        )
+
+
 def debug_realtime(
     args: argparse.Namespace,
     mj_model: mujoco.MjModel,
     mj_data: mujoco.MjData,
-    theta: Optional[PushParams] = None,
+    theta: PushParams,
     goal_marker_fn: Optional[callable] = None,
 ) -> None:
-    """Connect to the control server and visualize the live belief in MuJoCo.
+    """Compare a hardcoded EE sweep in sim vs. on the real robot.
 
-    Seeds MuJoCo with the latest EKF belief from the controller, then opens a
-    passive viewer that mirrors subsequent responses (t-block pose + robot
-    joints) live. No motion commands are sent to the simulator or the robot.
+    Flow:
+      1. Connect to the control server, fetch the latest EKF belief, and seed
+         MuJoCo with it (t-block pose + robot joints).
+      2. Run a hardcoded y-sweep in MuJoCo, recording the t-block pose at each
+         waypoint.
+      3. Run the same sweep on the real robot via ZMQ, recording the EKF belief
+         after each motion completes.
+      4. Print both trajectories side-by-side.
     """
     cmd_addr = f"tcp://{args.server_host}:{args.cmd_port}"
     resp_addr = f"tcp://{args.server_host}:{args.resp_port}"
@@ -266,8 +408,7 @@ def debug_realtime(
     )
 
     try:
-        # Initial recv: SUB sockets miss messages published before subscription
-        # is established (slow joiner), so retry a handful of times.
+        # ── 1. Initial belief: seed MuJoCo ───────────────────────────────────
         response = None
         last_err: Optional[Exception] = None
         for attempt in range(1, 21):
@@ -285,42 +426,35 @@ def debug_realtime(
         mean = _apply_response_to_mj(mj_model, mj_data, response)
         if mean is None:
             raise RuntimeError("Control server response had no beliefs")
-
         print(
             f"[debug-realtime] Seeded MuJoCo t_block: "
             f"x={mean[0]:.3f} m, y={mean[1]:.3f} m, yaw={np.degrees(mean[2]):.1f}°"
         )
 
-        joint_q = response.get("joint_q") or []
-        if joint_q:
-            latest_q_str = ", ".join(f"{q:+.3f}" for q in joint_q[-1])
-            print(f"[debug-realtime] Latest robot joint_q: [{latest_q_str}]")
+        waypoints = _make_sweep_waypoints()
+        print(
+            f"[debug-realtime] Hardcoded sweep: {len(waypoints)} waypoints, "
+            f"x={SWEEP_X:.2f}, y={SWEEP_Y_LO:+.2f}→{SWEEP_Y_HI:+.2f}"
+        )
 
-        # Switch SUB to non-blocking so the viewer loop never stalls on recv.
-        planner.sub_sock.setsockopt(zmq.RCVTIMEO, 0)
+        # ── 2. Sim execution ─────────────────────────────────────────────────
+        print("\n=== Executing sweep in MuJoCo (sim) ===")
+        sim_traj = _exec_motion_sim(
+            mj_model, mj_data, theta.ik_cache, waypoints,
+            theta=theta, goal_marker_fn=goal_marker_fn,
+        )
 
-        print("[debug-realtime] Launching passive viewer (close window to exit).")
-        with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
-            while viewer.is_running():
-                try:
-                    response, _rgb, _depth = planner.recv_response_latest(drain=True)
-                except zmq.Again:
-                    response = None
+        # ── 3. Real-robot execution ──────────────────────────────────────────
+        print("\n=== Executing sweep on real robot ===")
+        real_traj = _exec_motion_real(planner, waypoints)
 
-                if response is not None:
-                    _apply_response_to_mj(mj_model, mj_data, response)
-
-                if goal_marker_fn is not None and theta is not None:
-                    with viewer.lock():
-                        viewer.user_scn.ngeom = 0
-                        goal_marker_fn(viewer.user_scn, theta)
-
-                viewer.sync()
-                time.sleep(0.03)  # ~33 Hz
+        # ── 4. Print both trajectories ───────────────────────────────────────
+        _print_trajectory("SIM ", waypoints, sim_traj)
+        _print_trajectory("REAL", waypoints, real_traj)
 
     finally:
         planner.close()
-        print("[debug-realtime] Viewer closed.")
+        print("\n[debug-realtime] Done.")
 
 def main():
     parser = argparse.ArgumentParser(description="T-block pushing with PFMP")
