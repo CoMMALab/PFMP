@@ -84,7 +84,7 @@ def compute_error(th: PushParams, t_qpos: jax.Array) -> jax.Array:
 
 
 PROPOSAL_MIX   = 0.5   # probability of directed (vs random local) sample
-STEP_LEN_VEL   = 0.05  # step size toward T per knot (m)
+STEP_LEN_VEL   = 0.02  # step size toward T per knot (m)
 PUSH_OVERSHOOT = 1.0   # multiplier on step toward T centroid
 
 
@@ -236,17 +236,25 @@ def _apply_response_to_mj(mj_model, mj_data, response: dict) -> Optional[np.ndar
     return mean
 
 
-# Hardcoded debug-realtime motion: y-sweep at x=SWEEP_X, from Y_LO to Y_HI.
+# Hardcoded debug-realtime motion defaults: y-sweep at x=SWEEP_X.
+# Pick SWEEP_X so the sweep line passes through the tee that the EKF reports;
+# otherwise the robot just moves through empty space and neither sim nor real
+# will show any tee motion.
 SWEEP_X = 0.5
 SWEEP_Y_LO = -0.15
 SWEEP_Y_HI = 0.15
 SWEEP_N_WP = 8
 
 
-def _make_sweep_waypoints() -> np.ndarray:
-    """Hardcoded EE waypoints: linear y-sweep across the workspace at x=SWEEP_X."""
-    ys = np.linspace(SWEEP_Y_LO, SWEEP_Y_HI, SWEEP_N_WP)
-    return np.stack([np.full_like(ys, SWEEP_X), ys], axis=1)
+def _make_sweep_waypoints(
+    sweep_x: float = SWEEP_X,
+    y_lo: float = SWEEP_Y_LO,
+    y_hi: float = SWEEP_Y_HI,
+    n_wp: int = SWEEP_N_WP,
+) -> np.ndarray:
+    """Hardcoded EE waypoints: linear y-sweep across the workspace at x=sweep_x."""
+    ys = np.linspace(y_lo, y_hi, n_wp)
+    return np.stack([np.full_like(ys, sweep_x), ys], axis=1)
 
 
 def _exec_motion_sim(
@@ -315,7 +323,17 @@ def _exec_motion_real(
     traj = []
     for i, wp in enumerate(waypoints):
         cmd = Command(xy=wp.tolist())
-        ack = planner.send_command(cmd)
+        try:
+            ack = planner.send_command(cmd)
+        except zmq.Again:
+            # REQ timed out waiting for ack — controller is likely down, and
+            # the ZMQ REQ state machine is now stuck (must recv before sending
+            # again). Fill the rest with NaN and bail.
+            print(f"  [real] wp {i+1}: send_command timed out; controller may be down. "
+                  f"Skipping remaining {len(waypoints) - i} waypoints.")
+            for _ in range(i, len(waypoints)):
+                traj.append(np.full(3, np.nan))
+            break
         if not ack.get("accepted", False):
             print(f"  [real] wp {i+1}: command rejected: {ack}")
             traj.append(np.full(3, np.nan))
@@ -405,6 +423,9 @@ def debug_realtime(
         command_addr=cmd_addr,
         response_addr=resp_addr,
         conflate=False,
+        # Default 1 s is tight: the controller acks before motion starts, but
+        # under load the REQ round-trip can spike. Bump to 5 s.
+        command_timeout_ms=5000,
     )
 
     try:
@@ -431,11 +452,23 @@ def debug_realtime(
             f"x={mean[0]:.3f} m, y={mean[1]:.3f} m, yaw={np.degrees(mean[2]):.1f}°"
         )
 
-        waypoints = _make_sweep_waypoints()
-        print(
-            f"[debug-realtime] Hardcoded sweep: {len(waypoints)} waypoints, "
-            f"x={SWEEP_X:.2f}, y={SWEEP_Y_LO:+.2f}→{SWEEP_Y_HI:+.2f}"
+        waypoints = _make_sweep_waypoints(
+            sweep_x=args.sweep_x,
+            y_lo=args.sweep_y_lo,
+            y_hi=args.sweep_y_hi,
+            n_wp=args.sweep_n_wp,
         )
+        print(
+            f"[debug-realtime] Sweep: {len(waypoints)} waypoints, "
+            f"x={args.sweep_x:.3f}, y={args.sweep_y_lo:+.3f}→{args.sweep_y_hi:+.3f}"
+        )
+        if abs(args.sweep_x - mean[0]) > 0.10:
+            print(
+                f"[debug-realtime] WARNING: sweep_x={args.sweep_x:.3f} is "
+                f"{abs(args.sweep_x - mean[0])*100:.1f} cm from the seeded tee_x="
+                f"{mean[0]:.3f}; the EE will pass through empty space and the "
+                f"tee won't be pushed. Consider --sweep-x close to tee_x."
+            )
 
         # ── 2. Sim execution ─────────────────────────────────────────────────
         print("\n=== Executing sweep in MuJoCo (sim) ===")
@@ -467,6 +500,14 @@ def main():
                         help='ZMQ REQ port for sending commands to the controller')
     parser.add_argument('--resp-port', type=int, default=5556,
                         help='ZMQ SUB port for receiving responses from the controller')
+    parser.add_argument('--sweep-x', type=float, default=SWEEP_X,
+                        help='X position of the debug-realtime y-sweep (m)')
+    parser.add_argument('--sweep-y-lo', type=float, default=SWEEP_Y_LO,
+                        help='start y of the debug-realtime sweep (m)')
+    parser.add_argument('--sweep-y-hi', type=float, default=SWEEP_Y_HI,
+                        help='end y of the debug-realtime sweep (m)')
+    parser.add_argument('--sweep-n-wp', type=int, default=SWEEP_N_WP,
+                        help='number of waypoints in the debug-realtime sweep')
     subparsers = parser.add_subparsers(dest="algorithm", required=True)
     subparsers.add_parser("ps", help="Predictive Sampling (Sequential Importance Sampling)")
     subparsers.add_parser("sir", help="Sequential Importance Resampling")

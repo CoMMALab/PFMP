@@ -493,7 +493,17 @@ def main():
                         else:
                             endpoint.reply_command(accepted=True)
                             print(f"[server] received xy command: {target_xy.tolist()}")
-                            execute_xy(target_xy)
+                            # Don't let a single failed motion kill the server.
+                            # Log, try to recover, and keep accepting commands.
+                            try:
+                                execute_xy(target_xy)
+                            except Exception as e:
+                                print(f"[server] execute_xy failed: {e!r}")
+                                if robot is not None:
+                                    try:
+                                        robot.recover_from_errors()
+                                    except Exception as rec_e:
+                                        print(f"[server] recover_from_errors failed: {rec_e!r}")
 
             elif args.manual:
                 # Manual mode: consume stdin only when user typed a command.
