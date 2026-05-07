@@ -211,6 +211,7 @@ def simulate(
     pass   
 
 
+
 def _apply_response_to_mj(mj_model, mj_data, response: dict) -> Optional[np.ndarray]:
     """Mirror the controller's latest response into mj_data.
 
