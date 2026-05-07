@@ -211,20 +211,42 @@ def simulate(
     pass   
 
 
+def _apply_response_to_mj(mj_model, mj_data, response: dict) -> Optional[np.ndarray]:
+    """Mirror the controller's latest response into mj_data.
+
+    Updates the t-block (t_x/t_y/t_yaw from the latest belief) and the robot
+    joints (q[:7] from the latest joint_q row), then runs forward kinematics.
+    Returns the [x, y, yaw] belief mean used (or None if no belief was set).
+    """
+    mean = None
+    beliefs = response.get("beliefs") or []
+    if beliefs:
+        m = np.asarray(beliefs[-1]["mean"], dtype=float)
+        mj_data.qpos[T_QPOS_OFFSET]     = m[0]
+        mj_data.qpos[T_QPOS_OFFSET + 1] = m[1]
+        mj_data.qpos[T_QPOS_OFFSET + 2] = m[2]
+        mean = m
+
+    joint_q = response.get("joint_q") or []
+    if joint_q:
+        mj_data.qpos[:7] = np.asarray(joint_q[-1], dtype=float)
+
+    mujoco.mj_forward(mj_model, mj_data)
+    return mean
+
+
 def debug_realtime(
-    # horizon: float,
-    # commands: list[Command],
-    # push_params: PushParams,
     args: argparse.Namespace,
     mj_model: mujoco.MjModel,
     mj_data: mujoco.MjData,
-    # dt: float = 0.01,
+    theta: Optional[PushParams] = None,
+    goal_marker_fn: Optional[callable] = None,
 ) -> None:
-    """Connect to the control server, fetch a belief, and seed MuJoCo with it.
+    """Connect to the control server and visualize the live belief in MuJoCo.
 
-    No motion commands are sent to the simulator or robot — this only verifies
-    that the planner ↔ controller link works and that the t-block in MuJoCo
-    can be initialized to match the EKF estimate on the real-robot side.
+    Seeds MuJoCo with the latest EKF belief from the controller, then opens a
+    passive viewer that mirrors subsequent responses (t-block pose + robot
+    joints) live. No motion commands are sent to the simulator or the robot.
     """
     cmd_addr = f"tcp://{args.server_host}:{args.cmd_port}"
     resp_addr = f"tcp://{args.server_host}:{args.resp_port}"
@@ -242,52 +264,62 @@ def debug_realtime(
         conflate=False,
     )
 
-    # ZMQ SUB sockets miss messages published before the subscription is
-    # established (slow joiner), so retry a handful of times.
-    response = None
-    last_err: Optional[Exception] = None
-    for attempt in range(1, 21):
-        try:
-            response, _rgb, _depth = planner.recv_response_latest(drain=True)
-            break
-        except zmq.Again as e:
-            last_err = e
-            print(f"  [attempt {attempt}/20] no response yet; retrying...")
-            time.sleep(0.25)
+    try:
+        # Initial recv: SUB sockets miss messages published before subscription
+        # is established (slow joiner), so retry a handful of times.
+        response = None
+        last_err: Optional[Exception] = None
+        for attempt in range(1, 21):
+            try:
+                response, _rgb, _depth = planner.recv_response_latest(drain=True)
+                break
+            except zmq.Again as e:
+                last_err = e
+                print(f"  [attempt {attempt}/20] no response yet; retrying...")
+                time.sleep(0.25)
 
-    if response is None:
+        if response is None:
+            raise RuntimeError(f"No response from control server: {last_err}")
+
+        mean = _apply_response_to_mj(mj_model, mj_data, response)
+        if mean is None:
+            raise RuntimeError("Control server response had no beliefs")
+
+        print(
+            f"[debug-realtime] Seeded MuJoCo t_block: "
+            f"x={mean[0]:.3f} m, y={mean[1]:.3f} m, yaw={np.degrees(mean[2]):.1f}°"
+        )
+
+        joint_q = response.get("joint_q") or []
+        if joint_q:
+            latest_q_str = ", ".join(f"{q:+.3f}" for q in joint_q[-1])
+            print(f"[debug-realtime] Latest robot joint_q: [{latest_q_str}]")
+
+        # Switch SUB to non-blocking so the viewer loop never stalls on recv.
+        planner.sub_sock.setsockopt(zmq.RCVTIMEO, 0)
+
+        print("[debug-realtime] Launching passive viewer (close window to exit).")
+        with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
+            while viewer.is_running():
+                try:
+                    response, _rgb, _depth = planner.recv_response_latest(drain=True)
+                except zmq.Again:
+                    response = None
+
+                if response is not None:
+                    _apply_response_to_mj(mj_model, mj_data, response)
+
+                if goal_marker_fn is not None and theta is not None:
+                    with viewer.lock():
+                        viewer.user_scn.ngeom = 0
+                        goal_marker_fn(viewer.user_scn, theta)
+
+                viewer.sync()
+                time.sleep(0.03)  # ~33 Hz
+
+    finally:
         planner.close()
-        raise RuntimeError(f"No response from control server: {last_err}")
-
-    beliefs = response.get("beliefs") or []
-    if not beliefs:
-        planner.close()
-        raise RuntimeError("Control server response had no beliefs")
-
-    belief = beliefs[-1]
-    mean = np.asarray(belief["mean"], dtype=float)  # (3,) [x, y, yaw]
-
-    # Seed the t-block joints (t_x, t_y, t_yaw) in MuJoCo with the EKF mean.
-    mj_data.qpos[T_QPOS_OFFSET]     = mean[0]
-    mj_data.qpos[T_QPOS_OFFSET + 1] = mean[1]
-    mj_data.qpos[T_QPOS_OFFSET + 2] = mean[2]
-    mujoco.mj_forward(mj_model, mj_data)
-
-    print(
-        f"[debug-realtime] Seeded MuJoCo t_block: "
-        f"x={mean[0]:.3f} m, y={mean[1]:.3f} m, yaw={np.degrees(mean[2]):.1f}°"
-    )
-
-    joint_q = response.get("joint_q") or []
-    if joint_q:
-        latest_q = joint_q[-1]
-        latest_q_str = ", ".join(f"{q:+.3f}" for q in latest_q)
-        print(f"[debug-realtime] Latest robot joint_q: [{latest_q_str}]")
-
-    print("[debug-realtime] No motion commands sent. Done.")
-    planner.close()
-
-    return None, None
+        print("[debug-realtime] Viewer closed.")
 
 def main():
     parser = argparse.ArgumentParser(description="T-block pushing with PFMP")
@@ -388,7 +420,7 @@ def main():
             user_scn.ngeom += 1
 
     if args.debug_realtime:
-        debug_realtime(args, mj_model, mj_data)
+        debug_realtime(args, mj_model, mj_data, theta, goal_marker_callback)
         return
     else:
         # Run interactive simulation
