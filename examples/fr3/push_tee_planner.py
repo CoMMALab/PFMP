@@ -239,7 +239,7 @@ def main():
     parser = argparse.ArgumentParser(description="T-block pushing with PFMP")
     parser.add_argument('--cache-resolution', type=int, default=IK_CACHE_RESOLUTION,
                         help='IK cache grid resolution')
-    parser.add_argument('--debug-realtime', action='store_true', help='Hardcoded test for debugging')
+    parser.add_argument('--debug-realtime', action='store_true')
     subparsers = parser.add_subparsers(dest="algorithm", required=True)
     subparsers.add_parser("ps", help="Predictive Sampling (Sequential Importance Sampling)")
     subparsers.add_parser("sir", help="Sequential Importance Resampling")
