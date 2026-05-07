@@ -28,6 +28,7 @@ dependencies = [
     "opencv-python",
     "fire",
     "meshcat",
+    "franky-control",
 ]
 
 [tool.setuptools.packages.find]
