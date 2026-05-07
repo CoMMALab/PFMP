@@ -212,13 +212,13 @@ def simulate(
 
 
 def debug_realtime(
-    horizon: float,
-    commands: list[Command],
-    push_params: PushParams,
+    # horizon: float,
+    # commands: list[Command],
+    # push_params: PushParams,
     args: argparse.Namespace,
     mj_model: mujoco.MjModel,
     mj_data: mujoco.MjData,
-    dt: float = 0.01,
+    # dt: float = 0.01,
 ) -> None:
     """Connect to the control server, fetch a belief, and seed MuJoCo with it.
 
