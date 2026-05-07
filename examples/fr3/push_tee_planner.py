@@ -6,12 +6,14 @@ Real world workspace is 53' 1/8" x 23' 1/4"
 
 import argparse
 import os
-from typing import NamedTuple, Tuple
+import time
+from typing import NamedTuple, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
 import mujoco
 import numpy as np
+import zmq
 from mujoco import mjx
 
 import sys
@@ -21,7 +23,6 @@ from geom_tee import STEM_HALF, CAP_HALF, CAP_CTR
 import pfmp
 from pfmp.run_batch import Trajectory
 from pub_sub.protocol import Command, Response, TeeBelief
-from pub_sub.controller import ControllerEndpoint
 from pub_sub.planner import PlannerClient
 
 from ik_cache import (
@@ -199,50 +200,98 @@ def load_scene(xml_path: str):
     print(f"push_cylinder_visual geom id: {cyl_id} (−1 = not found)")
     return mj_model, mj_data
 
-class Trajectory(NamedTuple):
-    qpos: np.ndarray  # (T, nq)
-    qvel: np.ndarray  # (T, nv)
 
-def simulate(
-    init_belief: TeeBelief,
-    commands: list[Command],
-    push_params: PushParams,
-    steps_per_knot: int,
-    interactive: bool = True
-) -> Trajectory:
-    pass
+def simulate(                                                                                                                                                           
+    init_belief: TeeBelief,                                                                                                                                             
+    commands: list[Command],                                                                                                                                            
+    push_params: PushParams,                                                                                                                                            
+    steps_per_knot: int,                                                                                                                                                
+    interactive: bool = True                                                                                                                                            
+) -> Trajectory:                                                                                                                                                        
+    pass   
+
 
 def debug_realtime(
     horizon: float,
     commands: list[Command],
     push_params: PushParams,
-    dt: float = 0.01
-) -> Response:
-    num_knots = len(commands)
-    step_len = horizon / (num_knots - 1) # in units of time
-    steps_per_knot = int(step_len / dt) # more like timesteps per step
+    args: argparse.Namespace,
+    mj_model: mujoco.MjModel,
+    mj_data: mujoco.MjData,
+    dt: float = 0.01,
+) -> None:
+    """Connect to the control server, fetch a belief, and seed MuJoCo with it.
 
-    # 1. setup planner client and controller endpoint
-    # PlannerClient is us
-    # ControllerEndpoint is the server, the franka
-    planner = PlannerClient() 
-    controller = ControllerEndpoint()
+    No motion commands are sent to the simulator or robot — this only verifies
+    that the planner ↔ controller link works and that the t-block in MuJoCo
+    can be initialized to match the EKF estimate on the real-robot side.
+    """
+    cmd_addr = f"tcp://{args.server_host}:{args.cmd_port}"
+    resp_addr = f"tcp://{args.server_host}:{args.resp_port}"
 
-    # 2. obtain EKF belief state from the controller endpoint
+    print(f"[debug-realtime] Connecting to control server")
+    print(f"  command socket  REQ → {cmd_addr}")
+    print(f"  response socket SUB ← {resp_addr}")
+    planner = PlannerClient(command_addr=cmd_addr, response_addr=resp_addr)
 
-    init_belief = controller.
-    # 3. initialize Mujoco with the EKF estimate
-    trajectory = simulate(init_belief, commands, push_params, steps_per_knot)
+    # ZMQ SUB sockets miss messages published before the subscription is
+    # established (slow joiner), so retry a handful of times.
+    response = None
+    last_err: Optional[Exception] = None
+    for attempt in range(1, 21):
+        try:
+            response, _rgb, _depth = planner.recv_response_latest(drain=True)
+            break
+        except zmq.Again as e:
+            last_err = e
+            print(f"  [attempt {attempt}/20] no response yet; retrying...")
+            time.sleep(0.25)
 
-    planner.send(commands)  # check actual API
-    res = controller.recv_response()
-    return trajectory, res
+    if response is None:
+        planner.close()
+        raise RuntimeError(f"No response from control server: {last_err}")
+
+    beliefs = response.get("beliefs") or []
+    if not beliefs:
+        planner.close()
+        raise RuntimeError("Control server response had no beliefs")
+
+    belief = beliefs[-1]
+    mean = np.asarray(belief["mean"], dtype=float)  # (3,) [x, y, yaw]
+
+    # Seed the t-block joints (t_x, t_y, t_yaw) in MuJoCo with the EKF mean.
+    mj_data.qpos[T_QPOS_OFFSET]     = mean[0]
+    mj_data.qpos[T_QPOS_OFFSET + 1] = mean[1]
+    mj_data.qpos[T_QPOS_OFFSET + 2] = mean[2]
+    mujoco.mj_forward(mj_model, mj_data)
+
+    print(
+        f"[debug-realtime] Seeded MuJoCo t_block: "
+        f"x={mean[0]:.3f} m, y={mean[1]:.3f} m, yaw={np.degrees(mean[2]):.1f}°"
+    )
+
+    joint_q = response.get("joint_q") or []
+    if joint_q:
+        latest_q = joint_q[-1]
+        latest_q_str = ", ".join(f"{q:+.3f}" for q in latest_q)
+        print(f"[debug-realtime] Latest robot joint_q: [{latest_q_str}]")
+
+    print("[debug-realtime] No motion commands sent. Done.")
+    planner.close()
+
+    return None, None
 
 def main():
     parser = argparse.ArgumentParser(description="T-block pushing with PFMP")
     parser.add_argument('--cache-resolution', type=int, default=IK_CACHE_RESOLUTION,
                         help='IK cache grid resolution')
     parser.add_argument('--debug-realtime', action='store_true')
+    parser.add_argument('--server-host', default='localhost',
+                        help='Hostname/IP of the controller server (real robot machine)')
+    parser.add_argument('--cmd-port', type=int, default=5555,
+                        help='ZMQ REQ port for sending commands to the controller')
+    parser.add_argument('--resp-port', type=int, default=5556,
+                        help='ZMQ SUB port for receiving responses from the controller')
     subparsers = parser.add_subparsers(dest="algorithm", required=True)
     subparsers.add_parser("ps", help="Predictive Sampling (Sequential Importance Sampling)")
     subparsers.add_parser("sir", help="Sequential Importance Resampling")
@@ -331,8 +380,8 @@ def main():
             user_scn.ngeom += 1
 
     if args.debug_realtime:
-        trajectory, res = debug_realtime()
-        # TODO: analysis on trajectory, res
+        trajectory, res = debug_realtime(args, mj_model, mj_data)
+        return
     else:
         # Run interactive simulation
         pfmp.run_interactive(

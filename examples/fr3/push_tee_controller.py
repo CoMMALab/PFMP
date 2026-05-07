@@ -21,6 +21,7 @@ import time
 from typing import NamedTuple, Optional
 
 import numpy as np
+import zmq
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "perception"))
 
@@ -33,6 +34,8 @@ from main import project_world_xy, draw_pose_marker, CYAN
 
 sys.path.insert(0, os.path.dirname(__file__))
 from ik_cache import ik_from_cache, get_or_build_cache, HOME_Q, EE_HEIGHT
+from pub_sub.controller import ControllerEndpoint
+from pub_sub.protocol import TeeBelief
 
 
 ROBOT_IP = "172.16.0.3"
@@ -269,6 +272,11 @@ def main():
     parser.add_argument("--wf", default="wf.npz")
     parser.add_argument("--cache", default=None)
     parser.add_argument("--xy-step", type=float, default=XY_STEP_M)  # unused with CartesianMotion
+    parser.add_argument("--server", action="store_true") # use as server with ControlEndpoint
+    parser.add_argument("--cmd-port", type=int, default=5555,
+                        help="ZMQ REP port for commands (server mode)")
+    parser.add_argument("--resp-port", type=int, default=5556,
+                        help="ZMQ PUB port for responses (server mode)")
 
     # Default behavior: autonomous random target sampling.
     # Manual behavior: wait for stdin commands: xy <x> <y>, home, q.
@@ -336,7 +344,22 @@ def main():
 
     rng = np.random.default_rng()
 
-    if args.manual:
+    # ── ZMQ endpoint (server mode only) ───────────────────────────────────────
+    endpoint: Optional[ControllerEndpoint] = None
+    if args.server:
+        cmd_addr = f"tcp://*:{args.cmd_port}"
+        resp_addr = f"tcp://*:{args.resp_port}"
+        endpoint = ControllerEndpoint(
+            command_bind_addr=cmd_addr,
+            response_bind_addr=resp_addr,
+            recv_timeout_ms=0,  # non-blocking REP
+        )
+
+    if args.server:
+        print(f"\nLoop running in SERVER mode.")
+        print(f"  commands  REP ← {cmd_addr}")
+        print(f"  responses PUB → {resp_addr}")
+    elif args.manual:
         print("\nLoop running in MANUAL mode.")
         print("Commands: xy <x> <y>  |  home  |  q")
     else:
@@ -414,6 +437,9 @@ def main():
 
         print(f"Moved linearly to xy={current_xy}, commanded={target_xy}")
 
+        # response = 
+        # return response
+
     try:
         while not stop_event.is_set():
             snap = shared.get()
@@ -437,7 +463,39 @@ def main():
                 shared.update_perception(mask=mask, ekf_mean=ekf.mean.copy())
                 last_ekf_seq = snap.seq
 
-            if args.manual:
+            if args.server:
+                # Publish current state (rgb, depth, joints, EKF belief) for any
+                # subscribers. Then non-blockingly poll for an incoming command.
+                if endpoint is not None and snap.color is not None and snap.depth is not None:
+                    belief = TeeBelief(
+                        mean=ekf.mean.tolist(),
+                        cov=ekf.cov.tolist(),
+                    )
+                    endpoint.publish_rgbd_response(
+                        rgb=snap.color,
+                        depth=snap.depth.astype(np.float32),
+                        joint_q=[q_prev.tolist()],
+                        joint_v=[[0.0] * 7],
+                        beliefs=[belief],
+                    )
+
+                if endpoint is not None:
+                    try:
+                        cmd = endpoint.recv_command()
+                    except zmq.Again:
+                        cmd = None
+
+                    if cmd is not None:
+                        try:
+                            target_xy = np.asarray(cmd.xy, dtype=float)
+                        except Exception as e:
+                            endpoint.reply_command(accepted=False, reason=f"bad command: {e}")
+                        else:
+                            endpoint.reply_command(accepted=True)
+                            print(f"[server] received xy command: {target_xy.tolist()}")
+                            execute_xy(target_xy)
+
+            elif args.manual:
                 # Manual mode: consume stdin only when user typed a command.
                 if select.select([sys.stdin], [], [], 0.0)[0]:
                     line = sys.stdin.readline().strip()
@@ -472,6 +530,12 @@ def main():
     finally:
         stop_event.set()
         vis_thread.join(timeout=1.0)
+
+        if endpoint is not None:
+            try:
+                endpoint.close()
+            except Exception as e:
+                print(f"[WARN] could not close ZMQ endpoint: {e}")
 
         try:
             pipe.stop()
