@@ -232,7 +232,15 @@ def debug_realtime(
     print(f"[debug-realtime] Connecting to control server")
     print(f"  command socket  REQ → {cmd_addr}")
     print(f"  response socket SUB ← {resp_addr}")
-    planner = PlannerClient(command_addr=cmd_addr, response_addr=resp_addr)
+    # NOTE: conflate=False is required because the controller publishes
+    # multipart frames ([topic][json][rgb][depth]) and ZMQ's CONFLATE option
+    # doesn't support multipart — it asserts (`!_more` in fq.cpp). We get
+    # "latest only" semantics from recv_response_latest(drain=True) instead.
+    planner = PlannerClient(
+        command_addr=cmd_addr,
+        response_addr=resp_addr,
+        conflate=False,
+    )
 
     # ZMQ SUB sockets miss messages published before the subscription is
     # established (slow joiner), so retry a handful of times.
@@ -380,7 +388,7 @@ def main():
             user_scn.ngeom += 1
 
     if args.debug_realtime:
-        trajectory, res = debug_realtime(args, mj_model, mj_data)
+        debug_realtime(args, mj_model, mj_data)
         return
     else:
         # Run interactive simulation
