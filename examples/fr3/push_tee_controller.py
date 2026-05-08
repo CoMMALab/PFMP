@@ -35,7 +35,7 @@ from main import project_world_xy, draw_pose_marker, CYAN
 sys.path.insert(0, os.path.dirname(__file__))
 from ik_cache import ik_from_cache, get_or_build_cache, HOME_Q, EE_HEIGHT
 from pub_sub.controller import ControllerEndpoint
-from pub_sub.protocol import TeeBelief
+from pub_sub.protocol import Reply, TeeBelief
 
 
 ROBOT_IP = "172.16.0.3"
@@ -274,9 +274,7 @@ def main():
     parser.add_argument("--xy-step", type=float, default=XY_STEP_M)  # unused with CartesianMotion
     parser.add_argument("--server", action="store_true") # use as server with ControlEndpoint
     parser.add_argument("--cmd-port", type=int, default=5555,
-                        help="ZMQ REP port for commands (server mode)")
-    parser.add_argument("--resp-port", type=int, default=5556,
-                        help="ZMQ PUB port for responses (server mode)")
+                        help="ZMQ REP port for command round-trips (server mode)")
 
     # Default behavior: autonomous random target sampling.
     # Manual behavior: wait for stdin commands: xy <x> <y>, home, q.
@@ -348,17 +346,14 @@ def main():
     endpoint: Optional[ControllerEndpoint] = None
     if args.server:
         cmd_addr = f"tcp://*:{args.cmd_port}"
-        resp_addr = f"tcp://*:{args.resp_port}"
         endpoint = ControllerEndpoint(
             command_bind_addr=cmd_addr,
-            response_bind_addr=resp_addr,
-            recv_timeout_ms=0,  # non-blocking REP
+            recv_timeout_ms=0,  # non-blocking poll inside the perception loop
         )
 
     if args.server:
         print(f"\nLoop running in SERVER mode.")
-        print(f"  commands  REP ← {cmd_addr}")
-        print(f"  responses PUB → {resp_addr}")
+        print(f"  REQ/REP ← {cmd_addr}")
     elif args.manual:
         print("\nLoop running in MANUAL mode.")
         print("Commands: xy <x> <y>  |  home  |  q")
@@ -488,46 +483,72 @@ def main():
                 last_ekf_seq = snap.seq
 
             if args.server:
-                # Publish current state (rgb, depth, joints, EKF belief) for any
-                # subscribers. Then non-blockingly poll for an incoming command.
-                if endpoint is not None and snap.color is not None and snap.depth is not None:
-                    belief = TeeBelief(
-                        mean=ekf.mean.tolist(),
-                        cov=ekf.cov.tolist(),
-                    )
-                    endpoint.publish_rgbd_response(
-                        rgb=snap.color,
-                        depth=snap.depth.astype(np.float32),
-                        joint_q=[q_prev.tolist()],
-                        joint_v=[[0.0] * 7],
-                        beliefs=[belief],
-                    )
-
+                # Synchronous one-shot RPC: poll for a command (non-blocking),
+                # do the work it asks for, then reply. The planner's REQ blocks
+                # on this reply, so the planner cannot overlap commands.
+                cmd = None
                 if endpoint is not None:
                     try:
                         cmd = endpoint.recv_command()
                     except zmq.Again:
                         cmd = None
 
-                    if cmd is not None:
-                        try:
-                            target_xy = np.asarray(cmd.xy, dtype=float)
-                        except Exception as e:
-                            endpoint.reply_command(accepted=False, reason=f"bad command: {e}")
+                if cmd is not None:
+                    success = True
+                    err_msg: Optional[str] = None
+
+                    if cmd.kind == "query":
+                        # Nothing to do beyond replying with current state.
+                        pass
+                    elif cmd.kind == "move":
+                        if cmd.xy is None or len(cmd.xy) != 2:
+                            success = False
+                            err_msg = f"move command missing xy: {cmd}"
                         else:
-                            endpoint.reply_command(accepted=True)
-                            print(f"[server] received xy command: {target_xy.tolist()}")
-                            # Don't let a single failed motion kill the server.
-                            # Log, try to recover, and keep accepting commands.
+                            target_xy = np.asarray(cmd.xy, dtype=float)
+                            print(f"[server] received move command: xy={target_xy.tolist()}")
                             try:
                                 execute_xy(target_xy)
                             except Exception as e:
-                                print(f"[server] execute_xy failed: {e!r}")
+                                success = False
+                                err_msg = repr(e)
+                                print(f"[server] execute_xy failed: {err_msg}")
                                 if robot is not None:
                                     try:
                                         robot.recover_from_errors()
                                     except Exception as rec_e:
                                         print(f"[server] recover_from_errors failed: {rec_e!r}")
+                    else:
+                        success = False
+                        err_msg = f"unknown command kind: {cmd.kind!r}"
+
+                    # Refresh perception once on the latest frame so the reply
+                    # carries the post-motion belief, not the pre-motion one.
+                    snap = shared.get()
+                    if snap.color is not None and snap.depth is not None:
+                        ekf, mask = perception_step_from_frame(
+                            wf=wf,
+                            color=snap.color,
+                            depth=snap.depth,
+                            K_top=K_top,
+                            dist_top=dist_top,
+                            serial_top=serial_top,
+                            depth_scale=depth_scale,
+                            ekf=ekf,
+                        )
+                        shared.update_perception(mask=mask, ekf_mean=ekf.mean.copy())
+                        last_ekf_seq = snap.seq
+
+                    endpoint.reply(Reply(
+                        success=success,
+                        error=err_msg,
+                        timestamp=time.time(),
+                        belief=TeeBelief(
+                            mean=ekf.mean.tolist(),
+                            cov=ekf.cov.tolist(),
+                        ),
+                        joint_q=q_prev.tolist(),
+                    ))
 
             elif args.manual:
                 # Manual mode: consume stdin only when user typed a command.

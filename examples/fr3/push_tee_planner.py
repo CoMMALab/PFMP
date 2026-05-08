@@ -31,7 +31,7 @@ from tee import (
 
 import pfmp
 from pfmp.run_batch import Trajectory
-from pub_sub.protocol import Command, Response, TeeBelief
+from pub_sub.protocol import Command, Reply, TeeBelief
 from pub_sub.planner import PlannerClient
 
 from ik_cache import (
@@ -221,28 +221,19 @@ def simulate(
 
 
 
-def _apply_response_to_mj(mj_model, mj_data, response: dict) -> Optional[np.ndarray]:
-    """Mirror the controller's latest response into mj_data.
+def _apply_reply_to_mj(mj_model, mj_data, reply: Reply) -> np.ndarray:
+    """Mirror the controller's reply into mj_data: t_block pose + robot joints.
 
-    Updates the t-block (t_x/t_y/t_yaw from the latest belief) and the robot
-    joints (q[:7] from the latest joint_q row), then runs forward kinematics.
-    Returns the [x, y, yaw] belief mean used (or None if no belief was set).
+    Returns the [x, y, yaw] belief mean that was applied.
     """
-    mean = None
-    beliefs = response.get("beliefs") or []
-    if beliefs:
-        m = np.asarray(beliefs[-1]["mean"], dtype=float)
-        mj_data.qpos[T_QPOS_OFFSET]     = m[0]
-        mj_data.qpos[T_QPOS_OFFSET + 1] = m[1]
-        mj_data.qpos[T_QPOS_OFFSET + 2] = m[2]
-        mean = m
-
-    joint_q = response.get("joint_q") or []
-    if joint_q:
-        mj_data.qpos[:7] = np.asarray(joint_q[-1], dtype=float)
-
+    m = np.asarray(reply.belief.mean, dtype=float)
+    mj_data.qpos[T_QPOS_OFFSET]     = m[0]
+    mj_data.qpos[T_QPOS_OFFSET + 1] = m[1]
+    mj_data.qpos[T_QPOS_OFFSET + 2] = m[2]
+    if reply.joint_q and len(reply.joint_q) >= 7:
+        mj_data.qpos[:7] = np.asarray(reply.joint_q[:7], dtype=float)
     mujoco.mj_forward(mj_model, mj_data)
-    return mean
+    return m
 
 
 # Hardcoded debug-realtime motion defaults: y-sweep at x=SWEEP_X.
@@ -431,134 +422,48 @@ def _exec_motion_sim(
     return np.asarray(tee_traj), np.asarray(ee_traj)
 
 
-def _reconnect_req(planner: PlannerClient, command_timeout_ms: int = 5000) -> None:
-    """Recreate the REQ socket on the planner.
-
-    After a recv timeout (`zmq.Again`) the REQ state machine is stuck — it
-    expects a recv before it can send again. The only clean recovery is to
-    close and re-open the socket.
-    """
-    planner.cmd_sock.close(linger=0)
-    s = planner.ctx.socket(zmq.REQ)
-    s.setsockopt(zmq.RCVTIMEO, command_timeout_ms)
-    s.setsockopt(zmq.SNDTIMEO, command_timeout_ms)
-    s.connect(planner.command_addr)
-    planner.cmd_sock = s
-
-
-def _send_with_retry(
-    planner: PlannerClient,
-    cmd: Command,
-    label: str,
-    max_attempts: int = 30,
-    retry_pause_s: float = 1.0,
-    command_timeout_ms: int = 5000,
-) -> dict:
-    """send_command, but reconnect-and-retry on zmq.Again.
-
-    Each attempt waits up to command_timeout_ms for the ack. If the controller
-    is busy (long motion + perception + publish + recv), the ack might miss
-    one window but land on the next. Worst case (controller crash + restart),
-    reconnecting also lets a freshly-launched controller take over.
-    """
-    for attempt in range(1, max_attempts + 1):
-        try:
-            return planner.send_command(cmd)
-        except zmq.Again:
-            print(
-                f"  [real] {label}: send_command timed out "
-                f"(attempt {attempt}/{max_attempts}); reconnecting REQ and retrying…"
-            )
-            _reconnect_req(planner, command_timeout_ms=command_timeout_ms)
-            time.sleep(retry_pause_s)
-    raise RuntimeError(f"send_command failed after {max_attempts} attempts")
-
-
 def _exec_motion_real(
     planner: PlannerClient,
     waypoints: np.ndarray,
-    motion_timeout_s: float = 15.0,
-    ack_settle_s: float = 0.1,
-    send_max_attempts: int = 30,
-    send_retry_pause_s: float = 1.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Send each waypoint to the controller and record (tee, EE) at each.
 
-    Sequencing inside the controller's main loop:
-        … perception → publish(seq=N) → recv_command → reply_command → execute_xy …
-    So when our send_command() returns with the ack, the publish at seq=N has
-    already happened. While execute_xy is blocking, no further publishes occur.
-    We wait briefly for that pre-motion publish to settle into our SUB queue,
-    drain to capture seq=N, then wait for a response with seq > N — that's the
-    next iteration's publish, which runs after execute_xy returns.
+    Synchronous flow: planner.move(wp) blocks until the controller finishes
+    execute_xy + perception, then returns the post-motion belief. No need to
+    track sequence numbers or wait for fresh publishes.
 
-    If the ack doesn't arrive within the REQ timeout, we reconnect and retry
-    (up to send_max_attempts times) before giving up on a waypoint.
-
-    Returns (tee_traj, ee_traj). The real EE position isn't published, so we
-    use the commanded waypoint as a proxy (the controller's CartesianMotion
-    targets exactly that xy). Skipped/rejected waypoints get NaN.
+    On a REQ timeout (controller hung or restarting) we reconnect and bail
+    out, NaN-filling the remaining waypoints. The real EE position isn't
+    reported, so we use the commanded xy as a proxy.
     """
     tee_traj = []
     ee_traj = []
     for i, wp in enumerate(waypoints):
-        cmd = Command(xy=wp.tolist())
         label = f"wp {i+1:2d}/{len(waypoints)}"
+        print(f"  [real] {label}: sending xy=({wp[0]:+.3f}, {wp[1]:+.3f}) and waiting…")
+
         try:
-            ack = _send_with_retry(
-                planner, cmd, label,
-                max_attempts=send_max_attempts,
-                retry_pause_s=send_retry_pause_s,
-            )
-        except RuntimeError as e:
-            print(f"  [real] {label}: {e}; skipping remaining {len(waypoints) - i} waypoints.")
+            reply = planner.move(wp)
+        except zmq.Again:
+            print(f"  [real] {label}: timed out waiting for reply; reconnecting and bailing.")
+            planner.reconnect()
             for _ in range(i, len(waypoints)):
                 tee_traj.append(np.full(3, np.nan))
                 ee_traj.append(np.full(2, np.nan))
             break
-        if not ack.get("accepted", False):
-            print(f"  [real] wp {i+1}: command rejected: {ack}")
+
+        if not reply.success:
+            print(f"  [real] {label}: motion failed on the controller: {reply.error}")
             tee_traj.append(np.full(3, np.nan))
             ee_traj.append(np.full(2, np.nan))
             continue
-        print(f"  [real] wp {i+1:2d}/{len(waypoints)}: sent xy=({wp[0]:+.3f}, {wp[1]:+.3f})")
 
-        # Capture the pre-motion seq AFTER the ack — the most recent publish at
-        # this point is the one that ran in the controller's iteration just
-        # before reply_command. Any seq strictly greater is post-motion.
-        time.sleep(ack_settle_s)
-        pre_motion_seq = -1
-        try:
-            pre, _rgb, _depth = planner.recv_response_latest(drain=True)
-            pre_motion_seq = int(pre.get("seq", -1))
-        except zmq.Again:
-            pass
-
-        belief = None
-        t0 = time.time()
-        while time.time() - t0 < motion_timeout_s:
-            try:
-                response, _rgb, _depth = planner.recv_response_latest(drain=True)
-            except zmq.Again:
-                time.sleep(0.05)
-                continue
-            seq = int(response.get("seq", -1))
-            if seq > pre_motion_seq:
-                beliefs = response.get("beliefs") or []
-                if beliefs:
-                    belief = np.asarray(beliefs[-1]["mean"], dtype=float)
-                break
-            time.sleep(0.05)
-
-        if belief is None:
-            print(f"  [real] wp {i+1}: no fresh belief within {motion_timeout_s}s")
-            belief = np.full(3, np.nan)
-        else:
-            print(
-                f"  [real] wp {i+1:2d}/{len(waypoints)}: "
-                f"tee=({belief[0]:+.3f}, {belief[1]:+.3f}, {np.degrees(belief[2]):+6.1f}°)"
-            )
-        tee_traj.append(belief)
+        belief_mean = np.asarray(reply.belief.mean, dtype=float)
+        print(
+            f"  [real] {label}: tee=({belief_mean[0]:+.3f}, "
+            f"{belief_mean[1]:+.3f}, {np.degrees(belief_mean[2]):+6.1f}°)"
+        )
+        tee_traj.append(belief_mean)
         ee_traj.append(wp.copy())
 
     return np.asarray(tee_traj), np.asarray(ee_traj)
@@ -594,43 +499,26 @@ def debug_realtime(
       4. Print both trajectories side-by-side.
     """
     cmd_addr = f"tcp://{args.server_host}:{args.cmd_port}"
-    resp_addr = f"tcp://{args.server_host}:{args.resp_port}"
 
-    print(f"[debug-realtime] Connecting to control server")
-    print(f"  command socket  REQ → {cmd_addr}")
-    print(f"  response socket SUB ← {resp_addr}")
-    # NOTE: conflate=False is required because the controller publishes
-    # multipart frames ([topic][json][rgb][depth]) and ZMQ's CONFLATE option
-    # doesn't support multipart — it asserts (`!_more` in fq.cpp). We get
-    # "latest only" semantics from recv_response_latest(drain=True) instead.
+    print(f"[debug-realtime] Connecting to control server  REQ ⇄ {cmd_addr}")
     planner = PlannerClient(
         command_addr=cmd_addr,
-        response_addr=resp_addr,
-        conflate=False,
-        # Default 1 s is tight: the controller acks before motion starts, but
-        # under load the REQ round-trip can spike. Bump to 5 s.
-        command_timeout_ms=5000,
+        # The reply to a "move" command only comes back after the motion
+        # completes, so the timeout has to cover the longest expected motion.
+        timeout_ms=args.req_timeout_ms,
     )
 
     try:
-        # ── 1. Initial belief: seed MuJoCo ───────────────────────────────────
-        response = None
-        last_err: Optional[Exception] = None
-        for attempt in range(1, 21):
-            try:
-                response, _rgb, _depth = planner.recv_response_latest(drain=True)
-                break
-            except zmq.Again as e:
-                last_err = e
-                print(f"  [attempt {attempt}/20] no response yet; retrying...")
-                time.sleep(0.25)
+        # ── 1. Initial belief: query and seed MuJoCo ─────────────────────────
+        print("[debug-realtime] Querying initial belief…")
+        try:
+            reply = planner.query()
+        except zmq.Again as e:
+            raise RuntimeError(f"No reply from control server: {e}")
+        if not reply.success:
+            raise RuntimeError(f"Query rejected by controller: {reply.error}")
 
-        if response is None:
-            raise RuntimeError(f"No response from control server: {last_err}")
-
-        mean = _apply_response_to_mj(mj_model, mj_data, response)
-        if mean is None:
-            raise RuntimeError("Control server response had no beliefs")
+        mean = _apply_reply_to_mj(mj_model, mj_data, reply)
         print(
             f"[debug-realtime] Seeded MuJoCo t_block: "
             f"x={mean[0]:.3f} m, y={mean[1]:.3f} m, yaw={np.degrees(mean[2]):.1f}°"
@@ -686,9 +574,9 @@ def main():
     parser.add_argument('--server-host', default='localhost',
                         help='Hostname/IP of the controller server (real robot machine)')
     parser.add_argument('--cmd-port', type=int, default=5555,
-                        help='ZMQ REQ port for sending commands to the controller')
-    parser.add_argument('--resp-port', type=int, default=5556,
-                        help='ZMQ SUB port for receiving responses from the controller')
+                        help='ZMQ REQ/REP port for command round-trips with the controller')
+    parser.add_argument('--req-timeout-ms', type=int, default=60_000,
+                        help='REQ recv/send timeout in ms; must exceed the longest motion duration')
     parser.add_argument('--sweep-x', type=float, default=SWEEP_X,
                         help='X position of the debug-realtime y-sweep (m)')
     parser.add_argument('--sweep-y-lo', type=float, default=SWEEP_Y_LO,
