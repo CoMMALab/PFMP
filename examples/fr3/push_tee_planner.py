@@ -304,11 +304,56 @@ def _exec_motion_sim(
     return np.asarray(traj)
 
 
+def _reconnect_req(planner: PlannerClient, command_timeout_ms: int = 5000) -> None:
+    """Recreate the REQ socket on the planner.
+
+    After a recv timeout (`zmq.Again`) the REQ state machine is stuck — it
+    expects a recv before it can send again. The only clean recovery is to
+    close and re-open the socket.
+    """
+    planner.cmd_sock.close(linger=0)
+    s = planner.ctx.socket(zmq.REQ)
+    s.setsockopt(zmq.RCVTIMEO, command_timeout_ms)
+    s.setsockopt(zmq.SNDTIMEO, command_timeout_ms)
+    s.connect(planner.command_addr)
+    planner.cmd_sock = s
+
+
+def _send_with_retry(
+    planner: PlannerClient,
+    cmd: Command,
+    label: str,
+    max_attempts: int = 30,
+    retry_pause_s: float = 1.0,
+    command_timeout_ms: int = 5000,
+) -> dict:
+    """send_command, but reconnect-and-retry on zmq.Again.
+
+    Each attempt waits up to command_timeout_ms for the ack. If the controller
+    is busy (long motion + perception + publish + recv), the ack might miss
+    one window but land on the next. Worst case (controller crash + restart),
+    reconnecting also lets a freshly-launched controller take over.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return planner.send_command(cmd)
+        except zmq.Again:
+            print(
+                f"  [real] {label}: send_command timed out "
+                f"(attempt {attempt}/{max_attempts}); reconnecting REQ and retrying…"
+            )
+            _reconnect_req(planner, command_timeout_ms=command_timeout_ms)
+            time.sleep(retry_pause_s)
+    raise RuntimeError(f"send_command failed after {max_attempts} attempts")
+
+
 def _exec_motion_real(
     planner: PlannerClient,
     waypoints: np.ndarray,
     motion_timeout_s: float = 15.0,
     ack_settle_s: float = 0.1,
+    send_max_attempts: int = 30,
+    send_retry_pause_s: float = 1.0,
 ) -> np.ndarray:
     """Send each waypoint to the controller and record the post-motion belief.
 
@@ -319,18 +364,22 @@ def _exec_motion_real(
     We wait briefly for that pre-motion publish to settle into our SUB queue,
     drain to capture seq=N, then wait for a response with seq > N — that's the
     next iteration's publish, which runs after execute_xy returns.
+
+    If the ack doesn't arrive within the REQ timeout, we reconnect and retry
+    (up to send_max_attempts times) before giving up on a waypoint.
     """
     traj = []
     for i, wp in enumerate(waypoints):
         cmd = Command(xy=wp.tolist())
+        label = f"wp {i+1:2d}/{len(waypoints)}"
         try:
-            ack = planner.send_command(cmd)
-        except zmq.Again:
-            # REQ timed out waiting for ack — controller is likely down, and
-            # the ZMQ REQ state machine is now stuck (must recv before sending
-            # again). Fill the rest with NaN and bail.
-            print(f"  [real] wp {i+1}: send_command timed out; controller may be down. "
-                  f"Skipping remaining {len(waypoints) - i} waypoints.")
+            ack = _send_with_retry(
+                planner, cmd, label,
+                max_attempts=send_max_attempts,
+                retry_pause_s=send_retry_pause_s,
+            )
+        except RuntimeError as e:
+            print(f"  [real] {label}: {e}; skipping remaining {len(waypoints) - i} waypoints.")
             for _ in range(i, len(waypoints)):
                 traj.append(np.full(3, np.nan))
             break
