@@ -37,11 +37,15 @@ from ik_cache import ik_from_cache, get_or_build_cache, HOME_Q, EE_HEIGHT
 from pub_sub.controller import ControllerEndpoint
 from pub_sub.protocol import TeeBelief
 
+import jax.numpy as jnp
+import franky
+
 
 ROBOT_IP = "172.16.0.3"
 VELOCITY_SCALE = 0.05
 MAX_JUMP_DEG = 20.0
 XY_STEP_M = 0.025
+CONTROL_ATTEMPTS = 50
 
 
 class Snapshot(NamedTuple):
@@ -264,26 +268,36 @@ def robot_current_xy(robot) -> np.ndarray:
         float(pose.translation[1]),
     ])
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ip", default=ROBOT_IP)
-    parser.add_argument("--speed", type=float, default=VELOCITY_SCALE)
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--wf", default="wf.npz")
-    parser.add_argument("--cache", default=None)
-    parser.add_argument("--xy-step", type=float, default=XY_STEP_M)  # unused with CartesianMotion
-    parser.add_argument("--server", action="store_true") # use as server with ControlEndpoint
-    parser.add_argument("--cmd-port", type=int, default=5555,
-                        help="ZMQ REP port for commands (server mode)")
-    parser.add_argument("--resp-port", type=int, default=5556,
-                        help="ZMQ PUB port for responses (server mode)")
+# recover from errors
+# time.sleep()
 
-    # Default behavior: autonomous random target sampling.
-    # Manual behavior: wait for stdin commands: xy <x> <y>, home, q.
-    parser.add_argument("--manual", action="store_true")
+def go_pushing_plane(robot, target_xy, ik_cache):
+    target_xy = np.asarray(target_xy, dtype=float)
+    target_q = np.array(ik_from_cache(jnp.array(target_xy), ik_cache))
+    return robot.move(franky.JointMotion(target_q.tolist()))
 
-    args = parser.parse_args()
+def go_home(robot):
+    return robot.move(franky.JointMotion(HOME_Q.tolist()))
 
+def execute_xy(robot: franky.Robot, target_xy: np.ndarray) -> bool:
+    target_xy = np.asarray(target_xy, dtype=float)
+    current_xy = robot_current_xy(robot)
+    delta_xy = target_xy - current_xy
+    try:
+        robot.move(franky.CartesianMotion(
+            franky.Affine([
+                float(delta_xy[0]),
+                float(-delta_xy[1]),  # franky expects negated y coord
+                0.0,
+            ]),
+            franky.ReferenceType.Relative,
+        ))
+        return True
+    except:
+        return False
+
+
+def main(args):
     # ── World frame & IK cache ────────────────────────────────────────────────
     wf = WorldFrame.load(args.wf)
     cache_path = args.cache or os.path.join(
@@ -328,13 +342,15 @@ def main():
     current_xy = None  # None means: not on the pushing plane yet
 
     if not args.dry_run:
-        import franky
-
         print(f"Connecting to {args.ip}…")
         robot = franky.Robot(args.ip)
         robot.relative_dynamics_factor = args.speed
-        robot.recover_from_errors()
-        robot.move(franky.JointMotion(HOME_Q.tolist()))
+        for attempt in range(CONTROL_ATTEMPTS):
+            try:
+                go_home(robot)
+                break
+            except:
+                robot.recover_from_errors()
         q_prev = np.array(robot.current_joint_state.position, dtype=float)
         print("At home. Not on pushing plane.")
 
@@ -346,7 +362,7 @@ def main():
 
     # ── ZMQ endpoint (server mode only) ───────────────────────────────────────
     endpoint: Optional[ControllerEndpoint] = None
-    if args.server:
+    if args.mode == 'server':
         cmd_addr = f"tcp://*:{args.cmd_port}"
         resp_addr = f"tcp://*:{args.resp_port}"
         endpoint = ControllerEndpoint(
@@ -355,115 +371,35 @@ def main():
             recv_timeout_ms=0,  # non-blocking REP
         )
 
-    if args.server:
+    # init arm position in pushing plane
+    success = False
+    for attempt in range(CONTROL_ATTEMPTS):
+        try:
+            go_pushing_plane(robot, args.init_xy, ik_cache)
+            success = True
+            break
+        except Exception as e:
+            print(e)
+            robot.recover_from_errors()
+            time.sleep(0.05)
+    if success:
+        print('moved to init_xy:', args.init_xy)
+    else:
+        print('failed to init xy')
+
+    if args.mode == 'server':
         print(f"\nLoop running in SERVER mode.")
         print(f"  commands  REP ← {cmd_addr}")
         print(f"  responses PUB → {resp_addr}")
-    elif args.manual:
+    elif args.mode == 'manual':
         print("\nLoop running in MANUAL mode.")
         print("Commands: xy <x> <y>  |  home  |  q")
     else:
         print("\nLoop running in AUTO random-target mode.")
         print("Commands: q")
 
-    def go_home():
-        nonlocal current_xy, q_prev
 
-        if robot is not None:
-            robot.recover_from_errors()
-            robot.move(franky.JointMotion(HOME_Q.tolist()))
-            q_prev = np.array(robot.current_joint_state.position, dtype=float)
-        else:
-            q_prev = np.array(HOME_Q)
-
-        current_xy = None
-        shared.update_path(None)
-        print("Returned to home. Exited pushing plane.")
-
-    def execute_xy(target_xy: np.ndarray):
-        nonlocal current_xy, q_prev
-
-        import jax.numpy as jnp
-
-        target_xy = np.asarray(target_xy, dtype=float)
-
-        if current_xy is None:
-            # From HOME / non-pushing pose: descend directly to the requested xy
-            # point on the pushing plane. Do not interpolate from HOME's
-            # projected xy.
-            q_target = np.array(ik_from_cache(jnp.array(target_xy), ik_cache))
-
-            shared.update_path(np.array([target_xy]))
-
-            if robot is not None:
-                robot.recover_from_errors()
-                robot.move(franky.JointMotion(q_target.tolist()))
-                # Let any residual velocity / planner state settle before the
-                # next motion — concatenating motions tightly is a known cause
-                # of joint_motion_generator_velocity_discontinuity reflexes.
-                time.sleep(0.05)
-                q_prev = np.array(robot.current_joint_state.position, dtype=float)
-                current_xy = robot_current_xy(robot)
-            else:
-                q_prev = q_target
-                current_xy = target_xy.copy()
-
-            print(f"Entered pushing plane at xy={current_xy}, commanded={target_xy}")
-            return
-
-        # Already on the pushing plane: move linearly in Cartesian space.
-        path_xy = np.vstack([current_xy, target_xy])
-        shared.update_path(path_xy)
-
-        if robot is not None:
-            delta_xy = target_xy - current_xy
-
-            # Bounded retry: if the motion keeps reflex-aborting, give up and
-            # raise so the outer handler can log + recover + accept the next
-            # command. An unbounded retry deadlocks the server.
-            max_retries = 3
-            last_err: Optional[Exception] = None
-            succeeded = False
-            for attempt in range(1, max_retries + 1):
-                try:
-                    robot.move(franky.CartesianMotion(
-                        franky.Affine([
-                            float(delta_xy[0]),
-                            float(-delta_xy[1]),  # franky expects negated y coord
-                            0.0,
-                        ]),
-                        franky.ReferenceType.Relative,
-                    ))
-                    succeeded = True
-                    break
-                except Exception as e:
-                    last_err = e
-                    print(f"[WARN] cartesian motion attempt {attempt}/{max_retries} failed: {e}")
-                    try:
-                        robot.recover_from_errors()
-                    except Exception as rec_e:
-                        print(f"[WARN] recover_from_errors failed: {rec_e}")
-                    time.sleep(0.1)
-
-            if not succeeded:
-                raise RuntimeError(
-                    f"Cartesian motion failed after {max_retries} attempts: {last_err}"
-                )
-
-            # Small settle to avoid velocity discontinuities into the next motion.
-            time.sleep(0.05)
-
-            q_prev = np.array(robot.current_joint_state.position, dtype=float)
-            current_xy = robot_current_xy(robot)
-        else:
-            q_prev = np.array(ik_from_cache(jnp.array(target_xy), ik_cache))
-            current_xy = target_xy.copy()
-
-        print(f"Moved linearly to xy={current_xy}, commanded={target_xy}")
-
-        # response = 
-        # return response
-
+    # main loop
     try:
         while not stop_event.is_set():
             snap = shared.get()
@@ -487,7 +423,7 @@ def main():
                 shared.update_perception(mask=mask, ekf_mean=ekf.mean.copy())
                 last_ekf_seq = snap.seq
 
-            if args.server:
+            if args.mode == 'server':
                 # Publish current state (rgb, depth, joints, EKF belief) for any
                 # subscribers. Then non-blockingly poll for an incoming command.
                 if endpoint is not None and snap.color is not None and snap.depth is not None:
@@ -520,7 +456,7 @@ def main():
                             # Don't let a single failed motion kill the server.
                             # Log, try to recover, and keep accepting commands.
                             try:
-                                execute_xy(target_xy)
+                                execute_xy(robot, target_xy)
                             except Exception as e:
                                 print(f"[server] execute_xy failed: {e!r}")
                                 if robot is not None:
@@ -529,7 +465,7 @@ def main():
                                     except Exception as rec_e:
                                         print(f"[server] recover_from_errors failed: {rec_e!r}")
 
-            elif args.manual:
+            elif args.mode == 'manual':
                 # Manual mode: consume stdin only when user typed a command.
                 if select.select([sys.stdin], [], [], 0.0)[0]:
                     line = sys.stdin.readline().strip()
@@ -543,12 +479,18 @@ def main():
                         break
 
                     if parts[0] == "home":
-                        go_home()
+                        success = go_home(robot)
+                        print('home msg:', success)
                         continue
 
                     if parts[0] == "xy" and len(parts) == 3:
+                        current_xy = robot_current_xy(robot)
                         target_xy = np.array([float(parts[1]), float(parts[2])])
-                        execute_xy(target_xy)
+                        path_xy = np.vstack([current_xy, target_xy])
+                        shared.update_path(path_xy)
+
+                        success = execute_xy(robot, target_xy)
+                        print('xy msg:', success)
                         continue
 
                     print(f"[WARN] unknown command: {line}")
@@ -557,7 +499,8 @@ def main():
                 # Auto mode: preserve your current behavior.
                 # It continuously samples random xy targets and executes them.
                 target_xy = rng.normal([0.4, 0.0], 0.025, size=2)
-                execute_xy(target_xy)
+                success = execute_xy(robot, target_xy)
+                print('success:', success)
 
             time.sleep(0.001)
 
@@ -593,4 +536,23 @@ def main():
                 print(f"[WARN] could not return to home: {e}")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ip", default=ROBOT_IP)
+    parser.add_argument("--speed", type=float, default=VELOCITY_SCALE)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--wf", default="wf.npz")
+    parser.add_argument("--cache", default=None)
+    parser.add_argument("--cmd-port", type=int, default=5555,
+                        help="ZMQ REP port for commands (server mode)")
+    parser.add_argument("--resp-port", type=int, default=5556,
+                        help="ZMQ PUB port for responses (server mode)")
+
+    # Default behavior: autonomous random target sampling.
+    # Manual behavior: wait for stdin commands: xy <x> <y>, home, q.
+    parser.add_argument("--mode", type=str, default='manual', help="options: manual, random, server")
+
+    parser.add_argument("--init-xy", type=float, nargs=2, default=[0.4, 0.0])
+
+    args = parser.parse_args()
+
+    main(args)
