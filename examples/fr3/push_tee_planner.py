@@ -11,6 +11,7 @@ from typing import NamedTuple, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
+import matplotlib.pyplot as plt
 import mujoco
 import numpy as np
 import zmq
@@ -19,6 +20,14 @@ from mujoco import mjx
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from geom_tee import STEM_HALF, CAP_HALF, CAP_CTR
+
+# Real-world tee dimensions (8" × 8" T) for top-down outline plotting; see
+# examples/fr3/perception/tee.py and viz.py for the full 3D shape definition.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "perception"))
+from tee import (
+    TEE_WIDTH_M, TEE_LENGTH_M, TEE_XY_THICKNESS_M,
+    TEE_CENTER_OFFSET_Y_M,
+)
 
 import pfmp
 from pfmp.run_batch import Trajectory
@@ -257,6 +266,113 @@ def _make_sweep_waypoints(
     return np.stack([np.full_like(ys, sweep_x), ys], axis=1)
 
 
+def _tee_outline_2d_local() -> Tuple[np.ndarray, np.ndarray]:
+    """Top-down 2D outlines (cap, stem) of the tee in local body coords.
+
+    Mirrors the xy footprint from `examples/fr3/perception/viz.py`'s
+    `_tee_box_vertices_local`. The local origin is at the AprilTag (top
+    surface center, with `TEE_CENTER_OFFSET_Y_M` y-offset). At yaw=0 the
+    stem points in the −y direction.
+    """
+    half_w = TEE_WIDTH_M / 2.0
+    stem_half_w = TEE_XY_THICKNESS_M / 2.0
+    stem_len = TEE_LENGTH_M - TEE_XY_THICKNESS_M
+    cy = TEE_CENTER_OFFSET_Y_M
+
+    cap = np.array([
+        [-half_w, 0.0       + cy],
+        [ half_w, 0.0       + cy],
+        [ half_w, TEE_XY_THICKNESS_M + cy],
+        [-half_w, TEE_XY_THICKNESS_M + cy],
+    ])
+    stem = np.array([
+        [-stem_half_w, -stem_len + cy],
+        [ stem_half_w, -stem_len + cy],
+        [ stem_half_w, 0.0       + cy],
+        [-stem_half_w, 0.0       + cy],
+    ])
+    return cap, stem
+
+
+def _draw_tee(ax, x: float, y: float, yaw: float, color="C1", alpha: float = 0.3) -> None:
+    """Draw a top-down tee outline at (x, y) with yaw in radians."""
+    cap_local, stem_local = _tee_outline_2d_local()
+    R = np.array([
+        [np.cos(yaw), -np.sin(yaw)],
+        [np.sin(yaw),  np.cos(yaw)],
+    ])
+    cap_w  = (R @ cap_local.T ).T + np.array([x, y])
+    stem_w = (R @ stem_local.T).T + np.array([x, y])
+    for poly in (cap_w, stem_w):
+        ax.fill(poly[:, 0], poly[:, 1], color=color, alpha=alpha,
+                edgecolor=color, linewidth=0.8)
+
+
+def _plot_trajectories(
+    waypoints: np.ndarray,
+    sim_tee: np.ndarray,
+    sim_ee: np.ndarray,
+    real_tee: np.ndarray,
+    real_ee: np.ndarray,
+    save_path: Optional[str] = None,
+) -> None:
+    """Side-by-side top-down plot of tee outlines + EE trail for sim and real."""
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7), sharex=True, sharey=True)
+
+    panels = [
+        ("SIM",  sim_tee,  sim_ee,  axes[0]),
+        ("REAL", real_tee, real_ee, axes[1]),
+    ]
+
+    for name, tee_traj, ee_traj, ax in panels:
+        # Tee outlines: faded (early) → opaque (late) over the trajectory.
+        n = len(tee_traj)
+        for i, p in enumerate(tee_traj):
+            if not np.all(np.isfinite(p)):
+                continue
+            alpha = 0.15 + 0.65 * (i / max(n - 1, 1))
+            _draw_tee(ax, p[0], p[1], p[2], color="C1", alpha=alpha)
+
+        # Tee centroid trail.
+        valid_t = np.all(np.isfinite(tee_traj), axis=1)
+        if np.any(valid_t):
+            ax.plot(tee_traj[valid_t, 0], tee_traj[valid_t, 1], "-",
+                    color="C1", alpha=0.6, linewidth=1.2, label="tee centroid")
+            ax.scatter(tee_traj[valid_t, 0][0], tee_traj[valid_t, 1][0],
+                       s=60, marker="s", facecolor="white", edgecolor="C1",
+                       zorder=5, label="tee start")
+
+        # Commanded waypoints (gray dotted reference).
+        ax.plot(waypoints[:, 0], waypoints[:, 1], ":", color="gray",
+                alpha=0.5, label="commanded xy")
+
+        # EE trail (sim: actual gripper; real: commanded wp as proxy).
+        ee = np.asarray(ee_traj)
+        valid_e = np.all(np.isfinite(ee), axis=1)
+        if np.any(valid_e):
+            ax.plot(ee[valid_e, 0], ee[valid_e, 1], "-o",
+                    color="C0", linewidth=1.5, markersize=5, label="EE")
+            ax.scatter(ee[valid_e, 0][0], ee[valid_e, 1][0], s=80,
+                       facecolor="white", edgecolor="C0",
+                       zorder=5, label="EE start")
+
+        ax.set_title(name)
+        ax.set_xlabel("x (m)")
+        ax.set_ylabel("y (m)")
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best", fontsize=8)
+
+    fig.suptitle("debug-realtime: top-down tee + EE trajectories")
+    fig.tight_layout()
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=120, bbox_inches="tight")
+        print(f"[debug-realtime] Saved trajectory plot to {save_path}")
+
+    plt.show()
+
+
 def _exec_motion_sim(
     mj_model: mujoco.MjModel,
     mj_data: mujoco.MjData,
@@ -265,14 +381,19 @@ def _exec_motion_sim(
     steps_per_wp: int = 500,
     theta: Optional[PushParams] = None,
     goal_marker_fn: Optional[callable] = None,
-) -> np.ndarray:
-    """Drive MuJoCo through the waypoints and record t-block pose at each.
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Drive MuJoCo through the waypoints and record (tee, EE) at each.
 
     Each waypoint sets the position-controller targets to ik_from_cache(xy) and
-    steps physics for `steps_per_wp` ticks. Returns an (N, 3) array of
-    [x, y, yaw] for the t-block at the end of each waypoint.
+    steps physics for `steps_per_wp` ticks. Returns
+        tee_traj: (N, 3) array of [x, y, yaw] for the t-block,
+        ee_traj:  (N, 2) array of [x, y] for the gripper site (or commanded
+                  xy if theta is None / no gripper site is available).
     """
-    traj = []
+    tee_traj = []
+    ee_traj = []
+    gripper_site_id = theta.gripper_site_id if theta is not None else None
+
     with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
         for i, wp in enumerate(waypoints):
             target_q = np.asarray(ik_from_cache(jnp.asarray(wp), ik_cache))
@@ -290,10 +411,16 @@ def _exec_motion_sim(
                     break
 
             tee = mj_data.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 3].copy()
-            traj.append(tee)
+            tee_traj.append(tee)
+            if gripper_site_id is not None:
+                ee = np.array(mj_data.site_xpos[gripper_site_id, :2], dtype=float)
+            else:
+                ee = wp.copy()
+            ee_traj.append(ee)
             print(
                 f"  [sim ] wp {i+1:2d}/{len(waypoints)}: "
                 f"target_xy=({wp[0]:+.3f}, {wp[1]:+.3f})  "
+                f"ee=({ee[0]:+.3f}, {ee[1]:+.3f})  "
                 f"tee=({tee[0]:+.3f}, {tee[1]:+.3f}, {np.degrees(tee[2]):+6.1f}°)"
             )
 
@@ -301,7 +428,7 @@ def _exec_motion_sim(
                 print("  [sim ] viewer closed; stopping early.")
                 break
 
-    return np.asarray(traj)
+    return np.asarray(tee_traj), np.asarray(ee_traj)
 
 
 def _reconnect_req(planner: PlannerClient, command_timeout_ms: int = 5000) -> None:
@@ -354,8 +481,8 @@ def _exec_motion_real(
     ack_settle_s: float = 0.1,
     send_max_attempts: int = 30,
     send_retry_pause_s: float = 1.0,
-) -> np.ndarray:
-    """Send each waypoint to the controller and record the post-motion belief.
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Send each waypoint to the controller and record (tee, EE) at each.
 
     Sequencing inside the controller's main loop:
         … perception → publish(seq=N) → recv_command → reply_command → execute_xy …
@@ -367,8 +494,13 @@ def _exec_motion_real(
 
     If the ack doesn't arrive within the REQ timeout, we reconnect and retry
     (up to send_max_attempts times) before giving up on a waypoint.
+
+    Returns (tee_traj, ee_traj). The real EE position isn't published, so we
+    use the commanded waypoint as a proxy (the controller's CartesianMotion
+    targets exactly that xy). Skipped/rejected waypoints get NaN.
     """
-    traj = []
+    tee_traj = []
+    ee_traj = []
     for i, wp in enumerate(waypoints):
         cmd = Command(xy=wp.tolist())
         label = f"wp {i+1:2d}/{len(waypoints)}"
@@ -381,11 +513,13 @@ def _exec_motion_real(
         except RuntimeError as e:
             print(f"  [real] {label}: {e}; skipping remaining {len(waypoints) - i} waypoints.")
             for _ in range(i, len(waypoints)):
-                traj.append(np.full(3, np.nan))
+                tee_traj.append(np.full(3, np.nan))
+                ee_traj.append(np.full(2, np.nan))
             break
         if not ack.get("accepted", False):
             print(f"  [real] wp {i+1}: command rejected: {ack}")
-            traj.append(np.full(3, np.nan))
+            tee_traj.append(np.full(3, np.nan))
+            ee_traj.append(np.full(2, np.nan))
             continue
         print(f"  [real] wp {i+1:2d}/{len(waypoints)}: sent xy=({wp[0]:+.3f}, {wp[1]:+.3f})")
 
@@ -424,9 +558,10 @@ def _exec_motion_real(
                 f"  [real] wp {i+1:2d}/{len(waypoints)}: "
                 f"tee=({belief[0]:+.3f}, {belief[1]:+.3f}, {np.degrees(belief[2]):+6.1f}°)"
             )
-        traj.append(belief)
+        tee_traj.append(belief)
+        ee_traj.append(wp.copy())
 
-    return np.asarray(traj)
+    return np.asarray(tee_traj), np.asarray(ee_traj)
 
 
 def _print_trajectory(label: str, waypoints: np.ndarray, traj: np.ndarray) -> None:
@@ -521,18 +656,23 @@ def debug_realtime(
 
         # ── 2. Sim execution ─────────────────────────────────────────────────
         print("\n=== Executing sweep in MuJoCo (sim) ===")
-        sim_traj = _exec_motion_sim(
+        sim_tee, sim_ee = _exec_motion_sim(
             mj_model, mj_data, theta.ik_cache, waypoints,
             theta=theta, goal_marker_fn=goal_marker_fn,
         )
 
         # ── 3. Real-robot execution ──────────────────────────────────────────
         print("\n=== Executing sweep on real robot ===")
-        real_traj = _exec_motion_real(planner, waypoints)
+        real_tee, real_ee = _exec_motion_real(planner, waypoints)
 
         # ── 4. Print both trajectories ───────────────────────────────────────
-        _print_trajectory("SIM ", waypoints, sim_traj)
-        _print_trajectory("REAL", waypoints, real_traj)
+        _print_trajectory("SIM ", waypoints, sim_tee)
+        _print_trajectory("REAL", waypoints, real_tee)
+
+        # ── 5. Plot ──────────────────────────────────────────────────────────
+        plot_path = os.path.join(os.path.dirname(__file__), "debug_realtime_traj.png")
+        _plot_trajectories(waypoints, sim_tee, sim_ee, real_tee, real_ee,
+                           save_path=plot_path)
 
     finally:
         planner.close()
