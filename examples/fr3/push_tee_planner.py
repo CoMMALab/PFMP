@@ -209,6 +209,7 @@ def load_scene(xml_path: str):
     print(f"push_cylinder_visual geom id: {cyl_id} (−1 = not found)")
     return mj_model, mj_data
 
+#################################################################
 
 def simulate(                                                                                                                                                           
     init_belief: TeeBelief,                                                                                                                                             
@@ -677,6 +678,8 @@ def debug_realtime(
     finally:
         planner.close()
         print("\n[debug-realtime] Done.")
+
+#################################################################
 
 def main():
     parser = argparse.ArgumentParser(description="T-block pushing with PFMP")
