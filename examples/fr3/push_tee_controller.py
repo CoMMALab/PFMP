@@ -398,6 +398,10 @@ def main():
             if robot is not None:
                 robot.recover_from_errors()
                 robot.move(franky.JointMotion(q_target.tolist()))
+                # Let any residual velocity / planner state settle before the
+                # next motion — concatenating motions tightly is a known cause
+                # of joint_motion_generator_velocity_discontinuity reflexes.
+                time.sleep(0.05)
                 q_prev = np.array(robot.current_joint_state.position, dtype=float)
                 current_xy = robot_current_xy(robot)
             else:
@@ -414,7 +418,13 @@ def main():
         if robot is not None:
             delta_xy = target_xy - current_xy
 
-            while True:
+            # Bounded retry: if the motion keeps reflex-aborting, give up and
+            # raise so the outer handler can log + recover + accept the next
+            # command. An unbounded retry deadlocks the server.
+            max_retries = 3
+            last_err: Optional[Exception] = None
+            succeeded = False
+            for attempt in range(1, max_retries + 1):
                 try:
                     robot.move(franky.CartesianMotion(
                         franky.Affine([
@@ -424,10 +434,24 @@ def main():
                         ]),
                         franky.ReferenceType.Relative,
                     ))
+                    succeeded = True
                     break
                 except Exception as e:
-                    robot.recover_from_errors()
-                    print(f"[WARN] motion attempt failed: {e}")
+                    last_err = e
+                    print(f"[WARN] cartesian motion attempt {attempt}/{max_retries} failed: {e}")
+                    try:
+                        robot.recover_from_errors()
+                    except Exception as rec_e:
+                        print(f"[WARN] recover_from_errors failed: {rec_e}")
+                    time.sleep(0.1)
+
+            if not succeeded:
+                raise RuntimeError(
+                    f"Cartesian motion failed after {max_retries} attempts: {last_err}"
+                )
+
+            # Small settle to avoid velocity discontinuities into the next motion.
+            time.sleep(0.05)
 
             q_prev = np.array(robot.current_joint_state.position, dtype=float)
             current_xy = robot_current_xy(robot)
