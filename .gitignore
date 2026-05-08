@@ -156,8 +156,6 @@ logs/
 *.pt
 *.pth
 
-# Model/trajectory files (uncomment if you want to track some)
-# !experiments/important_result.npz
 
 # Temporary files
 *.tmp
@@ -200,14 +198,5 @@ datasets/
 *.bak
 *.backup
 
-
-
-
-
-
-
-
-# MUYANG
 debug.sh
 uv.lock
-CLAUDE.md
