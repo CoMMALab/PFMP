@@ -18,6 +18,7 @@ import select
 import sys
 import threading
 import time
+import cv2
 from typing import NamedTuple, Optional
 
 import numpy as np
@@ -118,8 +119,6 @@ def camera_vis_loop(
     shared: SharedSnapshot,
     stop_event: threading.Event,
 ):
-    import cv2
-
     while not stop_event.is_set():
         color, depth = get_rgbd_frames(cfg.pipe, "top")
         shared.update_frame(color, depth)
@@ -271,30 +270,26 @@ def robot_current_xy(robot) -> np.ndarray:
 # recover from errors
 # time.sleep()
 
-def go_pushing_plane(robot, target_xy, ik_cache):
+def go_pushing_plane(robot: franky.Robot, target_xy: np.ndarray, ik_cache) -> None:
     target_xy = np.asarray(target_xy, dtype=float)
     target_q = np.array(ik_from_cache(jnp.array(target_xy), ik_cache))
-    return robot.move(franky.JointMotion(target_q.tolist()))
+    robot.move(franky.JointMotion(target_q.tolist()))
 
-def go_home(robot):
-    return robot.move(franky.JointMotion(HOME_Q.tolist()))
+def go_home(robot: franky.Robot) -> None:
+    robot.move(franky.JointMotion(HOME_Q.tolist()))
 
-def execute_xy(robot: franky.Robot, target_xy: np.ndarray) -> bool:
+def execute_xy(robot: franky.Robot, target_xy: np.ndarray) -> None:
     target_xy = np.asarray(target_xy, dtype=float)
     current_xy = robot_current_xy(robot)
     delta_xy = target_xy - current_xy
-    try:
-        robot.move(franky.CartesianMotion(
-            franky.Affine([
-                float(delta_xy[0]),
-                float(-delta_xy[1]),  # franky expects negated y coord
-                0.0,
-            ]),
-            franky.ReferenceType.Relative,
-        ))
-        return True
-    except:
-        return False
+    robot.move(franky.CartesianMotion(
+        franky.Affine([
+            float(delta_xy[0]),
+            float(-delta_xy[1]),  # franky expects negated y coord
+            0.0,
+        ]),
+        franky.ReferenceType.Relative,
+    ))
 
 
 def main(args):
@@ -489,18 +484,29 @@ def main(args):
                         path_xy = np.vstack([current_xy, target_xy])
                         shared.update_path(path_xy)
 
-                        success = execute_xy(robot, target_xy)
-                        print('xy msg:', success)
+                        for attempt in range(CONTROL_ATTEMPTS):
+                            try:
+                                execute_xy(robot, target_xy)
+                                break
+                            except:
+                                robot.recover_from_errors()
+                                time.sleep(0.05)
                         continue
 
                     print(f"[WARN] unknown command: {line}")
 
             else:
-                # Auto mode: preserve your current behavior.
-                # It continuously samples random xy targets and executes them.
-                target_xy = rng.normal([0.4, 0.0], 0.025, size=2)
-                success = execute_xy(robot, target_xy)
-                print('success:', success)
+                current_xy = robot_current_xy(robot)
+                target_xy = rng.normal(args.init_xy, 0.05, size=2)
+                path_xy = np.vstack([current_xy, target_xy])
+                shared.update_path(path_xy)
+                for attempt in range(CONTROL_ATTEMPTS):
+                    try:
+                        execute_xy(robot, target_xy)
+                        break
+                    except:
+                        robot.recover_from_errors()
+                        time.sleep(0.05)
 
             time.sleep(0.001)
 
@@ -520,7 +526,6 @@ def main(args):
             print(f"[WARN] could not stop camera pipe: {e}")
 
         try:
-            import cv2
             cv2.destroyAllWindows()
         except Exception:
             pass
