@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from geom_tee import THICKNESS
 
 
-class PoseDetection(NamedTuple):
+class TeeDetection(NamedTuple):
     name: str
     pose: np.ndarray   # (3,) [x, y, yaw]
     R: np.ndarray      # (3, 3)
@@ -22,7 +22,7 @@ class EKF(NamedTuple):
     @staticmethod
     def init(
         frame: WorldFrame,
-        detections: list[PoseDetection] | None = None,
+        detections: list[TeeDetection] | None = None,
     ) -> "EKF":
         """Initialize EKF from existing pose detections. Falls back to zeros."""
         detections = [] if detections is None else detections
@@ -92,13 +92,13 @@ class EKF(NamedTuple):
 
         return self._replace(mean=mean_new, cov=cov_new)
 
-    def update(self, detections: list[PoseDetection]) -> "EKF":
+    def update(self, detections: list[TeeDetection]) -> "EKF":
         """Fuse already-computed pose detections."""
         ekf = self.predict()
 
         for det in detections:
             z = det.pose.copy()
-            z[2] = align_angle_to_reference(z[2], ekf.mean[2])
+            # z[2] = align_angle_to_reference(z[2], ekf.mean[2])
             ekf = ekf.update_pose(z, det.R, gated=det.gated)
 
         return ekf
@@ -115,8 +115,3 @@ class EKF(NamedTuple):
 
 def wrap_angle(a: float) -> float:
     return (a + np.pi) % (2.0 * np.pi) - np.pi
-
-def align_angle_to_reference(theta: float, ref: float) -> float:
-    candidates = np.array([theta, theta + np.pi, theta - np.pi])
-    diffs = np.array([wrap_angle(c - ref) for c in candidates])
-    return candidates[np.argmin(np.abs(diffs))]

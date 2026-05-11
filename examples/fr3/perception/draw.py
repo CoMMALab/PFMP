@@ -104,6 +104,8 @@ def make_debug_view(color, mask, wf: WorldFrame, serial_top, K_top,
         tag_xy, tag_yaw = det.pose[:2], det.pose[2]
         body_c = project_world_xy(tag_xy, ekf_z, T_w2c, K_top)[0]
         cv2.circle(overlay, tuple(body_c), 8, YELLOW, -1)
+        cv2.putText(overlay, det.name, tuple(body_c + np.array([10, -10])),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, GREEN, 2, cv2.LINE_AA)
         draw_projected_outline(overlay, tag_xy, tag_yaw, ekf_z, T_w2c, K_top, GREEN)
         draw_projected_outline(bw,      tag_xy, tag_yaw, ekf_z, T_w2c, K_top, GREEN)
 

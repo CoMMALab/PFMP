@@ -17,14 +17,20 @@ import sys
 import time
 from typing import Optional, Tuple
 
+import cv2
 import jax.numpy as jnp
-import matplotlib.pyplot as plt
 import mujoco
+import mujoco.viewer
 import numpy as np
 import zmq
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ik_cache import ik_from_cache, get_or_build_cache
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "perception"))
+from camera import WorldFrame, SERIAL_NUMS
+from draw import CYAN, draw_pose_marker
+from geom_tee import THICKNESS
 
 from pub_sub.protocol import Command
 from pub_sub.planner import PlannerClient
@@ -111,8 +117,8 @@ def send_with_retry(planner, cmd, label, max_attempts=30, retry_pause=1.0):
     raise RuntimeError(f"send_command failed after {max_attempts} attempts")
 
 
-def exec_real(planner, waypoints, motion_timeout=15.0) -> Tuple[np.ndarray, np.ndarray]:
-    tee_traj, ee_traj = [], []
+def exec_real(planner, waypoints, motion_timeout=15.0) -> Tuple[np.ndarray, np.ndarray, list[Optional[np.ndarray]]]:
+    tee_traj, ee_traj, frames = [], [], []
     for i, wp in enumerate(waypoints):
         label = f"wp {i+1}/{len(waypoints)}"
         try:
@@ -122,10 +128,12 @@ def exec_real(planner, waypoints, motion_timeout=15.0) -> Tuple[np.ndarray, np.n
             for _ in range(i, len(waypoints)):
                 tee_traj.append(np.full(3, np.nan))
                 ee_traj.append(np.full(2, np.nan))
+                frames.append(None)
             break
         if not ack.get("accepted", False):
             tee_traj.append(np.full(3, np.nan))
             ee_traj.append(np.full(2, np.nan))
+            frames.append(None)
             continue
 
         time.sleep(0.1)
@@ -137,14 +145,16 @@ def exec_real(planner, waypoints, motion_timeout=15.0) -> Tuple[np.ndarray, np.n
             pass
 
         belief = None
+        frame = None
         t0 = time.time()
         while time.time() - t0 < motion_timeout:
             try:
-                resp, _, _ = planner.recv_response_latest(drain=True)
+                resp, rgb, _ = planner.recv_response_latest(drain=True)
             except zmq.Again:
                 time.sleep(0.05)
                 continue
             if int(resp.get("seq", -1)) > pre_seq:
+                frame = rgb.copy()
                 beliefs = resp.get("beliefs") or []
                 if beliefs:
                     belief = np.asarray(beliefs[-1]["mean"], dtype=float)
@@ -158,8 +168,9 @@ def exec_real(planner, waypoints, motion_timeout=15.0) -> Tuple[np.ndarray, np.n
                   f"tee=({belief[0]:+.3f}, {belief[1]:+.3f}, {np.degrees(belief[2]):+.1f}°)")
         tee_traj.append(belief)
         ee_traj.append(wp.copy())
+        frames.append(frame)
 
-    return np.asarray(tee_traj), np.asarray(ee_traj)
+    return np.asarray(tee_traj), np.asarray(ee_traj), frames
 
 
 # ── Comparison ────────────────────────────────────────────────────────────────
@@ -176,31 +187,105 @@ def print_comparison(waypoints, sim_tee, real_tee):
         print(f"{i+1:>3}  {wp[0]:+8.3f} {wp[1]:+8.3f}  {fmt(s)}  {fmt(r)}")
 
 
-def plot_comparison(waypoints, sim_tee, sim_ee, real_tee, real_ee, save_path=None):
-    fig, axes = plt.subplots(1, 2, figsize=(14, 7), sharex=True, sharey=True)
-    for (name, tee, ee), ax in zip(
-        [("SIM", sim_tee, sim_ee), ("REAL", real_tee, real_ee)], axes
-    ):
-        valid_t = np.all(np.isfinite(tee), axis=1)
-        if np.any(valid_t):
-            ax.plot(tee[valid_t, 0], tee[valid_t, 1], "-o", color="C1",
-                    linewidth=1.5, markersize=5, label="tee centroid")
-        ax.plot(waypoints[:, 0], waypoints[:, 1], ":", color="gray",
-                alpha=0.5, label="commanded xy")
-        valid_e = np.all(np.isfinite(ee), axis=1)
-        if np.any(valid_e):
-            ax.plot(ee[valid_e, 0], ee[valid_e, 1], "-", color="C0",
-                    linewidth=1.2, alpha=0.7, label="EE")
-        ax.set_title(name)
-        ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
-        ax.set_aspect("equal"); ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8)
-    fig.suptitle("sysid: sim vs real T-block response to EE sweep")
-    fig.tight_layout()
-    if save_path:
-        fig.savefig(save_path, dpi=120, bbox_inches="tight")
-        print(f"[sysid] saved → {save_path}")
-    plt.show()
+def _valid_pose(pose: np.ndarray) -> bool:
+    return pose is not None and np.asarray(pose).shape == (3,) and np.all(np.isfinite(pose))
+
+
+def make_review_frame(
+    frame: Optional[np.ndarray],
+    wf: WorldFrame,
+    serial_top: str,
+    K_top: np.ndarray,
+    sim_pose: np.ndarray,
+    real_pose: np.ndarray,
+    waypoint: np.ndarray,
+    idx: int,
+    n: int,
+) -> np.ndarray:
+    if frame is None:
+        canvas = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.putText(canvas, "no RGB frame captured", (30, 240),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (180, 180, 180), 2, cv2.LINE_AA)
+    else:
+        canvas = frame.copy()
+
+    T_w2c = np.linalg.inv(wf.t_cams[serial_top])
+    z_body = THICKNESS / 2
+    gray = (170, 170, 170)
+
+    if _valid_pose(sim_pose):
+        draw_pose_marker(
+            canvas,
+            sim_pose[:2],
+            float(sim_pose[2]),
+            z_body,
+            T_w2c,
+            K_top,
+            gray,
+            outline_thickness=2,
+            center_radius=5,
+        )
+
+    if _valid_pose(real_pose):
+        draw_pose_marker(
+            canvas,
+            real_pose[:2],
+            float(real_pose[2]),
+            z_body,
+            T_w2c,
+            K_top,
+            CYAN,
+            outline_thickness=3,
+            center_radius=7,
+        )
+
+    cv2.putText(canvas, f"{idx + 1}/{n}  cmd=({waypoint[0]:+.3f},{waypoint[1]:+.3f})",
+                (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(canvas, "cyan=EKF belief   gray=MuJoCo prediction",
+                (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(canvas, "left/right: frame   q/esc: quit",
+                (20, canvas.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX,
+                0.65, (255, 255, 255), 2, cv2.LINE_AA)
+    return canvas
+
+
+def review_frames(
+    waypoints: np.ndarray,
+    frames: list[Optional[np.ndarray]],
+    sim_tee: np.ndarray,
+    real_tee: np.ndarray,
+    wf: WorldFrame,
+) -> None:
+    serial_top = SERIAL_NUMS["top"]
+    K_top = wf.Ks[serial_top]
+    n = min(len(waypoints), len(frames), len(sim_tee), len(real_tee))
+    if n == 0:
+        print("[sysid] no frames to review")
+        return
+
+    print("[sysid] review: left/right arrows cycle frames, q/esc exits")
+    idx = 0
+    while True:
+        view = make_review_frame(
+            frames[idx],
+            wf,
+            serial_top,
+            K_top,
+            sim_tee[idx],
+            real_tee[idx],
+            waypoints[idx],
+            idx,
+            n,
+        )
+        cv2.imshow("sysid review", view)
+        key = cv2.waitKeyEx(0)
+        if key in (ord("q"), 27):
+            break
+        if key in (81, 2424832, ord("a")):
+            idx = (idx - 1) % n
+        elif key in (83, 2555904, ord("d"), ord(" ")):
+            idx = (idx + 1) % n
+    cv2.destroyWindow("sysid review")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -216,9 +301,10 @@ def main():
     parser.add_argument("--n",          type=int,   default=SWEEP_N_WP)
     parser.add_argument("--steps",      type=int,   default=500)
     parser.add_argument("--cache",      default=None)
-    parser.add_argument("--out",        default="sysid_traj.png")
+    parser.add_argument("--wf",         default="wf.npz")
     args = parser.parse_args()
 
+    wf = WorldFrame.load(args.wf)
     mj_model  = mujoco.MjModel.from_xml_path(SCENE_XML_PATH)
     mj_data   = mujoco.MjData(mj_model)
     cache_path = args.cache or os.path.join(os.path.dirname(__file__), "..", "ik_cache.pkl")
@@ -261,15 +347,13 @@ def main():
         sim_tee, sim_ee = exec_sim(mj_model, mj_data, ik_cache, waypoints, args.steps)
 
         print("\n=== Real sweep ===")
-        real_tee, real_ee = exec_real(planner, waypoints)
+        real_tee, real_ee, real_frames = exec_real(planner, waypoints)
 
         print_comparison(waypoints, sim_tee, real_tee)
-        plot_comparison(waypoints, sim_tee, sim_ee, real_tee, real_ee, save_path=args.out)
+        review_frames(waypoints, real_frames, sim_tee, real_tee, wf)
 
     finally:
-        planner.cmd_sock.close(linger=0)
-        planner.resp_sock.close(linger=0)
-        planner.ctx.term()
+        planner.close()
 
 
 if __name__ == "__main__":

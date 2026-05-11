@@ -49,6 +49,34 @@ class AprilDetector(NamedTuple):
     K:       dict[str, np.ndarray] = {}  # serial -> (3, 3) camera matrix
     dist:    dict[str, np.ndarray] = {}  # serial -> (5,) distortion coefficients
 
+    @staticmethod
+    def pose_from_corners(corners_cam: np.ndarray) -> np.ndarray:
+        """Return T_tag_to_cam from detected tag corners in camera frame."""
+        center_cam = corners_cam.mean(axis=0)
+
+        x_axis = corners_cam[1] - corners_cam[0]
+        x_axis = x_axis / np.linalg.norm(x_axis)
+
+        y_axis = corners_cam[0] - corners_cam[3]
+        y_axis = y_axis / np.linalg.norm(y_axis)
+
+        z_axis = np.cross(x_axis, y_axis)
+        z_axis = z_axis / np.linalg.norm(z_axis)
+
+        y_axis = np.cross(z_axis, x_axis)
+        y_axis = y_axis / np.linalg.norm(y_axis)
+
+        T_tag_to_cam = np.eye(4)
+        T_tag_to_cam[:3, 0] = x_axis
+        T_tag_to_cam[:3, 1] = y_axis
+        T_tag_to_cam[:3, 2] = z_axis
+        T_tag_to_cam[:3, 3] = center_cam
+        return T_tag_to_cam
+
+    def pose(self, serial: str) -> np.ndarray:
+        """Return T_tag_to_cam for a previously detected camera serial."""
+        return self.pose_from_corners(self.corners[serial])
+
     def detect(self, serial: str, rgbd: tuple[np.ndarray, np.ndarray], K: np.ndarray, dist: np.ndarray, depth_scale: float = 1e-3) -> "tuple[bool, AprilDetector]":
         """Detect self.tag_id in rgbd and append result keyed by serial.
 
