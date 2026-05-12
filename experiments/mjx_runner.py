@@ -1,9 +1,16 @@
 import os
+import sys
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
 import jax
 import jax.numpy as jnp
 import yaml
 import mujoco
 import pfmp
+import importlib.util
 
 from fire import Fire
 from hydrax.task_base import Task
@@ -44,6 +51,12 @@ def _load_task(name):
     if name == "PushT":
         from pfmp.tasks.pushT import PushT
         return PushT()
+    if name == "HalfCheetah":
+        path = os.path.join(os.path.dirname(__file__), "..", "examples", "half_cheetah.py")
+        spec = importlib.util.spec_from_file_location("half_cheetah", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.HalfCheetah()
     return eval(name)()
 
 def main(yamlfile, outdir):
@@ -55,6 +68,9 @@ def main(yamlfile, outdir):
     task = _load_task(config["task"])
     mj_model = task.mj_model
     mj_data = mujoco.MjData(mj_model)
+    if hasattr(task, "initial_qpos"):
+        mj_data.qpos[:] = task.initial_qpos
+        mujoco.mj_forward(mj_model, mj_data)
 
     # Check if this is a PFMP-native task (provides its own controller)
     pfmp_native = hasattr(task, 'make_controller')

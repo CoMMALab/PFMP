@@ -16,9 +16,17 @@ class Trajectory:
     cost: np.ndarray  # (B, T)
     qpos: np.ndarray  # (B, T, nq)
     qvel: np.ndarray  # (B, T, nv)
+    replan_ms: float = 0.0  # Mean wall time per single-trajectory replan.
 
     def save(self, path):
-        np.savez(path, ctrl=self.ctrl, cost=self.cost, qpos=self.qpos, qvel=self.qvel)
+        np.savez(
+            path,
+            ctrl=self.ctrl,
+            cost=self.cost,
+            qpos=self.qpos,
+            qvel=self.qvel,
+            replan_ms=self.replan_ms,
+        )
 
     @staticmethod
     def load(path):
@@ -27,7 +35,8 @@ class Trajectory:
             ctrl=data["ctrl"],
             cost=data["cost"],
             qpos=data["qpos"],
-            qvel=data["qvel"]
+            qvel=data["qvel"],
+            replan_ms=float(data["replan_ms"]) if "replan_ms" in data else 0.0,
         )
 
 def _batch_scenes(sample_problem, mj_model, mj_data, theta, num):
@@ -152,6 +161,7 @@ def run_batch(  # noqa: PLR0912, PLR0915
     # Warm-up jit compilation
     print("Jitting batched controller...")
     st = time.time()
+    replan_ms = 0.0
 
     if family == "pfmp":
         init_shape = theta.mean.shape
@@ -216,6 +226,20 @@ def run_batch(  # noqa: PLR0912, PLR0915
         pfmp_step_fn = jax.jit(pfmp_step_fn)
         (keys, mjx_data, theta_batched), _ = pfmp_step_fn((keys, mjx_data, theta_batched), None)
 
+        replan_jit = jax.jit(replan)
+        replan_key = keys[0]
+        replan_data = jax.tree.map(lambda x: x[0], mjx_data)
+        replan_theta = jax.tree.map(lambda x: x[0], theta_batched)
+        _, replan_out = replan_jit(replan_key, replan_data, replan_theta)
+        jax.block_until_ready(replan_out)
+        num_timing_runs = 20
+        timing_start = time.perf_counter()
+        for _ in range(num_timing_runs):
+            _, replan_out = replan_jit(replan_key, replan_data, replan_theta)
+        jax.block_until_ready(replan_out)
+        replan_ms = (time.perf_counter() - timing_start) / num_timing_runs * 1000.0
+        print(f"Per-replan wall time (replan only, num=1): {replan_ms:.2f} ms")
+
     else:
         # For hydrax family
         seeds = jnp.arange(num)
@@ -257,6 +281,19 @@ def run_batch(  # noqa: PLR0912, PLR0915
         # JIT the full loop
         hydrax_step_fn = jax.jit(hydrax_step_fn)
         (mjx_data, policy_params_batched), _ = hydrax_step_fn((mjx_data, policy_params_batched), None)
+
+        replan_jit = jax.jit(controller.optimize)
+        replan_data = jax.tree.map(lambda x: x[0], mjx_data)
+        replan_params = jax.tree.map(lambda x: x[0], policy_params_batched)
+        replan_out, _ = replan_jit(replan_data, replan_params)
+        jax.block_until_ready(replan_out)
+        num_timing_runs = 20
+        timing_start = time.perf_counter()
+        for _ in range(num_timing_runs):
+            replan_out, _ = replan_jit(replan_data, replan_params)
+        jax.block_until_ready(replan_out)
+        replan_ms = (time.perf_counter() - timing_start) / num_timing_runs * 1000.0
+        print(f"Per-replan wall time (replan only, num=1): {replan_ms:.2f} ms")
 
     print(f"Time to jit batched: {time.time() - st:.3f} seconds")
 
@@ -308,4 +345,10 @@ def run_batch(  # noqa: PLR0912, PLR0915
     qpos_array = np.array(qpos_data.transpose(2, 0, 1, 3).reshape(num, -1, qpos_data.shape[-1]))
     qvel_array = np.array(qvel_data.transpose(2, 0, 1, 3).reshape(num, -1, qvel_data.shape[-1]))
 
-    return Trajectory(ctrl=ctrl_array, cost=cost_array, qpos=qpos_array, qvel=qvel_array)
+    return Trajectory(
+        ctrl=ctrl_array,
+        cost=cost_array,
+        qpos=qpos_array,
+        qvel=qvel_array,
+        replan_ms=replan_ms,
+    )
