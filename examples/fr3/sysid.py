@@ -2,9 +2,10 @@
 sysid.py — System identification for the push-T task.
 
 Runs a scripted EE sweep on both the real robot and MuJoCo, records
-the T-block response in both, and plots them side-by-side.
+the T-block response in both, and reviews them frame-by-frame.
 
-No planner required. Communicates with push_tee_controller.py via ZMQ.
+No planner required. Sends commands to push_tee_controller.py and subscribes
+to push_tee_perception.py for RGBD frames and EKF beliefs.
 
 Usage:
     python examples/fr3/sysid.py
@@ -29,11 +30,12 @@ from ik_cache import ik_from_cache, get_or_build_cache
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "perception"))
 from camera import WorldFrame, SERIAL_NUMS
-from draw import CYAN, draw_pose_marker
+from draw import CYAN, draw_pose_marker, project_world_xy
 from geom_tee import THICKNESS
 
 from pub_sub.protocol import Command
 from pub_sub.planner import PlannerClient
+from pub_sub.perception import PerceptionClient
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -117,10 +119,17 @@ def send_with_retry(planner, cmd, label, max_attempts=30, retry_pause=1.0):
     raise RuntimeError(f"send_command failed after {max_attempts} attempts")
 
 
-def exec_real(planner, waypoints, motion_timeout=15.0) -> Tuple[np.ndarray, np.ndarray, list[Optional[np.ndarray]]]:
+def exec_real(
+    planner,
+    perception: PerceptionClient,
+    waypoints,
+    motion_timeout=15.0,
+    settle_s=0.2,
+) -> Tuple[np.ndarray, np.ndarray, list[Optional[np.ndarray]]]:
     tee_traj, ee_traj, frames = [], [], []
     for i, wp in enumerate(waypoints):
         label = f"wp {i+1}/{len(waypoints)}"
+        time.sleep(1.0)
         try:
             ack = send_with_retry(planner, Command(xy=wp.tolist()), label)
         except RuntimeError as e:
@@ -136,24 +145,18 @@ def exec_real(planner, waypoints, motion_timeout=15.0) -> Tuple[np.ndarray, np.n
             frames.append(None)
             continue
 
-        time.sleep(0.1)
-        pre_seq = -1
-        try:
-            pre, _, _ = planner.recv_response_latest(drain=True)
-            pre_seq = int(pre.get("seq", -1))
-        except zmq.Again:
-            pass
+        min_timestamp = time.time() + settle_s
 
         belief = None
         frame = None
         t0 = time.time()
         while time.time() - t0 < motion_timeout:
             try:
-                resp, rgb, _ = planner.recv_response_latest(drain=True)
+                resp, rgb, _ = perception.recv_latest(drain=True)
             except zmq.Again:
                 time.sleep(0.05)
                 continue
-            if int(resp.get("seq", -1)) > pre_seq:
+            if float(resp.get("timestamp", 0.0)) >= min_timestamp:
                 frame = rgb.copy()
                 beliefs = resp.get("beliefs") or []
                 if beliefs:
@@ -211,7 +214,7 @@ def make_review_frame(
 
     T_w2c = np.linalg.inv(wf.t_cams[serial_top])
     z_body = THICKNESS / 2
-    gray = (170, 170, 170)
+    purple = (180, 80, 220)
 
     if _valid_pose(sim_pose):
         draw_pose_marker(
@@ -221,10 +224,13 @@ def make_review_frame(
             z_body,
             T_w2c,
             K_top,
-            gray,
+            purple,
             outline_thickness=2,
             center_radius=5,
         )
+        label_px = project_world_xy(sim_pose[:2], z_body, T_w2c, K_top)[0]
+        cv2.putText(canvas, "SIM", (int(label_px[0]) + 8, int(label_px[1]) - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, purple, 2, cv2.LINE_AA)
 
     if _valid_pose(real_pose):
         draw_pose_marker(
@@ -238,10 +244,13 @@ def make_review_frame(
             outline_thickness=3,
             center_radius=7,
         )
+        label_px = project_world_xy(real_pose[:2], z_body, T_w2c, K_top)[0]
+        cv2.putText(canvas, "EKF", (int(label_px[0]) + 8, int(label_px[1]) + 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, CYAN, 2, cv2.LINE_AA)
 
     cv2.putText(canvas, f"{idx + 1}/{n}  cmd=({waypoint[0]:+.3f},{waypoint[1]:+.3f})",
                 (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(canvas, "cyan=EKF belief   gray=MuJoCo prediction",
+    cv2.putText(canvas, "cyan=EKF   purple=SIM",
                 (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.putText(canvas, "left/right: frame   q/esc: quit",
                 (20, canvas.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX,
@@ -288,20 +297,70 @@ def review_frames(
     cv2.destroyWindow("sysid review")
 
 
+def save_review_gif(
+    out_path: str,
+    waypoints: np.ndarray,
+    frames: list[Optional[np.ndarray]],
+    sim_tee: np.ndarray,
+    real_tee: np.ndarray,
+    wf: WorldFrame,
+    fps: float,
+) -> None:
+    from PIL import Image
+
+    serial_top = SERIAL_NUMS["top"]
+    K_top = wf.Ks[serial_top]
+    n = min(len(waypoints), len(frames), len(sim_tee), len(real_tee))
+    if n == 0:
+        print("[sysid] no frames to save")
+        return
+
+    gif_frames = []
+    for idx in range(n):
+        view_bgr = make_review_frame(
+            frames[idx],
+            wf,
+            serial_top,
+            K_top,
+            sim_tee[idx],
+            real_tee[idx],
+            waypoints[idx],
+            idx,
+            n,
+        )
+        view_rgb = cv2.cvtColor(view_bgr, cv2.COLOR_BGR2RGB)
+        gif_frames.append(Image.fromarray(view_rgb))
+
+    duration_ms = int(round(1000.0 / max(fps, 1e-6)))
+    gif_frames[0].save(
+        out_path,
+        save_all=True,
+        append_images=gif_frames[1:],
+        duration=duration_ms,
+        loop=0,
+    )
+    print(f"[sysid] saved review gif to {out_path}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Push-T system identification")
     parser.add_argument("--server-host", default="localhost")
     parser.add_argument("--cmd-port",   type=int, default=5555)
-    parser.add_argument("--resp-port",  type=int, default=5556)
+    parser.add_argument("--perception-port", type=int, default=5557)
     parser.add_argument("--sweep-x",    type=float, default=SWEEP_X)
     parser.add_argument("--sweep-y-lo", type=float, default=SWEEP_Y_LO)
     parser.add_argument("--sweep-y-hi", type=float, default=SWEEP_Y_HI)
     parser.add_argument("--n",          type=int,   default=SWEEP_N_WP)
     parser.add_argument("--steps",      type=int,   default=500)
+    parser.add_argument("--settle",     type=float, default=0.2,
+                        help="Seconds to wait after command ack before sampling perception.")
     parser.add_argument("--cache",      default=None)
     parser.add_argument("--wf",         default="wf.npz")
+    parser.add_argument("--gif-out",    default=None,
+                        help="Optional path to save the sysid review as a GIF.")
+    parser.add_argument("--gif-fps",    type=float, default=2.0)
     args = parser.parse_args()
 
     wf = WorldFrame.load(args.wf)
@@ -317,25 +376,30 @@ def main():
 
     planner = PlannerClient(
         command_addr=f"tcp://{args.server_host}:{args.cmd_port}",
-        response_addr=f"tcp://{args.server_host}:{args.resp_port}",
+        response_addr="tcp://localhost:5556",
         conflate=False, command_timeout_ms=5000,
+    )
+    perception = PerceptionClient(
+        addr=f"tcp://{args.server_host}:{args.perception_port}",
+        conflate=False,
+        timeout_ms=1000,
     )
 
     try:
         response = None
         for attempt in range(1, 21):
             try:
-                response, _, _ = planner.recv_response_latest(drain=True)
+                response, _, _ = perception.recv_latest(drain=True)
                 break
             except zmq.Again:
-                print(f"  [sysid] waiting for controller (attempt {attempt}/20)…")
+                print(f"  [sysid] waiting for perception (attempt {attempt}/20)…")
                 time.sleep(0.25)
         if response is None:
-            raise RuntimeError("No response from control server")
+            raise RuntimeError("No response from perception server")
 
         mean = apply_response_to_mj(mj_model, mj_data, response)
         if mean is None:
-            raise RuntimeError("No T-block belief in response")
+            raise RuntimeError("No T-block belief in perception response")
         print(f"[sysid] seeded MuJoCo: tee=({mean[0]:.3f}, {mean[1]:.3f}, "
               f"{np.degrees(mean[2]):.1f}°)")
 
@@ -347,12 +411,28 @@ def main():
         sim_tee, sim_ee = exec_sim(mj_model, mj_data, ik_cache, waypoints, args.steps)
 
         print("\n=== Real sweep ===")
-        real_tee, real_ee, real_frames = exec_real(planner, waypoints)
+        real_tee, real_ee, real_frames = exec_real(
+            planner,
+            perception,
+            waypoints,
+            settle_s=args.settle,
+        )
 
         print_comparison(waypoints, sim_tee, real_tee)
+        if args.gif_out is not None:
+            save_review_gif(
+                args.gif_out,
+                waypoints,
+                real_frames,
+                sim_tee,
+                real_tee,
+                wf,
+                args.gif_fps,
+            )
         review_frames(waypoints, real_frames, sim_tee, real_tee, wf)
 
     finally:
+        perception.close()
         planner.close()
 
 

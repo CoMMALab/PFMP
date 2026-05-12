@@ -34,6 +34,9 @@ class PerceptionPublisher:
         sndhwm: int = 1,
         conflate: bool = False,
     ) -> None:
+        if conflate:
+            raise ValueError("ZMQ CONFLATE is unsafe for multipart perception messages")
+
         self.ctx = zmq.Context.instance()
         self.bind_addr = bind_addr
 
@@ -43,8 +46,6 @@ class PerceptionPublisher:
 
         self.pub_sock = self.ctx.socket(zmq.PUB)
         self.pub_sock.setsockopt(zmq.SNDHWM, sndhwm)
-        if conflate:
-            self.pub_sock.setsockopt(zmq.CONFLATE, 1)
         self.pub_sock.bind(bind_addr)
         self.seq = 0
 
@@ -107,8 +108,11 @@ class PerceptionClient:
         topic: bytes | str = DEFAULT_PERCEPTION_TOPIC,
         timeout_ms: int = 1000,
         rcvhwm: int = 1,
-        conflate: bool = True,
+        conflate: bool = False,
     ) -> None:
+        if conflate:
+            raise ValueError("ZMQ CONFLATE is unsafe for multipart perception messages")
+
         self.ctx = zmq.Context.instance()
         self.addr = addr
 
@@ -119,8 +123,6 @@ class PerceptionClient:
         self.sub_sock = self.ctx.socket(zmq.SUB)
         self.sub_sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
         self.sub_sock.setsockopt(zmq.RCVHWM, rcvhwm)
-        if conflate:
-            self.sub_sock.setsockopt(zmq.CONFLATE, 1)
         self.sub_sock.connect(addr)
         self.sub_sock.setsockopt(zmq.SUBSCRIBE, self.topic)
 
@@ -143,24 +145,37 @@ class PerceptionClient:
         return response, rgb, depth
 
     def recv_latest(self, *, drain: bool = True) -> tuple[dict, np.ndarray, np.ndarray]:
-        response, rgb, depth = self.recv()
+        parts = self.sub_sock.recv_multipart()
+        if len(parts) != 4:
+            raise ValueError(
+                f"Expected 4 ZMQ frames [topic][json][rgb][depth], got {len(parts)}"
+            )
+
         if not drain:
-            return response, rgb, depth
+            return self._decode_parts(parts)
 
         while True:
             try:
-                parts = self.sub_sock.recv_multipart(flags=zmq.NOBLOCK)
+                next_parts = self.sub_sock.recv_multipart(flags=zmq.NOBLOCK)
             except zmq.Again:
                 break
 
-            if len(parts) != 4:
+            if len(next_parts) != 4:
                 continue
 
-            topic, response_json, rgb_bytes, depth_bytes = parts
+            topic = next_parts[0]
             if not topic.startswith(self.topic):
                 continue
 
-            response = decode_json(response_json)
-            rgb, depth = decode_rgbd(response, rgb_bytes, depth_bytes)
+            parts = next_parts
 
+        return self._decode_parts(parts)
+
+    def _decode_parts(self, parts) -> tuple[dict, np.ndarray, np.ndarray]:
+        topic, response_json, rgb_bytes, depth_bytes = parts
+        if not topic.startswith(self.topic):
+            raise ValueError(f"Unexpected topic {topic!r}; expected prefix {self.topic!r}")
+
+        response = decode_json(response_json)
+        rgb, depth = decode_rgbd(response, rgb_bytes, depth_bytes)
         return response, rgb, depth

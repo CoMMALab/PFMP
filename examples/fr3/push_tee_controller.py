@@ -137,8 +137,6 @@ def main(args):
                         except Exception as e:
                             endpoint.reply_command(accepted=False, reason=f"bad command: {e}")
                         else:
-                            endpoint.reply_command(accepted=True)
-                            print(f"[server] received xy command: {target_xy.tolist()}")
                             # Don't let a single failed motion kill the server.
                             # Log, try to recover, and keep accepting commands.
                             try:
@@ -147,6 +145,7 @@ def main(args):
                                 else:
                                     execute_xy(robot, target_xy)
                                     current_xy = target_xy
+                                    print(f"[server] executed xy command: {target_xy.tolist()}")
                             except Exception as e:
                                 print(f"[server] execute_xy failed: {e!r}")
                                 if robot is not None:
@@ -154,6 +153,7 @@ def main(args):
                                         robot.recover_from_errors()
                                     except Exception as rec_e:
                                         print(f"[server] recover_from_errors failed: {rec_e!r}")
+                            endpoint.reply_command(accepted=True)
 
             elif args.mode == 'manual':
                 # Manual mode: consume stdin only when user typed a command.
