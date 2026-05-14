@@ -373,7 +373,8 @@ def animate(num_knots: int = 20, map_index: int = 0,
     smc_frames, steps_per_knot = precompute_smc(pfmp_sir, x0, theta, num_outer)
 
     plt.style.use('default')
-    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(16, 5))
+    fig, (ax_right, ax_left) = plt.subplots(2, 1, figsize=(8, 10),
+                                              gridspec_kw={'hspace': 0.05})
     fig.patch.set_facecolor('white')
     for ax in (ax_left, ax_right):
         ax.set_facecolor('white')
@@ -400,11 +401,10 @@ def animate(num_knots: int = 20, map_index: int = 0,
 
     anim = FuncAnimation(fig, combined, frames=frames, interval=interval,
                          blit=False, repeat=True, repeat_delay=2000)
-    plt.tight_layout()
 
     if save_gif:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        anim.save(OUTPUT_DIR / 'pfmp_complex.gif', writer='pillow', fps=5, dpi=150)
+        anim.save(OUTPUT_DIR / 'pfmp_complex.gif', writer='pillow', fps=5, dpi=250)
     else:
         plt.show()
 
@@ -476,7 +476,7 @@ def run_experiment():
             du_stdev=jnp.full(NUM_MAPS, DU_STDEV),
             u_stdev=jnp.full(NUM_MAPS, U_STDEV),
             mean=jnp.zeros((NUM_MAPS, num_knots)),
-            step_len=horizon / (num_knots - 1),
+            step_len=jnp.full(NUM_MAPS, horizon / (num_knots - 1)),
         )
         keys = jax.random.split(jax.random.key(SEED + num_knots * 1000), NUM_MAPS)
 
@@ -585,63 +585,45 @@ def make_plots(results: dict):
         "PS":      {"key": "ps_costs",   "color": "#E74C3C", "ls": "--"},
         "MPPI":    {"key": "mppi_costs", "color": "#3498DB", "ls": "--"},
         "CEM":     {"key": "cem_costs",  "color": "#E67E22", "ls": "--"},
-        "SMC-MPC": {"key": "smc_costs",  "color": "#27AE60", "ls": "-"},
+        "SMC": {"key": "smc_costs",  "color": "#27AE60", "ls": "-"},
     }
 
     stats = {}
-    success_rates = {}
     for name, m in methods.items():
-        medians, q25, q75, rates = [], [], [], []
+        medians, q25, q75 = [], [], []
         for k in knot_counts:
             data = np.where(np.isfinite(np.array(results[str(k)][m["key"]])),
                             np.array(results[str(k)][m["key"]]), np.nan)
             medians.append(np.nanmedian(data))
             q25.append(np.nanpercentile(data, 25))
             q75.append(np.nanpercentile(data, 75))
-            arena_length = results[str(k)]["arena_length"]
-            thresh = (arena_length - 1.0) ** 2 * 10 * 3.0
-            raw = np.array(results[str(k)][m["key"]])
-            rates.append(np.sum(np.isfinite(raw) & (raw < thresh)) / len(raw) * 100)
         stats[name] = {"median": np.array(medians), "q25": np.array(q25), "q75": np.array(q75)}
-        success_rates[name] = np.array(rates)
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.5))
+    fig, ax = plt.subplots(figsize=(7, 4.5))
 
     for name, m in methods.items():
         s = stats[name]
-        lw = 2.5 if name == "SMC-MPC" else 1.8
-        z = 5 if name == "SMC-MPC" else 3
-        ax1.plot(x, s["median"], color=m["color"], linestyle=m["ls"],
-                 linewidth=lw, marker="o", markersize=5, label=name, zorder=z)
-        ax1.fill_between(x, s["q25"], s["q75"], color=m["color"],
-                         alpha=0.20 if name == "SMC-MPC" else 0.12, zorder=z - 1)
-        ax2.plot(x, success_rates[name], color=m["color"], linestyle=m["ls"],
-                 linewidth=lw, marker="o", markersize=5, label=name, zorder=z)
+        lw = 2.5 if name == "SMC" else 1.8
+        z = 5 if name == "SMC" else 3
+        ax.plot(x, s["median"], color=m["color"], linestyle=m["ls"],
+                linewidth=lw, marker="o", markersize=5, label=name, zorder=z)
+        ax.fill_between(x, s["q25"], s["q75"], color=m["color"],
+                        alpha=0.20 if name == "SMC" else 0.12, zorder=z - 1)
 
-    for ax, title, ylabel in [
-        (ax1, "(a) Planning cost", "Executed cost (median)"),
-        (ax2, "(b) Success rate", "Success rate (%)"),
-    ]:
-        ax.set_xlabel("Planning horizon (knots)", fontsize=13)
-        ax.set_ylabel(ylabel, fontsize=13)
-        ax.tick_params(labelsize=11)
-        ax.set_xticks(x)
-        ax.legend(fontsize=10, framealpha=0.95, edgecolor="black", fancybox=False)
-        for spine in ax.spines.values():
-            spine.set_linewidth(1.2)
-        ax.set_title(title, fontsize=13, pad=10)
+    ax.set_xlabel("Planning Horizon (knots)", fontsize=13)
+    ax.set_ylabel("Executed Cost (median)", fontsize=13)
+    ax.tick_params(labelsize=11)
+    ax.set_xticks(x)
+    ax.set_title("Planning Cost vs. Horizon Length", fontsize=13, pad=10)
+    ax.legend(fontsize=10, framealpha=0.95, edgecolor="black", fancybox=False)
+    for spine in ax.spines.values():
+        spine.set_linewidth(1.2)
 
-    ax2.set_ylim(-5, 105)
-    ax2.axhline(100, color="gray", linestyle=":", linewidth=0.8, alpha=0.5)
-    ax2.legend(loc="lower left", fontsize=10, framealpha=0.95, edgecolor="black", fancybox=False)
-
-    fig.suptitle(f"{NUM_MAPS} random maps, {PARTICLES} particles per method",
-                 fontsize=12, y=1.02, color="gray")
     fig.tight_layout()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    fig.savefig(OUTPUT_DIR / "fig2.pdf", dpi=300, bbox_inches="tight")
-    fig.savefig(OUTPUT_DIR / "fig2.png", dpi=300, bbox_inches="tight")
-    print("Saved fig2.pdf/png")
+    fig.savefig(OUTPUT_DIR / "geometric_cost.pdf", dpi=300, bbox_inches="tight")
+    fig.savefig(OUTPUT_DIR / "geometric_cost.png", dpi=300, bbox_inches="tight")
+    print("Saved geometric_cost.pdf/png")
     plt.show()
 
 

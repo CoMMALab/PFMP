@@ -40,7 +40,7 @@ NUM_KNOTS = 6         # spline knots
 PARTICLES = 2048      # PFMP particles
 ESS_THRESH = 0.25
 
-N_REPLANS = 12      # closed-loop replan steps to precompute
+N_REPLANS = 2      # closed-loop replan steps to precompute
 STEPS_PER_REPLAN = 100  # sim steps between replans
 
 # 2D workspace — same as pushT_bench
@@ -609,6 +609,62 @@ def _is_success(final_state: np.ndarray, goal_xy, goal_angle: float) -> bool:
     return pos_err < SUCCESS_POS_THRESH and angle_err < SUCCESS_ANGLE_THRESH
 
 
+def _make_trace_figure(seeds, distance=None, n_obs=None, corridor=False, particles=PARTICLES):
+    """2×2 grid of scenarios; each panel overlays PS (red) and PFMP (green) traces."""
+    from matplotlib.patches import Polygon
+    import matplotlib.patches as mpatches
+
+    def draw_tee_trace(ax, states, color):
+        idxs = list(range(0, len(states), STEPS_PER_REPLAN))
+        n = len(idxs)
+        for j, i in enumerate(idxs):
+            alpha = 0.12 + 0.55 * (j / max(n - 1, 1))
+            s = np.array(states[i])
+            ax.add_patch(Polygon(_t_verts_world(s[0:2], s[2]), closed=True,
+                                 facecolor=color, alpha=alpha,
+                                 edgecolor='black', linewidth=0.8, zorder=5))
+        s_final = np.array(states[-1])
+        ax.plot(*s_final[6:8], 'o', color=color, markersize=6,
+                markeredgecolor='black', markeredgewidth=0.8, zorder=6)
+
+    fig, axes = plt.subplots(2, 2, figsize=(8, 8))
+    fig.patch.set_facecolor('white')
+
+    for ax, seed in zip(axes.flat, seeds):
+        x0, theta, ws_min, ws_max, n_replans = _build_scenario(seed, distance, n_obs, corridor)
+        goal_xy    = np.array(theta.goal_xy)
+        goal_angle = float(theta.goal_angle)
+        obstacles  = np.array(theta.obstacles)
+
+        ax.set_facecolor('#f5f5f5')
+        ax.set_xlim(ws_min[0], ws_max[0]); ax.set_ylim(ws_min[1], ws_max[1])
+        ax.set_aspect('equal'); ax.set_xticks([]); ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_edgecolor('black'); spine.set_linewidth(1.2)
+
+        for obs in obstacles:
+            cx, cy, hx, hy = obs
+            if hx > 0.01:
+                ax.add_patch(mpatches.Rectangle(
+                    (cx - hx, cy - hy), 2*hx, 2*hy,
+                    facecolor='dimgray', edgecolor='black', linewidth=1.2, zorder=3))
+
+        key_ps, key_pfmp = jax.random.split(jax.random.key(seed))
+        for method, color, key in [('ps', '#E74C3C', key_ps), ('pfmp', '#27AE60', key_pfmp)]:
+            states, _ = simulate(method, x0, theta, key, particles, n_replans)
+            draw_tee_trace(ax, states, color)
+
+        # Draw goal on top of traces
+        ax.add_patch(Polygon(_t_verts_world(goal_xy, goal_angle), closed=True,
+                             facecolor='darkorange', alpha=0.5,
+                             edgecolor='darkorange', linewidth=2.0, linestyle='--', zorder=7))
+        ax.plot(*goal_xy, '*', color='darkorange', markersize=12,
+                markeredgecolor='black', markeredgewidth=0.8, zorder=8)
+
+    fig.tight_layout()
+    return fig
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--save-gif', action='store_true')
@@ -625,7 +681,22 @@ def main():
                         help='Arena size as multiple of T-width. T fixed bottom-left, goal top-right.')
     parser.add_argument('--batch', type=int, default=None, metavar='N',
                         help='Run N seeds with all methods; print success-rate table (requires --distance).')
+    parser.add_argument('--trace-figure', action='store_true',
+                        help='Generate translucent-trace comparison figure (DIAL vs PFMP).')
     args = parser.parse_args()
+
+    # ── Trace figure mode ─────────────────────────────────────────
+    if args.trace_figure:
+        seeds = [args.seed + i for i in range(4)]
+        fig = _make_trace_figure(seeds, distance=args.distance, n_obs=args.n_obs,
+                                 corridor=args.corridor, particles=args.particles)
+        from pathlib import Path
+        out = Path(__file__).parent.parent / "figures" / "fig_pushT_traces"
+        fig.savefig(str(out) + ".pdf", dpi=300, bbox_inches='tight')
+        fig.savefig(str(out) + ".png", dpi=300, bbox_inches='tight')
+        print(f"Saved {out}.pdf / .png")
+        plt.show()
+        return
 
     # ── Batch benchmark mode ─────────────────────────────────────
     if args.batch is not None:

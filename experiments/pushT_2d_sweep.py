@@ -94,7 +94,13 @@ def run_experiment(distances=None, batch=BATCH, particles=PARTICLES, seed=SEED):
 
 def make_plots(results):
     dists = sorted(float(k) for k in results)
-    x = np.array(dists)
+    n_obs_all = [max(0, int(d) - 3) for d in dists]
+    seen, keep = set(), []
+    for i, n in enumerate(n_obs_all):
+        if n not in seen:
+            seen.add(n); keep.append(i)
+    dists = [dists[i] for i in keep]
+    x = np.array([n_obs_all[i] for i in keep])
 
     success_rates = {}
     for m in METHODS:
@@ -124,7 +130,7 @@ def make_plots(results):
             label=LABELS[m], zorder=5 if m.startswith("pfmp") else 3,
         )
 
-    ax.set_xlabel("Problem difficulty (distance × T-width)", fontsize=13)
+    ax.set_xlabel("Number of obstacles", fontsize=13)
     ax.set_ylabel("Success rate (%)", fontsize=13)
     ax.set_xticks(x)
     ax.set_ylim(-5, 105)
@@ -134,13 +140,7 @@ def make_plots(results):
               loc="upper right")
     for spine in ax.spines.values():
         spine.set_linewidth(1.2)
-    ax.set_title("2D Push-T: success rate vs. problem difficulty", fontsize=13, pad=10)
-
-    first = results[str(dists[0])]
-    n = first.get("batch", BATCH) if "batch" in first else len(next(iter(v for v in first.values() if isinstance(v, list)), []) or [None] * BATCH)
-    particles = first.get("particles", PARTICLES)
-    fig.suptitle(f"{n} random seeds, {particles} particles per method",
-                 fontsize=11, y=1.01, color="gray")
+    ax.set_title("Simulated Push-T (Success Rate vs. Obstacles)", fontsize=13, pad=10)
     fig.tight_layout()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

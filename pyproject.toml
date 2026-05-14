@@ -29,6 +29,7 @@ dependencies = [
     "fire",
     "meshcat",
     "franky-control==1.1.1",
+    "optuna>=4.8.0",
 ]
 
 [tool.setuptools.packages.find]
