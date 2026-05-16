@@ -1,6 +1,6 @@
-"""T-block geometry: dimensions, SDF, and object-centric vertices.
+"""T-block geometry, SDF, vertices, and Panda forward kinematics.
 
-All coordinates are in the T-block's local body frame:
+All T-block coordinates are in the local body frame:
   - origin at stem center
   - +y points toward the cap (bar)
   - units: metres
@@ -58,6 +58,15 @@ def _load_dims():
 
 STEM_HALF, CAP_HALF, CAP_CTR, THICKNESS = _load_dims()
 STEM_CTR = np.array([0.0, 0.0])
+
+# Transform from Optitrack rigid body frame (marker centroid) to tee body frame.
+# Rotation encodes R90-CCW + x-reflection; translation measured by visual alignment.
+OPTI_RB_TO_TEE = np.array([
+    [ 0.,  1.,  0., 0.0307 ],
+    [ 1.,  0.,  0., 0.0442 ],
+    [ 0.,  0.,  1., 0.03125],  # z: markers above tee top surface
+    [ 0.,  0.,  0., 1.     ],
+])
 
 # ── Polygon outline, CCW ───────────────────────────────────────────────────────
 
@@ -167,6 +176,27 @@ if __name__ == "__main__":
     ax.quiver(*tag_pos_w, *tag_R_w[:, 1]*0.03, color='g', linestyle='dashed')
     ax.quiver(*tag_pos_w, *tag_R_w[:, 2]*0.03, color='b', linestyle='dashed')
     ax.scatter(*tag_pos_w, color='k', s=20, label='tag origin')
+
+    # Marker triangle at calibrated offset
+    AB, BC, AC = 0.16706, 0.09224, 0.19128
+    A = np.array([0.0, 0.0])
+    B = np.array([AB, 0.0])
+    Cx = (AC**2 + AB**2 - BC**2) / (2 * AB)
+    Cy = np.sqrt(max(AC**2 - Cx**2, 0.0))
+    C = np.array([Cx, Cy])
+    tri_local = np.array([A, B, C])
+    tri_local -= tri_local.mean(axis=0)
+    R90 = np.array([[0, -1], [1, 0]])
+    tri_local = (R90 @ tri_local.T).T
+    tri_local[:, 0] *= -1
+    tri_local += OPTI_RB_TO_TEE[:2, 3]
+
+    R2 = np.array([[c, -s], [s, c]])
+    tri_w = (R2 @ tri_local.T).T
+    loop = [0, 1, 2, 0]
+    ax.plot(tri_w[loop, 0], tri_w[loop, 1],
+            [OPTI_RB_TO_TEE[2, 3]] * 4,
+            'o--', color='purple', linewidth=1.5, markersize=6, label='markers')
 
     ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
     ax.legend(fontsize=7)
