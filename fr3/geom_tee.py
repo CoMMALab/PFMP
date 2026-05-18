@@ -15,7 +15,7 @@ from pathlib import Path
 
 def _load_dims():
     import trimesh
-    stl_path = Path(__file__).resolve().parent.parent.parent / "models" / "T.stl"
+    stl_path = Path(__file__).resolve().parent.parent / "models" / "T.stl"
     mesh = trimesh.load(str(stl_path))
 
     # Unique 2D footprint vertices from the mesh (mm)
@@ -53,39 +53,35 @@ def _load_dims():
     # Express cap center in body frame (stem center = origin)
     cap_ctr_body = cap_ctr_m - stem_ctr_m
 
-    return stem_half_m, cap_half_m, cap_ctr_body, thickness_m
+    # Unique 2D outline vertices from STL, shifted to stem-center body frame origin
+    xy_m = xy_mm * 1e-3
+    xy_unique = np.unique(np.round(xy_m, 4), axis=0)
+    verts_local = (xy_unique - stem_ctr_m).astype(np.float32)
+
+    return stem_half_m, cap_half_m, cap_ctr_body, thickness_m, verts_local
 
 
-STEM_HALF, CAP_HALF, CAP_CTR, THICKNESS = _load_dims()
+STEM_HALF, CAP_HALF, CAP_CTR, THICKNESS, VERTS_LOCAL = _load_dims()
 STEM_CTR = np.array([0.0, 0.0])
 
 # Transform from Optitrack rigid body frame (marker centroid) to tee body frame.
-# Rotation encodes R90-CCW + x-reflection; translation measured by visual alignment.
-OPTI_RB_TO_TEE = np.array([
-    [ 0.,  1.,  0., 0.0307 ],
-    [ 1.,  0.,  0., 0.0442 ],
-    [ 0.,  0.,  1., 0.03125],  # z: markers above tee top surface
+OPTI_TO_BODY = np.array([
+    [ 1.,  0.,  0., 0.0307 ],
+    [ 0.,  1.,  0., 0.0442 ],
+    [ 0.,  0.,  1., 0.03125],
     [ 0.,  0.,  0., 1.     ],
 ])
 
-# ── Polygon outline, CCW ───────────────────────────────────────────────────────
-
-_sc, _sh = STEM_CTR, STEM_HALF
-_cc, _ch = CAP_CTR,  CAP_HALF
-VERTS_LOCAL = np.array([
-    [_sc[0] - _sh[0], _sc[1] - _sh[1]],  # stem bottom-left
-    [_sc[0] + _sh[0], _sc[1] - _sh[1]],  # stem bottom-right
-    [_sc[0] + _sh[0], _cc[1] - _ch[1]],  # stem/cap junction, right
-    [_cc[0] + _ch[0], _cc[1] - _ch[1]],  # cap bottom-right
-    [_cc[0] + _ch[0], _cc[1] + _ch[1]],  # cap top-right
-    [_cc[0] - _ch[0], _cc[1] + _ch[1]],  # cap top-left
-    [_cc[0] - _ch[0], _cc[1] - _ch[1]],  # cap bottom-left
-    [_sc[0] - _sh[0], _cc[1] - _ch[1]],  # stem/cap junction, left
-], dtype=np.float32)
+# Marker positions in RB frame (from --inspect-rb)
+OPTI_MARKERS_IN_RB = np.array([
+    [-0.0322,  0.0552,  0.0002],
+    [-0.0278, -0.1119, -0.0006],
+    [ 0.0599,  0.0567,  0.0004],
+])
 
 # AprilTag: outer border top edge is 4cm below the top of the T cap.
 TEE_TAG_SIZE_M = 0.0415
-_cap_top_y = float(_cc[1] + _ch[1])
+_cap_top_y = float(CAP_CTR[1] + CAP_HALF[1])
 TAG_IN_BODY = np.array([
     [1, 0, 0, 0.0                                    ],
     [0, 1, 0, _cap_top_y - 0.04 - TEE_TAG_SIZE_M / 2 ],
@@ -159,8 +155,16 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     fig = plt.figure()
     ax  = fig.add_subplot(111, projection="3d")
-    t_angle = 0.5
-    plot_wireframe(ax, np.array([0.0, 0.0]), t_angle, z=-THICKNESS / 2)
+    import trimesh
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    stl_path = Path(__file__).resolve().parent.parent / "models" / "T.stl"
+    stl_mesh = trimesh.load(str(stl_path))
+    verts_m = stl_mesh.vertices * 1e-3
+    poly = Poly3DCollection(verts_m[stl_mesh.faces], alpha=0.5,
+                            facecolor='darkorange', edgecolor='none')
+    ax.add_collection3d(poly)
+
+    t_angle = 0.0
 
     # Draw body frame axes at origin (rotated by yaw)
     c, s = np.cos(t_angle), np.sin(t_angle)
@@ -177,26 +181,19 @@ if __name__ == "__main__":
     ax.quiver(*tag_pos_w, *tag_R_w[:, 2]*0.03, color='b', linestyle='dashed')
     ax.scatter(*tag_pos_w, color='k', s=20, label='tag origin')
 
-    # Marker triangle at calibrated offset
-    AB, BC, AC = 0.16706, 0.09224, 0.19128
-    A = np.array([0.0, 0.0])
-    B = np.array([AB, 0.0])
-    Cx = (AC**2 + AB**2 - BC**2) / (2 * AB)
-    Cy = np.sqrt(max(AC**2 - Cx**2, 0.0))
-    C = np.array([Cx, Cy])
-    tri_local = np.array([A, B, C])
-    tri_local -= tri_local.mean(axis=0)
-    R90 = np.array([[0, -1], [1, 0]])
-    tri_local = (R90 @ tri_local.T).T
-    tri_local[:, 0] *= -1
-    tri_local += OPTI_RB_TO_TEE[:2, 3]
+    # RB frame axes and markers using OPTI_RB_POSE
+    rb_origin = OPTI_TO_BODY[:3, 3]
+    rb_R = OPTI_TO_BODY[:3, :3]
+    ax.quiver(*rb_origin, *rb_R[:, 0]*0.05, color='r', linestyle='dotted', label='opti x')
+    ax.quiver(*rb_origin, *rb_R[:, 1]*0.05, color='g', linestyle='dotted', label='opti y')
+    ax.quiver(*rb_origin, *rb_R[:, 2]*0.05, color='b', linestyle='dotted', label='opti z')
+    ax.scatter(*rb_origin, color='purple', s=30, label='RB origin')
+    for i, m in enumerate(OPTI_MARKERS_IN_RB):
+        m_body = (OPTI_TO_BODY @ np.append(m, 1.))[:3]
+        ax.scatter(m_body[0], m_body[1], m_body[2],
+                   color='purple', s=50, marker='o', zorder=10)
+        ax.text(m_body[0], m_body[1], m_body[2], f' m{i}', fontsize=7)
 
-    R2 = np.array([[c, -s], [s, c]])
-    tri_w = (R2 @ tri_local.T).T
-    loop = [0, 1, 2, 0]
-    ax.plot(tri_w[loop, 0], tri_w[loop, 1],
-            [OPTI_RB_TO_TEE[2, 3]] * 4,
-            'o--', color='purple', linewidth=1.5, markersize=6, label='markers')
 
     ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
     ax.legend(fontsize=7)

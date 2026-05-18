@@ -22,8 +22,8 @@ import numpy as np
 import pyroki as pk
 import yourdfpy
 
-ROBOT_URDF_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "models", "panda_spherized.urdf")
-CACHE_PATH      = os.path.join(os.path.dirname(__file__), "..", "ik_cache.pkl")
+ROBOT_URDF_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "panda_spherized.urdf")
+CACHE_PATH      = os.path.join(os.path.dirname(__file__), "ik_cache.pkl")
 
 EE_ID     = 12
 EE_HEIGHT = 0.075

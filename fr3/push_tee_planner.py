@@ -43,7 +43,7 @@ from ik_cache import (
 # Configuration
 # ===============================
 
-SCENE_XML_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "models", "mjx_t_push.xml")
+SCENE_XML_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "mjx_t_push.xml")
 
 # T-block qpos offset in the MuJoCo state
 T_QPOS_OFFSET = 7

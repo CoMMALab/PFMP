@@ -71,7 +71,7 @@ def main(args):
     cache_path = args.cache or os.path.join(
         os.path.dirname(__file__),
         "..",
-        "ik_cache.pkl",
+        os.path.join(os.path.dirname(__file__), "ik_cache.pkl"),
     )
     ik_cache = get_or_build_cache(path=cache_path)
 

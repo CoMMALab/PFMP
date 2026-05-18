@@ -30,6 +30,7 @@ dependencies = [
     "meshcat",
     "franky-control==1.1.1",
     "optuna>=4.8.0",
+    "new-natnet-client>=6.0.1",
 ]
 
 [tool.setuptools.packages.find]

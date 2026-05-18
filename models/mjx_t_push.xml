@@ -1,25 +1,34 @@
 <mujoco model="panda_t_push">
   <include file="mjx_scene.xml"/>
 
+  <asset>
+    <mesh name="t_mesh" file="T.stl" scale="0.001 0.001 0.001"/>
+  </asset>
+
   <worldbody>
   <!-- workspace footprint: 53-1/8" x 23-1/4", 1.5" from base -->
   <geom type="box" name="workspace"
-      pos="0.395 0.0 0.001" size="0.295 0.675 0.001"
+      pos="0.355 0.0 0.001" size="0.270 0.675 0.001"
       rgba="0.7 0.7 0.7 0.25" contype="0" conaffinity="0" group="2"/>
-  <!-- T dimensions from CAD (models/T.stl): STEM_HALF=[0.025,0.075], CAP_HALF=[0.1,0.025], CAP_CTR=[0,0.1], THICKNESS=0.040 -->
   <body name="t_block" pos="0 0 0.020">
       <joint name="t_x"   type="slide" axis="1 0 0" damping="5.0"/>
       <joint name="t_y"   type="slide" axis="0 1 0" damping="5.0"/>
       <joint name="t_yaw" type="hinge" axis="0 0 1" damping="0.05"/>
-      <!-- T stem: STEM_HALF[0]=0.025, STEM_HALF[1]=0.075, THICKNESS/2=0.020 -->
+      <geom type="mesh" mesh="t_mesh" name="t_visual"
+          rgba="1 0.5 0 1" contype="0" conaffinity="0"/>
+      <!-- Collision boxes matching mesh geometry -->
       <geom type="box" name="t_stem" size="0.025 0.075 0.020"
-          rgba="1 0.5 0 1" condim="3"
+          rgba="1 0.5 0 0" condim="3"
           friction="1 .03 .003" contype="2" conaffinity="1" solref="0.01 1"/>
-      <!-- T bar: CAP_HALF[0]=0.1, CAP_HALF[1]=0.025, pos y=CAP_CTR[1]=0.1 -->
       <geom type="box" name="t_bar" size="0.1 0.025 0.020" pos="0 0.1 0"
-          rgba="1 0.5 0 1" condim="3"
+          rgba="1 0.5 0 0" condim="3"
           friction="1 .03 .003" contype="2" conaffinity="1" solref="0.01 1"/>
       <site name="t_com" pos="0 0 0" size="0.004" rgba="0.1 0.9 0.1 0.6"/>
+  </body>
+  <!-- Optitrack tracker ghost — driven by mocap, no collision -->
+  <body name="t_tracker" mocap="true" pos="0 0 0.020">
+      <geom type="mesh" mesh="t_mesh" name="tracker_visual"
+          rgba="0 0.6 1 0.3" contype="0" conaffinity="0" group="2"/>
   </body>
   </worldbody>
 
