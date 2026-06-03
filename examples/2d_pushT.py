@@ -117,7 +117,8 @@ class PushParams(NamedTuple):
     ws_max:      jax.Array   # (2,) robot outer clip max
     t_ws_min:    jax.Array   # (2,) T-block inner clip min
     t_ws_max:    jax.Array   # (2,) T-block inner clip max
-    du_stdev:    jax.Array = None   # (num_knots, 2) — per-knot std for CEM
+    du_stdev:       jax.Array = None   # (num_knots, 2) — per-knot std for CEM
+    approach_weight: float    = 0.0    # robot-to-T cost (0 = disabled)
 
 
 # ============================================================
@@ -274,7 +275,9 @@ def running_cost(x: jax.Array, u: jax.Array, theta: PushParams, t: float) -> jax
     err_pos   = jnp.linalg.norm(x[0:2] - theta.goal_xy)
     err_angle = jnp.abs(_angle_wrap(x[2] - theta.goal_angle))
     aw = theta.angle_weight * jnp.clip(1.0 - err_pos / 0.25, 0.0, 1.0)
-    return theta.pos_weight * err_pos**2 + aw * err_angle**2
+    # Approach: pull robot toward T, gated by T-to-goal distance (off when near goal)
+    approach  = theta.approach_weight * jnp.linalg.norm(x[6:8] - x[0:2]) * jnp.clip(err_pos / 0.25, 0.0, 1.0)
+    return theta.pos_weight * err_pos**2 + aw * err_angle**2 + approach
 
 
 def terminal_cost(x: jax.Array, theta: PushParams) -> jax.Array:
@@ -345,10 +348,7 @@ def _t_verts_world(t_xy: np.ndarray, t_angle: float) -> np.ndarray:
 # Main
 # ============================================================
 
-def dial_sigma(i: int, h: int, sigma_max: float,
-               N: int, H: int, beta1: float, beta2: float) -> float:
-    """Eq. (7) from DIAL-MPC: σ_{i,h} = σ_max * exp(-(N-i)/(β1*N) - (H-h)/(β2*H))"""
-    return sigma_max * float(np.exp(-(N - i) / (beta1 * N) - (H - h) / (beta2 * H)))
+from pfmp import dial_sigma
 
 
 def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REPLANS):
@@ -683,7 +683,20 @@ def main():
                         help='Run N seeds with all methods; print success-rate table (requires --distance).')
     parser.add_argument('--trace-figure', action='store_true',
                         help='Generate translucent-trace comparison figure (DIAL vs PFMP).')
+    parser.add_argument('--tuned-params-dir', type=str, default=None,
+                        help='Directory containing pushT_optuna_{method}.json files; '
+                             'overrides default hyperparams per method in batch mode.')
     args = parser.parse_args()
+
+    # Load tuned params per method if requested
+    _tuned: dict = {}
+    if args.tuned_params_dir is not None:
+        import json as _json
+        from pathlib import Path as _Path
+        for _method in ('mppi', 'cem', 'dial', 'ps'):
+            _f = _Path(args.tuned_params_dir) / f"pushT_optuna_{_method}.json"
+            if _f.exists():
+                _tuned[_method] = _json.load(open(_f))['best_params']
 
     # ── Trace figure mode ─────────────────────────────────────────
     if args.trace_figure:
@@ -723,6 +736,28 @@ def main():
         results = {}
 
         for method, is_baseline, ess_thresh in methods:
+            # Apply tuned params for this method if available
+            p = _tuned.get(method.split('_')[0] if method.startswith('pfmp') else method, {})
+            pos_weight_m    = p.get('pos_weight',      POS_WEIGHT)
+            angle_weight_m  = p.get('angle_weight',    ANGLE_WEIGHT)
+            u_stdev_m       = p.get('u_stdev',         U_STDEV)
+            approach_wt_m   = p.get('approach_weight', 0.0)
+            mppi_temp_m     = p.get('mppi_temperature', MPPI_TEMPERATURE)
+            cem_elites_m    = int(p.get('cem_num_elites', CEM_NUM_ELITES))
+            dial_beta1_m    = p.get('dial_beta1',      DIAL_BETA1)
+            dial_beta2_m    = p.get('dial_beta2',      DIAL_BETA2)
+
+            theta_batch_m = jax.tree.map(
+                lambda x: x, theta_batch  # start from scenario defaults
+            )._replace(
+                pos_weight   =jnp.full(args.batch, pos_weight_m),
+                angle_weight =jnp.full(args.batch, angle_weight_m),
+                u_stdev      =jnp.full(args.batch, u_stdev_m),
+                approach_weight=jnp.full(args.batch, approach_wt_m),
+                step_len     =jnp.full(args.batch, HORIZON / (NUM_KNOTS - 1)),
+                du_stdev     =jnp.full((args.batch, NUM_KNOTS, 2), u_stdev_m),
+            )
+
             ctrl = PFMP(
                 dynamics, running_cost, terminal_cost,
                 perturbation_init     if is_baseline else init_control,
@@ -732,7 +767,9 @@ def main():
             )
             tk0 = jnp.array(ctrl.tk())
 
-            def simulate_one(key, x0, theta):
+            def simulate_one(key, x0, theta,
+                             _mppi_temp=mppi_temp_m, _cem_elites=cem_elites_m,
+                             _dial_b1=dial_beta1_m, _dial_b2=dial_beta2_m):
                 if is_baseline:
                     alphas = jnp.linspace(0.0, 1.0, NUM_KNOTS)
                     theta = theta._replace(
@@ -745,23 +782,23 @@ def main():
 
                     if method == 'mppi':
                         total = jnp.sum(costs, axis=1)
-                        temp = jnp.maximum(jnp.std(total) * MPPI_TEMPERATURE, 1e-6)
+                        temp = jnp.maximum(jnp.std(total) * _mppi_temp, 1e-6)
                         theta, _ = mppi_update(theta, trajs.transpose(1, 0, 2), costs.T, temp)
                     elif method == 'cem':
                         theta, _ = cem_update(theta, trajs, jnp.sum(costs, axis=1),
-                                              elite_frac=CEM_NUM_ELITES / args.particles)
+                                              elite_frac=_cem_elites / args.particles)
                     elif method == 'dial':
                         for i_inner in range(DIAL_N_INNER, 0, -1):
-                            sigma_mean = float(np.mean([
-                                dial_sigma(i_inner, h, U_STDEV, DIAL_N_INNER, NUM_KNOTS,
-                                           DIAL_BETA1, DIAL_BETA2)
+                            sigma_mean = jnp.mean(jnp.array([
+                                dial_sigma(i_inner, h, theta.u_stdev, DIAL_N_INNER, NUM_KNOTS,
+                                           _dial_b1, _dial_b2)
                                 for h in range(NUM_KNOTS)
                             ]))
                             key, subkey_i = jax.random.split(key)
                             theta_i = theta._replace(u_stdev=sigma_mean)
                             trajs_i, costs_i = ctrl.run_sis(subkey_i, x, theta_i)
                             total_i = jnp.sum(costs_i, axis=1)
-                            temp = jnp.maximum(jnp.std(total_i) * MPPI_TEMPERATURE, 1e-6)
+                            temp = jnp.maximum(jnp.std(total_i) * _mppi_temp, 1e-6)
                             theta, _ = mppi_update(theta, trajs_i.transpose(1, 0, 2), costs_i.T, temp)
                     else:
                         theta, _ = ps_update(theta, trajs, costs)
@@ -785,9 +822,9 @@ def main():
 
             run_batch = jax.jit(jax.vmap(simulate_one))
             print(f"{method}  warm-up…", end=" ", flush=True)
-            run_batch(keys_batch, x0_batch, theta_batch)[0].block_until_ready()
+            run_batch(keys_batch, x0_batch, theta_batch_m)[0].block_until_ready()
             print("running…", end=" ", flush=True)
-            final_states = np.array(run_batch(keys_batch, x0_batch, theta_batch))
+            final_states = np.array(run_batch(keys_batch, x0_batch, theta_batch_m))
             goal_xys    = np.array(theta_batch.goal_xy)
             goal_angles = np.array(theta_batch.goal_angle)
             successes = [_is_success(final_states[i], goal_xys[i], goal_angles[i])
@@ -796,10 +833,11 @@ def main():
             print(f"{sum(successes)}/{args.batch}")
 
         print(f"\n=== Success rates (distance={args.distance:.1f}x, N={args.batch}) ===")
-        from tabulate import tabulate
-        rows = [[m, f"{sum(results[m])}/{args.batch}",
-                 f"{100*sum(results[m])/args.batch:.1f}%"] for m, *_ in methods]
-        print(tabulate(rows, headers=["Method", "Successes", "Rate"], tablefmt="rounded_outline"))
+        print(f"{'Method':12s} {'Successes':>10s} {'Rate':>8s}")
+        print("-" * 34)
+        for m, *_ in methods:
+            s = sum(results[m])
+            print(f"{m:12s} {s:>6d}/{args.batch:<4d} {100*s/args.batch:>6.1f}%")
         if args.out:
             import json
             with open(args.out, "w") as f:

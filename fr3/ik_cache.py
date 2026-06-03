@@ -39,8 +39,8 @@ EE_ROTATION = jnp.array([
 
 _CACHE_MAX_JUMP = np.pi / 3   # ~60° — larger jumps indicate a wrist flip
 
-WORKSPACE_XY_MIN = jnp.array([0.1, -0.675])
-WORKSPACE_XY_MAX = jnp.array([0.69,  0.675])
+WORKSPACE_XY_MIN = jnp.array([0.175, -0.675])
+WORKSPACE_XY_MAX = jnp.array([0.715,  0.675])
 IK_CACHE_RESOLUTION = 64
 
 
@@ -70,6 +70,10 @@ class IKCache(NamedTuple):
     q_grid:  jax.Array   # (Nx, Ny, 7)
     z:       float
 
+import sys as _sys
+_sys.modules.setdefault('ik_cache', _sys.modules[__name__])
+IKCache.__module__ = 'ik_cache'
+
 
 # ── IK solver ─────────────────────────────────────────────────────────────────
 
@@ -78,9 +82,6 @@ def _ee_z_axis_residual(vals, robot, joint_var, target_link_index, weight):
     R    = jaxlie.SE3(Ts[..., target_link_index, :]).rotation().as_matrix()
     ee_z = R @ jnp.array([0., 0., 1.])
     return ((ee_z - jnp.array([0., 0., -1.])) * weight).flatten()
-
-_ee_z_cost = jaxls.Cost.factory(_ee_z_axis_residual)
-
 
 @jdc.jit
 def _make_ik_problem(target_mat4, pos_weight=10.0, ori_weight=5.0, limit_weight=100.0):
@@ -93,7 +94,7 @@ def _make_ik_problem(target_mat4, pos_weight=10.0, ori_weight=5.0, limit_weight=
         pk.costs.pose_cost_analytic_jac(PANDA, joint_var, T_target,
                                          target_link_index=jnp.array(EE_ID),
                                          pos_weight=pos_weight, ori_weight=0.0),
-        _ee_z_cost(PANDA, joint_var, jnp.array(EE_ID), ori_weight),
+        jaxls.Cost(_ee_z_axis_residual, (PANDA, joint_var, jnp.array(EE_ID), ori_weight)),
         pk.costs.limit_cost(PANDA, joint_var, weight=limit_weight),
         pk.costs.rest_cost(joint_var, HOME_Q, REST_WEIGHT * 0.1),
     ]

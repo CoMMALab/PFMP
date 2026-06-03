@@ -1,15 +1,23 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-from tabulate import tabulate
+try:
+    from tabulate import tabulate
+except ImportError:
+    def tabulate(rows, headers=None, tablefmt=None):
+        col_w = [max(len(str(r[i])) for r in ([headers] if headers else []) + rows) for i in range(len(rows[0]))]
+        fmt = "  ".join(f"{{:<{w}}}" for w in col_w)
+        lines = [fmt.format(*headers)] + ["-"*sum(col_w)] + [fmt.format(*r) for r in rows]
+        return "\n".join(lines)
 from pfmp.run_batch import Trajectory
 from fire import Fire
 
-METHODS = ["ps", "mppi", "cem", "sis", "sir"]
+METHODS = ["ps", "mppi", "cem", "dial", "sis", "sir"]
 LABELS = {
     "ps":   "PS",
     "mppi": "MPPI",
     "cem":  "CEM",
+    "dial": "DIAL-MPC",
     "sis":  "PFMP (SIS)",
     "sir":  "PFMP (SIR)",
 }

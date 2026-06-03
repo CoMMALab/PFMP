@@ -8,7 +8,7 @@
   <worldbody>
   <!-- workspace footprint: 53-1/8" x 23-1/4", 1.5" from base -->
   <geom type="box" name="workspace"
-      pos="0.355 0.0 0.001" size="0.270 0.675 0.001"
+      pos="0.445 0.0 0.001" size="0.270 0.675 0.001"
       rgba="0.7 0.7 0.7 0.25" contype="0" conaffinity="0" group="2"/>
   <body name="t_block" pos="0 0 0.020">
       <joint name="t_x"   type="slide" axis="1 0 0" damping="5.0"/>

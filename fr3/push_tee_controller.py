@@ -52,18 +52,19 @@ def go_pushing_plane(robot: franky.Robot, target_xy: np.ndarray, ik_cache) -> No
 def go_home(robot: franky.Robot) -> None:
     robot.move(franky.JointMotion(HOME_Q.tolist()))
 
-def execute_xy(robot: franky.Robot, target_xy: np.ndarray) -> None:
+def execute_xy(robot: franky.Robot, target_xy: np.ndarray, ik_cache=None) -> None:
     target_xy = np.asarray(target_xy, dtype=float)
-    current_xy = robot_current_xy(robot)
-    delta_xy = target_xy - current_xy
-    robot.move(franky.CartesianMotion(
-        franky.Affine([
-            float(delta_xy[0]),
-            float(-delta_xy[1]),  # franky expects negated y coord
-            0.0,
-        ]),
-        franky.ReferenceType.Relative,
-    ))
+    if ik_cache is not None:
+        import jax.numpy as jnp
+        target_q = np.asarray(ik_from_cache(jnp.array(target_xy), ik_cache), dtype=float)
+        robot.move(franky.JointMotion(target_q.tolist()))
+    else:
+        current_xy = robot_current_xy(robot)
+        delta_xy = target_xy - current_xy
+        robot.move(franky.CartesianMotion(
+            franky.Affine([float(delta_xy[0]), float(-delta_xy[1]), 0.0]),
+            franky.ReferenceType.Relative,
+        ))
 
 
 def main(args):
@@ -132,6 +133,7 @@ def main(args):
                         cmd = None
 
                     if cmd is not None:
+                        print(f"[server] received command: {cmd}")
                         try:
                             target_xy = np.asarray(cmd.xy, dtype=float)
                         except Exception as e:
@@ -139,13 +141,15 @@ def main(args):
                         else:
                             # Don't let a single failed motion kill the server.
                             # Log, try to recover, and keep accepting commands.
+                            actual_xy = None
                             try:
                                 if robot is None:
                                     print(f"[dry-run] would execute xy: {target_xy.tolist()}")
                                 else:
-                                    execute_xy(robot, target_xy)
-                                    current_xy = target_xy
-                                    print(f"[server] executed xy command: {target_xy.tolist()}")
+                                    execute_xy(robot, target_xy, ik_cache)
+                                    current_xy = robot_current_xy(robot)
+                                    actual_xy = current_xy.tolist()
+                                    print(f"[server] executed xy command: {target_xy.tolist()} actual: {actual_xy}")
                             except Exception as e:
                                 print(f"[server] execute_xy failed: {e!r}")
                                 if robot is not None:
@@ -153,7 +157,8 @@ def main(args):
                                         robot.recover_from_errors()
                                     except Exception as rec_e:
                                         print(f"[server] recover_from_errors failed: {rec_e!r}")
-                            endpoint.reply_command(accepted=True)
+                            endpoint.reply_command(accepted=True,
+                                extra={"actual_xy": actual_xy} if actual_xy else None)
 
             elif args.mode == 'manual':
                 # Manual mode: consume stdin only when user typed a command.
@@ -184,7 +189,7 @@ def main(args):
                         if robot is None:
                             print(f"[dry-run] would execute xy: {target_xy.tolist()}")
                         else:
-                            execute_xy(robot, target_xy)
+                            execute_xy(robot, target_xy, ik_cache)
                         current_xy = target_xy
                         continue
 
@@ -199,7 +204,7 @@ def main(args):
                 for attempt in range(CONTROL_ATTEMPTS):
                     try:
                         seq += 1
-                        execute_xy(robot, target_xy)
+                        execute_xy(robot, target_xy, ik_cache)
                         break
                     except Exception as e:
                         failures += 1

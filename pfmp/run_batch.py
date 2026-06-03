@@ -117,7 +117,7 @@ def run_batch(  # noqa: PLR0912, PLR0915
         replan = controller.run_sir
         interp = hermite_spline
         family = "pfmp"
-    elif algorithm == "ps" or algorithm == "cem" or algorithm == "mppi":
+    elif algorithm in ("ps", "mppi", "cem", "dial"):
         replan = jax.jit(controller.optimize)
         interp = jax.jit(controller.interp_func)
         family = "hydrax"

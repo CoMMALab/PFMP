@@ -23,33 +23,29 @@ BATCH     = 128
 PARTICLES = 2048
 SEED      = 42
 
-METHODS = ["pfmp_0", "pfmp_025", "pfmp_05", "ps", "mppi", "cem", "dial"]
+METHODS = ["pfmp_0", "ps", "mppi", "cem", "dial"]
 LABELS  = {
-    "pfmp_0":   "PFMP (no resamp.)",
-    "pfmp_025": "PFMP (ESS=0.25)",
-    "pfmp_05":  "PFMP (ESS=0.5)",
-    "ps":       "PS",
-    "mppi":     "MPPI",
-    "cem":      "CEM",
-    "dial":     "DIAL",
+    "pfmp_0": "SIS",
+    "ps":     "PS",
+    "mppi":   "MPPI",
+    "cem":    "CEM",
+    "dial":   "DIAL-MPC",
 }
 COLORS = {
-    "pfmp_0":   "#27AE60",
-    "pfmp_025": "#1ABC9C",
-    "pfmp_05":  "#82E0AA",
-    "ps":       "#E74C3C",
-    "mppi":     "#3498DB",
-    "cem":      "#E67E22",
-    "dial":     "#9B59B6",
+    "pfmp_0": "#27AE60",
+    "ps":     "#E74C3C",
+    "mppi":   "#3498DB",
+    "cem":    "#E67E22",
+    "dial":   "#9B59B6",
 }
-LINE_STYLES = {m: "-" if m.startswith("pfmp") else "--" for m in METHODS}
-LINE_WIDTHS = {m: 2.5 if m.startswith("pfmp") else 1.8 for m in METHODS}
+LINE_STYLES = {m: "-" if m == "pfmp_0" else "--" for m in METHODS}
+LINE_WIDTHS = {m: 2.5 if m == "pfmp_0" else 1.8 for m in METHODS}
 
 OUTPUT_DIR = Path(__file__).parent.parent / "figures"
 DATA_PATH  = OUTPUT_DIR / "fig_pushT_data.json"
 
 
-def run_experiment(distances=None, batch=BATCH, particles=PARTICLES, seed=SEED):
+def run_experiment(distances=None, batch=BATCH, particles=PARTICLES, seed=SEED, tuned_params_dir=None):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     dists = distances if distances is not None else DISTANCES
     results = {}
@@ -72,17 +68,17 @@ def run_experiment(distances=None, batch=BATCH, particles=PARTICLES, seed=SEED):
         print(f"\n{'='*60}")
         print(f"  distance={d:.1f}  batch={batch}  particles={particles}")
         print(f"{'='*60}")
-        subprocess.run(
-            [
-                sys.executable, "examples/2d_pushT.py",
-                "--distance",  str(d),
-                "--batch",     str(batch),
-                "--particles", str(particles),
-                "--seed",      str(seed),
-                "--out",       str(cache),
-            ],
-            check=True,
-        )
+        cmd = [
+            sys.executable, "examples/2d_pushT.py",
+            "--distance",  str(d),
+            "--batch",     str(batch),
+            "--particles", str(particles),
+            "--seed",      str(seed),
+            "--out",       str(cache),
+        ]
+        if tuned_params_dir is not None:
+            cmd += ["--tuned-params-dir", str(tuned_params_dir)]
+        subprocess.run(cmd, check=True)
         with open(cache) as f:
             results[key] = json.load(f)
 
@@ -163,7 +159,15 @@ if __name__ == "__main__":
     parser.add_argument("--batch",     type=int,   default=BATCH)
     parser.add_argument("--particles", type=int,   default=PARTICLES)
     parser.add_argument("--seed",      type=int,   default=SEED)
+    parser.add_argument("--tuned-params-dir", type=str, default=None,
+                        help="Directory with pushT_optuna_{method}.json files for tuned baselines.")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Override output directory (default: figures/).")
     args = parser.parse_args()
+
+    if args.output_dir is not None:
+        OUTPUT_DIR = Path(args.output_dir)
+        DATA_PATH  = OUTPUT_DIR / "fig_pushT_data.json"
 
     if args.plot_only:
         results = {}
@@ -180,7 +184,8 @@ if __name__ == "__main__":
             raise FileNotFoundError("No results found — run --experiment first.")
         make_plots(results)
     elif args.experiment:
-        results = run_experiment(args.distances, args.batch, args.particles, args.seed)
+        results = run_experiment(args.distances, args.batch, args.particles, args.seed,
+                                 tuned_params_dir=args.tuned_params_dir)
         make_plots(results)
     else:
         parser.print_help()

@@ -62,6 +62,13 @@ def ess(costs: jax.Array) -> jax.Array:
     return (1.0 / jnp.sum(ps ** 2)) / n
 
 
+def dial_sigma(i: int, h: int, sigma_max: float, N: int, H: int,
+               beta1: float, beta2: float) -> float:
+    """DIAL-MPC annealing schedule (Eq. 7): σ_{i,h} = σ_max · exp(−(N−i)/(β₁N) − (H−h)/(β₂H))."""
+    import math
+    return sigma_max * math.exp(-(N - i) / (beta1 * N) - (H - h) / (beta2 * H))
+
+
 def ps_update(theta: PyTree, trajs: jax.Array, costs: jax.Array):
     best_idx = jnp.argmin(jnp.sum(costs, axis=1))
     new_mean = jax.tree.map(lambda u: u[best_idx], trajs)
@@ -72,8 +79,8 @@ def ps_update(theta: PyTree, trajs: jax.Array, costs: jax.Array):
 def mppi_update(theta: PyTree, trajs: jax.Array, costs: jax.Array, temperature: float):
     weights = jnp.exp(-costs / temperature)
     weights = weights / jnp.sum(weights, axis=1, keepdims=True)
-    new_mean = jax.tree.map(lambda u: jnp.sum(u * weights[:,:,None], axis=1), trajs)
-    theta = theta._replace(mean = new_mean)
+    new_mean = jax.tree.map(lambda u: jnp.sum(u * weights[:, :, None], axis=1), trajs)
+    theta = theta._replace(mean=new_mean)
     return theta, jnp.sum(costs * weights, axis=1)
 
 # Cross-Entropy Method
@@ -81,8 +88,10 @@ def cem_update(theta: PyTree, trajs: jax.Array, costs: jax.Array, elite_frac: fl
     num_elite = int(elite_frac * trajs.shape[0])
     elite_idxs = jnp.argsort(costs, axis=0)[:num_elite]
     new_mean = jax.tree.map(lambda u: jnp.mean(u[elite_idxs], axis=0), trajs)
-    new_std  = jax.tree.map(lambda u: jnp.std(u[elite_idxs], axis=0), trajs)
-    theta = theta._replace(mean=new_mean, du_stdev=new_std)
+    updates = {"mean": new_mean}
+    if hasattr(theta, "du_stdev"):
+        updates["du_stdev"] = jax.tree.map(lambda u: jnp.std(u[elite_idxs], axis=0), trajs)
+    theta = theta._replace(**updates)
     return theta, jnp.mean(costs[elite_idxs], axis=0)
 
 # Mujoco XLA helper functions
@@ -118,6 +127,7 @@ class GenericMJXTaskParams(NamedTuple):
     mjx_model: mjx.Model
     mean: jax.Array
     noise_level: float
+    actor_params: any = None
 
 class PFMP(NamedTuple):
     """ Particle Filtering Motion Planning (PFMP) """
@@ -177,6 +187,40 @@ class PFMP(NamedTuple):
         # Scan over the spline and numerically integrate cost
         (x1, cost), _ys = jax.lax.scan(interpolate_step, (x0, 0.0), (jax.tree.map(lambda u: u[:-1], us), tq[:-1]))
         return (x1, u1), (u1, cost)
+
+    @partial(jax.jit, static_argnames=['self'])
+    def unroll(
+        self,
+        key: PRNGKeyArray,
+        x0: PyTree,
+        theta: PyTree,
+    ) -> tuple[jax.Array, jax.Array, PyTree]:
+        """Training primitive. Returns (us, costs, xs) per particle per knot.
+
+        us:    (particles, num_knots, action_dim)
+        costs: (particles, num_knots)
+        xs:    per-knot states, shape (particles, num_knots-1, ...) — state at end of each interval
+        """
+        key1, key2 = jax.random.split(key)
+        keys1 = jax.random.split(key1, (self.particles,))
+        u0s = jax.vmap(self.mpc_init, in_axes=(0, None, None))(keys1, x0, theta)
+        keys2 = jax.random.split(key2, (self.particles, self.num_knots - 1))
+
+        def scan_one(particle_keys, u0):
+            def step(carry, inp):
+                (x1, u1), (u, cost) = self.transition_model(inp[0], carry[0], carry[1], theta, inp[1])
+                return (x1, u1), (u, cost, x1)
+            (final_x, _), (us, costs, xs) = jax.lax.scan(
+                step, (x0, u0), (particle_keys, self.tk(endpoint=False))
+            )
+            return final_x, us, costs, xs
+
+        final_xs, us, costs, xs = jax.vmap(scan_one)(keys2, u0s)
+        final_costs = jax.vmap(self.mpc_terminal_cost, in_axes=(0, None))(final_xs, theta)
+        us    = jax.tree.map(lambda head, tail: jnp.concat([head[:, None], tail], axis=1), u0s, us)
+        costs = jnp.concatenate((costs, final_costs[:, None]), axis=-1)
+        # xs: (particles, num_knots-1, ...) — state at end of each knot interval
+        return us, costs, xs
 
     @partial(jax.jit, static_argnames=['self'])
     def run_sis(

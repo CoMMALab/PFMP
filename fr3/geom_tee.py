@@ -53,10 +53,21 @@ def _load_dims():
     # Express cap center in body frame (stem center = origin)
     cap_ctr_body = cap_ctr_m - stem_ctr_m
 
-    # Unique 2D outline vertices from STL, shifted to stem-center body frame origin
-    xy_m = xy_mm * 1e-3
-    xy_unique = np.unique(np.round(xy_m, 4), axis=0)
-    verts_local = (xy_unique - stem_ctr_m).astype(np.float32)
+    # Reconstruct CCW T-polygon from extracted dims (body frame, stem center = origin)
+    sc = np.array([0.0, 0.0])
+    sh = stem_half_m
+    cc = cap_ctr_body
+    ch = cap_half_m
+    verts_local = np.array([
+        [sc[0]-sh[0], sc[1]-sh[1]],  # stem bottom-left
+        [sc[0]+sh[0], sc[1]-sh[1]],  # stem bottom-right
+        [sc[0]+sh[0], cc[1]-ch[1]],  # stem/cap junction right
+        [cc[0]+ch[0], cc[1]-ch[1]],  # cap bottom-right
+        [cc[0]+ch[0], cc[1]+ch[1]],  # cap top-right
+        [cc[0]-ch[0], cc[1]+ch[1]],  # cap top-left
+        [cc[0]-ch[0], cc[1]-ch[1]],  # cap bottom-left
+        [sc[0]-sh[0], cc[1]-ch[1]],  # stem/cap junction left
+    ], dtype=np.float32)
 
     return stem_half_m, cap_half_m, cap_ctr_body, thickness_m, verts_local
 

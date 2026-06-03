@@ -11,13 +11,16 @@ Controls:
     cells green (smooth) → red (discontinuous)
 """
 
+import os
 import sys
 import time
 import numpy as np
 
-sys.path.insert(0, ".")
-from examples.fr3.ik_cache import (
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ik_cache import (
     ik_step_from_xy,
+    ik_from_cache,
+    get_or_build_cache,
     HOME_Q,
     EE_HEIGHT,
     WORKSPACE_XY_MIN,
@@ -31,11 +34,12 @@ import viser
 from viser.extras import ViserUrdf
 
 HOME_Q_NP = np.array(HOME_Q)
-# panda_joint1 … panda_joint7 — order matches HOME_Q indices
 ARM_JOINT_NAMES = [f"panda_joint{i+1}" for i in range(7)]
 
 
 def main() -> None:
+    print("Loading IK cache…")
+    cache = get_or_build_cache()
     server = viser.ViserServer()
 
     # ----- scene -----
@@ -68,15 +72,12 @@ def main() -> None:
         info_md = server.gui.add_markdown("*Move the sliders to solve IK.*")
 
     with server.gui.add_folder("Workspace heatmap"):
-        res_slider = server.gui.add_slider(
-            "Resolution", min=8, max=32, step=1, initial_value=16,
-        )
         build_btn = server.gui.add_button("Build heatmap")
 
     # ----- solve IK and refresh -----
     def solve_and_update() -> None:
         xy = np.array([x_slider.value, y_slider.value])
-        q = np.array(ik_step_from_xy(jnp.array(HOME_Q_NP), jnp.array(xy)))
+        q = np.array(ik_from_cache(jnp.array(xy), cache))
 
         # Update robot URDF
         cfg = {name: float(q[k]) for k, name in enumerate(ARM_JOINT_NAMES)}
@@ -85,20 +86,33 @@ def main() -> None:
         # Move EE frame
         ee_frame.position = (float(xy[0]), float(xy[1]), float(EE_HEIGHT))
 
-        # Deviation from HOME_Q
-        diff = ((q - HOME_Q_NP) + np.pi) % (2 * np.pi) - np.pi
-        worst_idx = int(np.argmax(np.abs(diff)))
-        worst_deg = float(np.degrees(np.abs(diff[worst_idx])))
+        # Max jump to any neighbouring cache cell
+        q_grid = np.array(cache.q_grid)
+        Nx, Ny = q_grid.shape[:2]
+        uv = np.clip((xy - np.array(cache.xy_min)) / (np.array(cache.xy_max) - np.array(cache.xy_min)), 0, 1)
+        ix = int(np.clip(np.floor(uv[0] * (Nx - 1)), 0, Nx - 1))
+        iy = int(np.clip(np.floor(uv[1] * (Ny - 1)), 0, Ny - 1))
+
+        neighbors = []
+        for di, dj in [(-1,0),(1,0),(0,-1),(0,1)]:
+            ni, nj = ix + di, iy + dj
+            if 0 <= ni < Nx and 0 <= nj < Ny:
+                neighbors.append(q_grid[ni, nj])
+
+        jumps = np.zeros(7)
+        for nb in neighbors:
+            diff = np.abs(((nb - q) + np.pi) % (2 * np.pi) - np.pi)
+            jumps = np.maximum(jumps, diff)
+
+        worst_idx = int(np.argmax(jumps))
+        worst_deg = float(np.degrees(jumps[worst_idx]))
         ok = worst_deg < np.degrees(_CACHE_MAX_JUMP)
 
-        rows = ["| jt | angle | Δ home |", "|:--:|------:|------:|"]
+        rows = ["| jt | angle | Δ neighbor |", "|:--:|------:|----------:|"]
         for k in range(7):
-            flag = " ⚠" if abs(diff[k]) >= _CACHE_MAX_JUMP else ""
-            rows.append(
-                f"| {k+1} | {np.degrees(q[k]):+.1f}° "
-                f"| {np.degrees(diff[k]):+.1f}°{flag} |"
-            )
-        status = "🟢 OK" if ok else f"🔴 BAD — j{worst_idx+1} off by {worst_deg:.0f}°"
+            flag = " ⚠" if jumps[k] >= _CACHE_MAX_JUMP else ""
+            rows.append(f"| {k+1} | {np.degrees(q[k]):+.1f}° | {np.degrees(jumps[k]):.1f}°{flag} |")
+        status = "🟢 OK" if ok else f"🔴 BAD — j{worst_idx+1} jumps {worst_deg:.0f}°"
         info_md.content = "\n".join(rows) + f"\n\n**{status}**"
 
     @x_slider.on_update
@@ -111,28 +125,21 @@ def main() -> None:
     @build_btn.on_click
     def _(_):
         build_btn.disabled = True
-        resolution = int(res_slider.value)
-        xs = np.linspace(float(WORKSPACE_XY_MIN[0]), float(WORKSPACE_XY_MAX[0]), resolution)
-        ys = np.linspace(float(WORKSPACE_XY_MIN[1]), float(WORKSPACE_XY_MAX[1]), resolution)
-
-        q_grid = np.zeros((resolution, resolution, 7))
-        for i, x in enumerate(xs):
-            for j, y in enumerate(ys):
-                q_grid[i, j] = np.array(
-                    ik_step_from_xy(jnp.array(HOME_Q_NP), jnp.array([x, y]))
-                )
+        q_grid = np.array(cache.q_grid)  # (Nx, Ny, 7)
+        Nx, Ny = q_grid.shape[:2]
+        xs = np.linspace(float(cache.xy_min[0]), float(cache.xy_max[0]), Nx)
+        ys = np.linspace(float(cache.xy_min[1]), float(cache.xy_max[1]), Ny)
 
         def wd(arr, axis):
             d = np.diff(arr, axis=axis)
             return (d + np.pi) % (2 * np.pi) - np.pi
 
-        dx = np.abs(wd(q_grid, 0))   # (N-1, N, 7)
-        dy = np.abs(wd(q_grid, 1))   # (N, N-1, 7)
-        jump = np.zeros((resolution, resolution))
+        dx = np.abs(wd(q_grid, 0))
+        dy = np.abs(wd(q_grid, 1))
+        jump = np.zeros((Nx, Ny))
         jump[:-1, :] = np.maximum(jump[:-1, :], np.max(dx, axis=-1))
         jump[:, :-1] = np.maximum(jump[:, :-1], np.max(dy, axis=-1))
 
-        # Point cloud: green = smooth, red = discontinuous
         pts, colors = [], []
         for i, x in enumerate(xs):
             for j, y in enumerate(ys):
@@ -148,8 +155,7 @@ def main() -> None:
         )
 
         n_bad = int(np.sum(jump >= _CACHE_MAX_JUMP))
-        print(f"Heatmap built: {n_bad}/{resolution**2} bad cells "
-              f"(max jump {np.degrees(jump.max()):.1f}°)")
+        print(f"Heatmap: {n_bad}/{Nx*Ny} bad cells (max jump {np.degrees(jump.max()):.1f}°)")
         build_btn.disabled = False
 
     # ----- init -----

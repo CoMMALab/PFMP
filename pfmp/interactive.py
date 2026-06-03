@@ -27,7 +27,8 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     record_video: bool = False,
     record_traj: bool = False,
     max_step: int = int(1e6),
-    goal_marker_fn: Optional[callable] = None
+    goal_marker_fn: Optional[callable] = None,
+    update_fn: Optional[callable] = None,
 ) -> None:
     """Run an interactive simulation with the MPC controller.
 
@@ -57,7 +58,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
         replan = controller.run_sir
         interp = hermite_spline
         family = "pfmp"
-    elif method == "ps" or method == "cem" or method == "mppi":
+    elif method == "ps" or method == "cem":
         replan = jax.jit(controller.optimize)
         interp = jax.jit(controller.interp_func)
         family = "hydrax"
@@ -99,17 +100,16 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     print("Jitting the controller...")
     st = time.time()
 
-    if family == "pfmp":
+    update = update_fn if update_fn is not None else ps_update
+    if family in ("pfmp", "pfmp_mppi"):
         init_shape = theta.mean.shape
         print(f"knots shape: {init_shape}")
         key, subkey = jax.random.split(key)
         (trajs, costs) = replan(subkey, mjx_data, theta)
-        # assert theta.mean.shape == init_shape
-        theta, _ = ps_update(theta, trajs, costs)
-        # assert theta.mean.shape == init_shape
+        theta, _ = update(theta, trajs, costs)
         key, subkey = jax.random.split(key)
         (trajs, costs) = replan(subkey, mjx_data, theta)
-        theta, _ = ps_update(theta, trajs, costs)
+        theta, _ = update(theta, trajs, costs)
         # assert theta.mean.shape == init_shape
     else:
         policy_params = controller.init_params(initial_knots=initial_knots)
@@ -176,7 +176,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                 total_costs = jnp.sum(costs, axis=1)
                 ess_val = ess(costs)
                 print(f"cost min={float(total_costs.min()):.3f} max={float(total_costs.max()):.3f} std={float(total_costs.std()):.3f}  ESS/K={float(ess_val):.3f}")
-                theta, _ = ps_update(theta, trajs, costs)
+                theta, _ = update(theta, trajs, costs)
             else:
                 policy_params, rollouts = replan(mjx_data, policy_params)
             plan_time = time.time() - plan_start

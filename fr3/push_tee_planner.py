@@ -6,33 +6,19 @@ Real world workspace is 53' 1/8" x 23' 1/4"
 
 import argparse
 import os
-import time
-from typing import NamedTuple, Optional, Tuple
+from typing import NamedTuple, Tuple
 
 import jax
 import jax.numpy as jnp
-import matplotlib.pyplot as plt
 import mujoco
 import numpy as np
-import zmq
 from mujoco import mjx
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from geom_tee import STEM_HALF, CAP_HALF, CAP_CTR
 
-# Real-world tee dimensions (8" × 8" T) for top-down outline plotting; see
-# examples/fr3/perception/tee.py and viz.py for the full 3D shape definition.
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "perception"))
-from tee import (
-    TEE_WIDTH_M, TEE_LENGTH_M, TEE_XY_THICKNESS_M,
-    TEE_CENTER_OFFSET_Y_M,
-)
-
 import pfmp
-from pfmp.run_batch import Trajectory
-from pub_sub.protocol import Command, Response, TeeBelief
-from pub_sub.planner import PlannerClient
 
 from ik_cache import (
     IKCache, ik_from_cache, get_or_build_cache,
@@ -65,6 +51,7 @@ class PushParams(NamedTuple):
     angle_weight: float
     u_stdev: float
     gripper_site_id: int
+    approach_weight: float = 0.0
 
 
 # ===============================
@@ -92,9 +79,19 @@ def compute_error(th: PushParams, t_qpos: jax.Array) -> jax.Array:
 # ===============================
 
 
-PROPOSAL_MIX   = 0.5   # probability of directed (vs random local) sample
-STEP_LEN_VEL   = 0.02  # step size toward T per knot (m)
-PUSH_OVERSHOOT = 1.0   # multiplier on step toward T centroid
+HORIZON   = 2.0
+NUM_KNOTS = 5
+PARTICLES = 4096
+
+SUCCESS_POS_RADIUS = 0.05   # metres
+SUCCESS_ANGLE_TOL  = 0.35   # radians (~20°)
+
+PROPOSAL_MIX    = 0.4   # directed toward tee
+ORBITAL_MIX     = 0.2   # orbit around tee at push radius
+STEP_LEN_VEL    = 0.05
+PUSH_OVERSHOOT  = 1.0
+PUSH_RADIUS     = 0.16  # just outside tee cap half-extent
+ORBITAL_Y_OFFSET = 0.04  # metres up the tee stem for the orbital centre
 
 
 def dynamics(x: mjx.Data, u: jax.Array, th: PushParams, t: float) -> Tuple[mjx.Data, jax.Array]:
@@ -105,13 +102,19 @@ def dynamics(x: mjx.Data, u: jax.Array, th: PushParams, t: float) -> Tuple[mjx.D
     return x_next, u
 
 
+TEE_ANNULUS_CENTER = (0.25 + 0.78) / 2   # ideal radial distance from base
+TEE_ANNULUS_WEIGHT = 5.0
+
 def running_cost(x: mjx.Data, u: jax.Array, th: PushParams, t: float) -> jax.Array:
     t_qpos    = x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 3]
+    t_xy      = t_qpos[:2]
     error     = compute_error(th, t_qpos)
     err_pos   = jnp.linalg.norm(error[:2])
     err_angle = jnp.abs(error[2])
-    aw = th.angle_weight * jnp.clip(1.0 - err_pos / 0.25, 0.0, 1.0)
-    return th.pos_weight * err_pos ** 2 + aw * err_angle ** 2
+    aw        = th.angle_weight * jnp.clip(1.0 - err_pos / 0.25, 0.0, 1.0)
+    radial    = jnp.linalg.norm(t_xy) - TEE_ANNULUS_CENTER
+    approach  = th.approach_weight * jnp.linalg.norm(u - t_xy) * jnp.clip(err_pos / 0.25, 0.0, 1.0)
+    return th.pos_weight * err_pos ** 2 + aw * err_angle ** 2 + TEE_ANNULUS_WEIGHT * radial ** 2 + approach
 
 
 def terminal_cost(x: mjx.Data, th: PushParams) -> jax.Array:
@@ -129,22 +132,45 @@ def init_control(key: jax.Array, _x: mjx.Data, th: PushParams) -> jax.Array:
     return r_xy + jax.random.normal(key, (2,)) * th.u_stdev * 0.1
 
 
+def mppi_proposal(key: jax.Array, _x: mjx.Data, _u: jax.Array, th: PushParams, t: float) -> jax.Array:
+    """Gaussian proposal centred on the mean knot at time t (for MPPI baseline)."""
+    step_len = HORIZON / (NUM_KNOTS - 1)
+    idx = jnp.clip(jnp.floor(t / step_len).astype(jnp.int32) + 1, 0, NUM_KNOTS - 1)
+    return th.mean[idx] + jax.random.normal(key, (2,)) * th.u_stdev
+
+
 def proposal(key: jax.Array, x: mjx.Data, u: jax.Array, th: PushParams, t: float) -> jax.Array:
-    """Mixture: directed toward T centroid (50%) or random walk from current u (50%).
-    Near the goal, noise is reduced to let the plan stabilize.
-    """
-    key_mix, key_a, key_b = jax.random.split(key, 3)
-    t_xy      = x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 2]
+    """Three-way mixture: directed toward tee / orbital around tee / random walk."""
+    key_mix, key_a, key_b, key_ang = jax.random.split(key, 4)
+    t_xy  = x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 2]
+    t_yaw = x.qpos[T_QPOS_OFFSET + 2]
+    r     = jax.random.uniform(key_mix)
 
-    # err_pos = jnp.linalg.norm(t_xy - th.goal_xy)
-    # stdev = th.u_stdev * jnp.where(err_pos < 0.05, 0.2, 1.0)
-
+    # Branch 1: step toward tee centroid
     direction = t_xy - u
     dist      = jnp.linalg.norm(direction) + 1e-7
     directed  = u + (direction / dist) * (jnp.minimum(dist, STEP_LEN_VEL) * PUSH_OVERSHOOT)
     directed  = directed + jax.random.normal(key_a, (2,)) * th.u_stdev
+
+    # Branch 2: orbit around a point shifted up the tee stem (body-frame +y).
+    stem_up     = jnp.array([-jnp.sin(t_yaw), jnp.cos(t_yaw)])
+    orbital_ctr = t_xy + ORBITAL_Y_OFFSET * stem_up
+    angle       = jax.random.uniform(key_ang, minval=0.0, maxval=2.0 * jnp.pi)
+    orbital     = orbital_ctr + PUSH_RADIUS * jnp.array([jnp.cos(angle), jnp.sin(angle)])
+
+    # Branch 3: random walk
     random_loc = u + jax.random.normal(key_b, (2,)) * th.u_stdev * 2.0
-    return jnp.where(jax.random.uniform(key_mix) < PROPOSAL_MIX, directed, random_loc)
+
+    sample = jnp.where(r < PROPOSAL_MIX, directed,
+             jnp.where(r < PROPOSAL_MIX + ORBITAL_MIX, orbital, random_loc))
+
+    # Clamp EE sample into the reachable annulus.
+    EE_INNER = 0.30
+    EE_OUTER = 0.775
+    d = jnp.linalg.norm(sample) + 1e-7
+    sample = jnp.where(d < EE_INNER, sample * (EE_INNER / d), sample)
+    sample = jnp.where(d > EE_OUTER, sample * (EE_OUTER / d), sample)
+    return sample
 
 
 # ===============================
@@ -211,14 +237,96 @@ def load_scene(xml_path: str):
 
 #################################################################
 
-def simulate(                                                                                                                                                           
-    init_belief: TeeBelief,                                                                                                                                             
-    commands: list[Command],                                                                                                                                            
-    push_params: PushParams,                                                                                                                                            
-    steps_per_knot: int,                                                                                                                                                
-    interactive: bool = True                                                                                                                                            
-) -> Trajectory:                                                                                                                                                        
-    pass   
+def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
+                 optitrack_client, robot_planner, method="sir", temperature=None):
+    """Closed-loop realtime push: Optitrack → PFMP → robot controller."""
+    from push_tee_optitrack import tee_pose
+    from pub_sub.protocol import Command
+    import mujoco.viewer as mjviewer
+
+    key = jax.random.key(0)
+    gripper_id = theta.gripper_site_id
+
+    def goal_marker_callback(user_scn, th):
+        user_scn.ngeom = 0
+        add_goal_T(user_scn, np.array(th.goal_xy), float(th.goal_angle),
+                   rgba=(0.2, 0.8, 0.2, 0.5))
+        knots = np.array(th.mean)
+        z = float(EE_HEIGHT)
+        for k in range(len(knots) - 1):
+            if user_scn.ngeom >= user_scn.maxgeom:
+                break
+            p0 = np.array([knots[k,0], knots[k,1], z], dtype=np.float64)
+            p1 = np.array([knots[k+1,0], knots[k+1,1], z], dtype=np.float64)
+            geom = user_scn.geoms[user_scn.ngeom]
+            mujoco.mjv_connector(geom, mujoco.mjtGeom.mjGEOM_LINE, 2.0, p0, p1)
+            geom.rgba[:] = [1.0, 0.5, 0.0, 1.0]
+            user_scn.ngeom += 1
+
+    from pfmp.algorithm import ps_update, mppi_update
+    if method == "mppi":
+        replan = lambda key, data, th: ctrl.run_sis(key, data, th)
+        update = lambda th, tr, co: mppi_update(th, tr.transpose(1, 0, 2), co.T, temperature)
+    elif method == "ps":
+        replan = lambda key, data, th: ctrl.run_sis(key, data, th)
+        update = ps_update
+    else:  # sir
+        replan = lambda key, data, th: ctrl.run_sir(key, data, th)
+        update = ps_update
+
+    print("JIT warm-up…", end=" ", flush=True)
+    mjx_data = mjx.put_data(mj_model, mj_data)
+    _ = replan(key, mjx_data, theta)
+    print("done")
+
+    with mjviewer.launch_passive(mj_model, mj_data) as viewer:
+        print("Realtime loop running. Close viewer to stop.")
+        while viewer.is_running():
+            # 1. Get real tee pose from Optitrack
+            rbs = []
+            for frame in optitrack_client.MoCap(timeout=None):
+                rbs = [rb for rb in frame.rigid_body_data.rigid_bodies if rb.tracking]
+                break
+            if rbs:
+                xy, yaw = tee_pose(rbs[0])
+                mj_data.qpos[T_QPOS_OFFSET]     = float(xy[0])
+                mj_data.qpos[T_QPOS_OFFSET + 1] = float(xy[1])
+                mj_data.qpos[T_QPOS_OFFSET + 2] = float(yaw)
+                mujoco.mj_forward(mj_model, mj_data)
+
+                dist_to_goal  = float(np.linalg.norm(xy - np.array(theta.goal_xy)))
+                angle_err     = float(abs(((yaw - float(theta.goal_angle) + np.pi) % (2 * np.pi)) - np.pi))
+                if dist_to_goal < SUCCESS_POS_RADIUS and angle_err < SUCCESS_ANGLE_TOL:
+                    print(f"\n✓ Goal reached (dist={dist_to_goal*100:.1f}cm, angle={np.degrees(angle_err):.1f}°). Press Enter to continue...")
+                    input()
+
+            # 2. Run PFMP
+            key, subkey = jax.random.split(key)
+            mjx_data = mjx.put_data(mj_model, mj_data)
+            trajs, costs = replan(subkey, mjx_data, theta)
+            theta, _ = update(theta, trajs, costs)
+
+            # 3. Execute one knot before replanning
+            for step in range(1, 2):
+                next_wp = np.clip(np.array(theta.mean[step]),
+                                  np.array(WORKSPACE_XY_MIN), np.array(WORKSPACE_XY_MAX))
+                try:
+                    reply = robot_planner.send_command(Command(xy=next_wp.tolist()))
+                    actual_xy = reply.get("actual_xy")
+                    ee_xy = np.array(actual_xy) if actual_xy else next_wp
+                    q_cmd = np.asarray(ik_from_cache(jnp.array(ee_xy), ik_cache), dtype=float)
+                    mj_data.qpos[:7] = q_cmd
+                    mj_data.ctrl[:7] = q_cmd
+                except Exception as e:
+                    print(f"[planner] command failed: {e}")
+
+            # Shift mean by 1 knot
+            new_mean = jnp.concatenate([theta.mean[1:], theta.mean[-1:]])
+            theta = theta._replace(mean=new_mean)
+
+            # 4. Update viewer
+            goal_marker_callback(viewer.user_scn, theta)
+            viewer.sync()
 
 
 
@@ -228,10 +336,40 @@ def main():
     parser = argparse.ArgumentParser(description="T-block pushing with PFMP")
     parser.add_argument('--cache-resolution', type=int, default=IK_CACHE_RESOLUTION,
                         help='IK cache grid resolution')
+    parser.add_argument('--init-xy',  type=float, nargs=2, default=[0.4, 0.0], metavar=('X', 'Y'))
+    parser.add_argument('--goal-x',   type=float, default=0.4)
+    parser.add_argument('--goal-y',   type=float, default=-0.35)
+    parser.add_argument('--goal-yaw', type=float, default=float(4*np.pi/3))
+    parser.add_argument('--seed',     type=int,   default=42)
+    parser.add_argument('--sample-x', type=float, nargs=2, default=[0.30, 0.55])
+    parser.add_argument('--sample-y', type=float, nargs=2, default=[-0.25, 0.25])
+
+    shared = argparse.ArgumentParser(add_help=False)
+    shared.add_argument('--trial', type=int, default=0,
+                        help='Trial index — matches view_start_region.py seed')
+
     subparsers = parser.add_subparsers(dest="algorithm", required=True)
-    subparsers.add_parser("ps", help="Predictive Sampling (Sequential Importance Sampling)")
-    subparsers.add_parser("sir", help="Sequential Importance Resampling")
-    subparsers.add_parser("realtime", help="Server Run")
+    subparsers.add_parser("ps",  parents=[shared], help="Predictive Sampling")
+    subparsers.add_parser("sir", parents=[shared], help="Sequential Importance Resampling")
+    mppi_p = subparsers.add_parser("mppi", parents=[shared], help="MPPI baseline")
+    mppi_p.add_argument("--temperature", type=float, default=1.0)
+    cem_p = subparsers.add_parser("cem", parents=[shared], help="Cross-Entropy Method")
+    cem_p.add_argument("--num-elites", type=int, default=13)
+    dial_p = subparsers.add_parser("dial", parents=[shared], help="DIAL-MPC baseline")
+    dial_p.add_argument("--temperature",  type=float, default=1.0)
+    dial_p.add_argument("--beta1",        type=float, default=1.0)
+    dial_p.add_argument("--beta2",        type=float, default=1.0)
+    dial_p.add_argument("--n-inner",      type=int,   default=5)
+    rt = subparsers.add_parser("realtime", help="Closed-loop real robot")
+    rt.add_argument("--server",      default="127.0.0.1", help="Motive IP")
+    rt.add_argument("--local",       default="127.0.0.1", help="Local IP")
+    rt.add_argument("--server-host", default="localhost",  help="Controller host")
+    rt.add_argument("--cmd-port",    type=int, default=5555)
+    rt.add_argument("--goal-x",      type=float, default=0.45)
+    rt.add_argument("--goal-y",      type=float, default=0.15)
+    rt.add_argument("--goal-yaw",    type=float, default=float(4*np.pi/3))
+    rt.add_argument("--method",         default="sir", choices=["sir", "ps", "mppi"])
+    rt.add_argument("--temperature",    type=float, default=1.0, help="MPPI temperature")
     args = parser.parse_args()
 
     # Load scene
@@ -247,12 +385,12 @@ def main():
     )
 
     # Task configuration
-    horizon = 6.0
-    num_knots = 8
-    particles = 4096
+    horizon   = HORIZON
+    num_knots = NUM_KNOTS
+    particles = PARTICLES
 
     # Initial end-effector position
-    init_xy = jnp.array([0.5, -0.2])
+    init_xy = jnp.array(args.init_xy)
     q0 = ik_from_cache(init_xy, ik_cache)
     mj_data.qpos[:7] = np.array(q0)
 
@@ -266,6 +404,18 @@ def main():
     t_qpos_xy  = mj_data.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 2]
     print(f"T world xy (xpos):  {t_world_xy}")
     print(f"T qpos[7:9]:        {t_qpos_xy}")
+    # Sample initial T pose using same RNG as view_start_region.py
+    trial = getattr(args, 'trial', 0)
+    rng = np.random.default_rng([args.seed, trial])
+    init_x   = rng.uniform(*args.sample_x)
+    init_y   = rng.uniform(*args.sample_y)
+    init_yaw = rng.uniform(-np.pi, np.pi)
+    print(f"Trial {trial} (seed={args.seed}): T init=({init_x:.3f}, {init_y:.3f}, {np.degrees(init_yaw):.1f}°)")
+    mj_data.qpos[T_QPOS_OFFSET]     = init_x
+    mj_data.qpos[T_QPOS_OFFSET + 1] = init_y
+    mj_data.qpos[T_QPOS_OFFSET + 2] = init_yaw
+    mujoco.mj_forward(mj_model, mj_data)
+
     t_xy = jnp.array(mj_data.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 2])
     alphas = jnp.linspace(0.0, 1.0, num_knots)
     init_mean = (1.0 - alphas[:, None]) * r_xy + alphas[:, None] * t_xy
@@ -275,27 +425,20 @@ def main():
         mean=init_mean,
         mjx_model=mjx.put_model(mj_model),
         ik_cache=ik_cache,
-        goal_xy=jnp.array([0.45, 0.15]),
-        goal_angle=4*np.pi/3,
+        goal_xy=jnp.array([args.goal_x, args.goal_y]),
+        goal_angle=float(args.goal_yaw),
         pos_weight=15.0,
         angle_weight=1.5,
         u_stdev=0.025,
         gripper_site_id=gripper_site_id,
     )
 
-    # Create PFMP controller
-    ctrl = pfmp.PFMP(
-        dynamics,
-        running_cost,
-        terminal_cost,
-        init_control,
-        proposal,
-        horizon=horizon,
-        num_knots=num_knots,
-        particles=particles,
-        dt=mj_model.opt.timestep,
-        ess_resample_thresh=0.5,
+    _common = dict(
+        horizon=horizon, num_knots=num_knots, particles=particles,
+        dt=mj_model.opt.timestep, ess_resample_thresh=0.5,
     )
+    ctrl = pfmp.PFMP(dynamics, running_cost, terminal_cost, init_control, proposal, **_common)
+    ctrl_mppi = pfmp.PFMP(dynamics, running_cost, terminal_cost, init_control, mppi_proposal, **_common)
 
     z_traj = float(EE_HEIGHT)
     traj_rgba = np.array([1.0, 0.5, 0.0, 1.0], dtype=np.float32)
@@ -315,19 +458,101 @@ def main():
             geom.rgba[:] = traj_rgba
             user_scn.ngeom += 1
 
-    pfmp.run_interactive(
-            ctrl,
+    if args.algorithm == "realtime":
+        from new_natnet_client.Client import NatNetClient, NatNetParams
+        from pub_sub.planner import PlannerClient
+
+        # Override goal from args
+        goal_yaw = args.goal_yaw if args.goal_yaw is not None else float(theta.goal_angle)
+        theta = theta._replace(
+            goal_xy=jnp.array([args.goal_x, args.goal_y]),
+            goal_angle=jnp.array(goal_yaw),
+        )
+
+        robot_planner = PlannerClient(
+            command_addr=f"tcp://{args.server_host}:{args.cmd_port}",
+            response_addr="tcp://localhost:5556",
+            conflate=False, command_timeout_ms=30000,
+        )
+        params = NatNetParams(server_address=args.server, local_ip_address=args.local,
+                              use_multicast=False)
+        print(f"Connecting to Motive at {args.server}...")
+        with NatNetClient(params) as optitrack_client:
+            if optitrack_client is None:
+                print("Failed to connect."); return
+            print("Connected. Sampling initial tee pose...")
+
+            # Seed tee position from Optitrack before starting
+            from push_tee_optitrack import tee_pose
+            for frame in optitrack_client.MoCap(timeout=None):
+                rbs = [rb for rb in frame.rigid_body_data.rigid_bodies if rb.tracking]
+                if rbs:
+                    xy, yaw = tee_pose(rbs[0])
+                    mj_data.qpos[T_QPOS_OFFSET]     = float(xy[0])
+                    mj_data.qpos[T_QPOS_OFFSET + 1] = float(xy[1])
+                    mj_data.qpos[T_QPOS_OFFSET + 2] = float(yaw)
+                    t_xy = jnp.array(xy)
+                    alphas = jnp.linspace(0.0, 1.0, num_knots)
+                    r_xy   = jnp.array(mj_data.qpos[
+                        mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_SITE, "gripper")
+                    ] if False else [init_xy[0], init_xy[1]])
+                    theta = theta._replace(
+                        mean=(1.0 - alphas[:, None]) * r_xy + alphas[:, None] * t_xy)
+                    print(f"  tee at ({xy[0]:+.3f}, {xy[1]:+.3f}, {np.degrees(yaw):+.1f}°)")
+                    break
+
+            try:
+                rt_method = getattr(args, "method", "sir")
+                temperature = args.temperature if rt_method == "mppi" else None
+                active_ctrl = ctrl_mppi if rt_method in ("ps", "mppi") else ctrl
+                run_realtime(active_ctrl, theta, mj_model, mj_data, ik_cache,
+                             optitrack_client, robot_planner,
+                             method=rt_method, temperature=temperature)
+            finally:
+                robot_planner.close()
+    else:
+        from pfmp.algorithm import cem_update, mppi_update
+
+        active_ctrl = ctrl_mppi if args.algorithm in ("mppi", "ps", "cem", "dial") else ctrl
+        update_fn = None
+
+        if args.algorithm == "cem":
+            num_elites = args.num_elites
+            update_fn = lambda th, tr, co: cem_update(th, tr, jnp.sum(co, axis=1),
+                                                       elite_frac=num_elites / PARTICLES)
+        elif args.algorithm == "dial":
+            from pfmp import dial_sigma
+
+            n_inner     = args.n_inner
+            beta1       = args.beta1
+            beta2       = args.beta2
+            temperature = args.temperature
+
+            def dial_update(th, tr, co):
+                theta_out = th
+                for i in range(n_inner, 0, -1):
+                    sigma = float(np.mean([dial_sigma(i, h, th.u_stdev, n_inner, NUM_KNOTS, beta1, beta2)
+                                           for h in range(NUM_KNOTS)]))
+                    total = jnp.sum(co, axis=1)
+                    temp = float(jnp.maximum(jnp.std(total), 1e-6)) * temperature
+                    theta_out, _ = mppi_update(theta_out, tr.transpose(1, 0, 2), co.T, temp)
+                return theta_out, jnp.zeros(PARTICLES)
+            update_fn = dial_update
+
+        pfmp.run_interactive(
+            active_ctrl,
             theta,
             mj_model,
             mj_data,
             ik_interp=lambda target, theta, mjx_data: ik_from_cache(target, ik_cache),
-            frequency=0.25,
-            method=args.algorithm,
+            frequency=0.5,
+            method=args.algorithm if args.algorithm not in ("cem", "dial") else "sis",
             fixed_camera_id=None,
             record_video=False,
             record_traj=False,
             max_step=8000,
-            goal_marker_fn=goal_marker_callback
+            goal_marker_fn=goal_marker_callback,
+            update_fn=update_fn,
         )
 
 

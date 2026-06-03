@@ -18,7 +18,7 @@ from hydrax.tasks.cart_pole import CartPole
 from hydrax.tasks.double_cart_pole import DoubleCartPole
 from hydrax.tasks.walker import Walker
 from hydrax.tasks.cube import CubeRotation
-from hydrax.algs import PredictiveSampling, MPPI, CEM
+from hydrax.algs import PredictiveSampling, MPPI, CEM, DIAL
 from mujoco import mjx
 from typing import Literal, NamedTuple
 
@@ -28,7 +28,7 @@ class MujocoParams(NamedTuple):
     mean: jax.Array
     noise_level: float
 
-AlgorithmType = Literal["sis", "sir", "ps", "mppi", "cem"]
+AlgorithmType = Literal["sis", "sir", "ps", "mppi", "cem", "dial"]
 
 class Experiment(NamedTuple):
     task: str
@@ -45,6 +45,9 @@ class Experiment(NamedTuple):
     cem_sigma_start: float
     cem_sigma_min: float
     frequency: int = 50
+    dial_beta_opt_iter: float = 1.0
+    dial_beta_horizon: float = 1.0
+    dial_iterations: int = 5
 
 def _load_task(name):
     """Instantiate a task by name. PFMP-native tasks are imported lazily."""
@@ -144,6 +147,19 @@ def main(yamlfile, outdir):
                 spline_type=cfg.spline_type,
                 plan_horizon=cfg.plan_horizon,
                 num_knots=cfg.num_knots,
+            )
+        elif cfg.algorithm == "dial":
+            ctrl = DIAL(
+                task,
+                num_samples=cfg.num_samples,
+                noise_level=cfg.noise_level,
+                beta_opt_iter=cfg.dial_beta_opt_iter,
+                beta_horizon=cfg.dial_beta_horizon,
+                temperature=cfg.mppi_temperature,
+                spline_type=cfg.spline_type,
+                plan_horizon=cfg.plan_horizon,
+                num_knots=cfg.num_knots,
+                iterations=cfg.dial_iterations,
             )
         else:
             raise ValueError(f"Unsupported MPC algorithm: {cfg.algorithm}")

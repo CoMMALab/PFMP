@@ -64,7 +64,7 @@ elif args.algorithm == "sir" or args.algorithm == "sis":
         init, proposal,
         horizon=horizon,
         num_knots=num_knots,
-        particles=128,
+        particles=1,
         dt=mj_model.opt.timestep,
         ess_resample_thresh=0.3
         )
