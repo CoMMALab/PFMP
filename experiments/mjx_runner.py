@@ -19,6 +19,7 @@ from hydrax.tasks.double_cart_pole import DoubleCartPole
 from hydrax.tasks.walker import Walker
 from hydrax.tasks.cube import CubeRotation
 from hydrax.algs import PredictiveSampling, MPPI, CEM, DIAL
+from pfmp.icem import iCEM
 from mujoco import mjx
 from typing import Literal, NamedTuple
 
@@ -28,7 +29,7 @@ class MujocoParams(NamedTuple):
     mean: jax.Array
     noise_level: float
 
-AlgorithmType = Literal["sis", "sir", "ps", "mppi", "cem", "dial"]
+AlgorithmType = Literal["sis", "sir", "ps", "mppi", "cem", "dial", "learned", "biased_mppi", "icem"]
 
 class Experiment(NamedTuple):
     task: str
@@ -48,6 +49,8 @@ class Experiment(NamedTuple):
     dial_beta_opt_iter: float = 1.0
     dial_beta_horizon: float = 1.0
     dial_iterations: int = 5
+    learned_checkpoint: str = None  # path to mjlab .pt actor checkpoint (algorithm="learned")
+    icem_beta: float = 2.5  # colored-noise exponent for iCEM
 
 def _load_task(name):
     """Instantiate a task by name. PFMP-native tasks are imported lazily."""
@@ -61,6 +64,23 @@ def _load_task(name):
         spec.loader.exec_module(module)
         return module.HalfCheetah()
     return eval(name)()
+
+_MJLAB_EXP = {"CartPole": "cartpole", "DoubleCartPole": "double_cartpole",
+              "Walker": "walker", "HalfCheetah": "half_cheetah"}
+
+def _resolve_learned_checkpoint(task):
+    """Newest mjlab run's final model_*.pt for `task`, or None."""
+    import glob, re
+    exp = _MJLAB_EXP.get(task)
+    if exp is None:
+        return None
+    base = os.path.join(ROOT_DIR, "logs", "rsl_rl", exp)
+    runs = sorted(glob.glob(os.path.join(base, "*/")), key=os.path.getmtime)
+    for run in reversed(runs):
+        models = glob.glob(os.path.join(run, "model_*.pt"))
+        if models:
+            return max(models, key=lambda p: int(re.search(r"model_(\d+)\.pt", p).group(1)))
+    return None
 
 def main(yamlfile, outdir):
     os.makedirs(outdir, exist_ok=True)
@@ -118,6 +138,50 @@ def main(yamlfile, outdir):
                 mean = jnp.zeros((cfg.num_knots,mj_model.nu)),
                 noise_level = cfg.noise_level
                 )
+        elif cfg.algorithm in ("learned", "biased_mppi"):
+            # mjlab-trained PPO policy (task reward) as the proposal. "learned"
+            # runs it as SMC (SIR, U_MAP); "biased_mppi" runs the same proposal
+            # with the MPPI mean update and no resampling (q_learned, rho=0,
+            # U_mean), so the two isolate exactly resampling + update on a shared
+            # proposal.
+            mod_name = {"CartPole": "mjlab_cartpole",
+                        "DoubleCartPole": "mjlab_double_cartpole",
+                        "Walker": "mjlab_walker",
+                        "HalfCheetah": "mjlab_half_cheetah"}.get(cfg.task)
+            if mod_name is None:
+                raise ValueError(f"No mjlab learned proposal module for task {cfg.task}")
+            ckpt = cfg.learned_checkpoint
+            if ckpt in (None, "auto", "latest"):
+                ckpt = _resolve_learned_checkpoint(cfg.task)
+                if ckpt is None:
+                    raise ValueError(
+                        f"No mjlab checkpoint found for {cfg.task}; train via "
+                        f"examples/{mod_name}.py --train or set learned_checkpoint")
+                print(f"[learned] auto-resolved checkpoint: {ckpt}")
+            mod_path = os.path.join(os.path.dirname(__file__), "..", "examples", f"{mod_name}.py")
+            spec = importlib.util.spec_from_file_location(mod_name, mod_path)
+            mjlab_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mjlab_mod)
+
+            running_cost, terminal_cost = pfmp.mjx_hydrax_cost(task)
+            actor_params = mjlab_mod.load_actor_params(ckpt)
+            init, proposal = mjlab_mod.make_proposal(deterministic=False)
+            ctrl = pfmp.PFMP(
+                pfmp.mjx_physics,
+                running_cost, terminal_cost,
+                init, proposal,
+                horizon=cfg.plan_horizon,
+                num_knots=cfg.num_knots,
+                particles=cfg.num_samples,
+                dt=mj_model.opt.timestep,
+                ess_resample_thresh=0.5,
+            )
+            theta = pfmp.GenericMJXTaskParams(
+                mjx_model=mjx.put_model(mj_model),
+                mean=jnp.zeros((cfg.num_knots, mj_model.nu)),
+                noise_level=cfg.noise_level,
+                actor_params=actor_params,
+            )
         elif cfg.algorithm == "ps":
             ctrl = PredictiveSampling(
                 task,
@@ -144,6 +208,18 @@ def main(yamlfile, outdir):
                 num_elites=cfg.cem_num_elites,
                 sigma_start=cfg.cem_sigma_start,
                 sigma_min=cfg.cem_sigma_min,
+                spline_type=cfg.spline_type,
+                plan_horizon=cfg.plan_horizon,
+                num_knots=cfg.num_knots,
+            )
+        elif cfg.algorithm == "icem":
+            ctrl = iCEM(
+                task,
+                num_samples=cfg.num_samples,
+                num_elites=cfg.cem_num_elites,
+                sigma_start=cfg.cem_sigma_start,
+                sigma_min=cfg.cem_sigma_min,
+                beta=cfg.icem_beta,
                 spline_type=cfg.spline_type,
                 plan_horizon=cfg.plan_horizon,
                 num_knots=cfg.num_knots,
@@ -175,6 +251,7 @@ def main(yamlfile, outdir):
             num=cfg.num,
             ik_interp=ik_interp,
             sample_problem=sample_problem,
+            temperature=cfg.mppi_temperature,
         )
         traj.save(os.path.join(outdir, cfg.algorithm))
 

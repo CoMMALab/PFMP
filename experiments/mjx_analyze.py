@@ -12,12 +12,15 @@ except ImportError:
 from pfmp.run_batch import Trajectory
 from fire import Fire
 
-METHODS = ["ps", "mppi", "cem", "dial", "sis", "sir"]
+METHODS = ["ps", "mppi", "cem", "icem", "dial", "learned", "biased_mppi", "sis", "sir"]
 LABELS = {
     "ps":   "PS",
     "mppi": "MPPI",
     "cem":  "CEM",
+    "icem": "iCEM",
     "dial": "DIAL-MPC",
+    "learned": "Learned (PPO)",
+    "biased_mppi": "Biased-MPPI",
     "sis":  "PFMP (SIS)",
     "sir":  "PFMP (SIR)",
 }

@@ -1,5 +1,8 @@
 task: "CartPole"
-algorithms: ["sis", "sir", "ps", "mppi", "cem", "dial"]
+# Add "learned" to run the mjlab-trained policy as the SMC proposal
+# (train via examples/mjlab_cartpole.py --train).
+algorithms: ["sis", "sir", "ps", "mppi", "cem", "icem", "dial", "learned", "biased_mppi"]
+learned_checkpoint: null  # null/"auto" = newest mjlab run; or pin a model_*.pt path
 num: 20
 max_step: 1000
 plan_horizon: 1.0

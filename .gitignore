@@ -201,3 +201,46 @@ datasets/
 debug.sh
 uv.lock
 CLAUDE.md
+# ── Added 2026-07 (session cleanup) ──
+# Raw sensor captures (RGB pngs already ignored; block the depth arrays + dir)
+*.npy
+captures/
+
+# Regenerable figure caches / sweep data / backups (keep rendered *.pdf, drop the rest)
+figures/*.json
+figures/cache_backup_*/
+figures/cache_orphans/
+figures/ablation_N*/
+
+# Robot run log + stray artifacts
+realtime_log.jsonl
+MUJOCO_LOG.TXT
+*.zip
+
+# LaTeX build artifacts
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.bbl
+paper/*.blg
+paper/*.toc
+paper/*.synctex.gz
+
+# figure sweep-data subdirs (json caches under figures/)
+figures/tuned/
+figures/tuned_short/
+figures/**/*.json
+
+# compiled paper
+paper/*.pdf
+
+# MBM benchmark data (downloadable; not code) — remove this line to ship it self-contained
+models/problems/
+results/*.jsonl
+
+# Local-only: scratch scripts, paper, and loose notes
+drafts/
+paper/
+figures/*.pdf
+*.md
+!README.md

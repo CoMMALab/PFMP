@@ -1,5 +1,5 @@
 task: "HalfCheetah"
-algorithms: ["ps", "mppi", "cem", "dial", "sis", "sir"]
+algorithms: ["ps", "mppi", "cem", "icem", "dial", "sis", "sir"]
 num: 20
 max_step: 1000
 plan_horizon: 0.6

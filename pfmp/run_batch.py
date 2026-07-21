@@ -7,7 +7,7 @@ import jax.numpy as jnp
 from mujoco import mjx
 from dataclasses import dataclass
 from pfmp.interpolate import Jet2, hermite_spline
-from pfmp.algorithm import ps_update
+from pfmp.algorithm import ps_update, mppi_update
 
 
 @dataclass
@@ -79,6 +79,7 @@ def run_batch(  # noqa: PLR0912, PLR0915
     num: int = 1,
     ik_interp = None,
     sample_problem = None,
+    temperature: float = 1.0,
 ) -> Trajectory:
     """Run batched simulations with the MPC controller using MJX.
 
@@ -113,11 +114,15 @@ def run_batch(  # noqa: PLR0912, PLR0915
         replan = controller.run_sis
         interp = hermite_spline
         family = "pfmp"
-    elif algorithm == "sir":
+    elif algorithm in ("sir", "learned"):
         replan = controller.run_sir
         interp = hermite_spline
         family = "pfmp"
-    elif algorithm in ("ps", "mppi", "cem", "dial"):
+    elif algorithm == "biased_mppi":
+        replan = controller.run_sis          # rho = 0 (no resampling)
+        interp = hermite_spline
+        family = "pfmp"
+    elif algorithm in ("ps", "mppi", "cem", "dial", "icem"):
         replan = jax.jit(controller.optimize)
         interp = jax.jit(controller.interp_func)
         family = "hydrax"
@@ -170,6 +175,16 @@ def run_batch(  # noqa: PLR0912, PLR0915
         # Batch theta (uniform for warmup)
         theta_batched = jax.tree.map(lambda x: jnp.repeat(jnp.array(x)[None], num, axis=0), theta)
 
+        # Update rule (U): MAP (best trajectory) for SIS/SIR/learned; mean
+        # (cost-weighted average, MPPI) for Biased-MPPI. mppi_update expects a
+        # (knots, particles, ...) layout, so transpose the (particles, knots)
+        # trajectories/costs that run_sis returns.
+        if algorithm == "biased_mppi":
+            def _pfmp_update(t, tr, c):
+                return mppi_update(t, tr.transpose(1, 0, 2), c.T, temperature)
+        else:
+            _pfmp_update = ps_update
+
         # Create the step function for pfmp
         def pfmp_step_fn(carry, _):
             keys, mjx_data, theta_batched = carry
@@ -180,7 +195,7 @@ def run_batch(  # noqa: PLR0912, PLR0915
 
             # Replan
             trajs, costs = jax.vmap(replan)(subkeys, mjx_data, theta_batched)
-            theta_batched = jax.vmap(lambda t, tr, c: ps_update(t, tr, c)[0])(theta_batched, trajs, costs)
+            theta_batched = jax.vmap(lambda t, tr, c: _pfmp_update(t, tr, c)[0])(theta_batched, trajs, costs)
 
             # Get controls
             tk = controller.tk()

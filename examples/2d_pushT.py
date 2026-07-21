@@ -354,15 +354,16 @@ from pfmp import dial_sigma
 def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REPLANS):
     """Run closed-loop simulation, return (states, plans)."""
     is_baseline = method in ('mppi', 'dial', 'ps', 'cem')
+    use_informed_proposal = method in ('biased_mppi', 'biased_cem')
 
     ctrl = PFMP(
         dynamics, running_cost, terminal_cost,
-        perturbation_init     if is_baseline else init_control,
-        perturbation_proposal if is_baseline else proposal,
+        perturbation_init     if is_baseline and not use_informed_proposal else init_control,
+        perturbation_proposal if is_baseline and not use_informed_proposal else proposal,
         horizon=HORIZON,
         num_knots=NUM_KNOTS,
         particles=particles,
-        ess_resample_thresh=0.0 if is_baseline else ESS_THRESH,
+        ess_resample_thresh=0.0 if is_baseline or use_informed_proposal else ESS_THRESH,
         dt=DT,
     )
 
@@ -373,7 +374,7 @@ def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REP
         alphas = jnp.linspace(0.0, 1.0, NUM_KNOTS)
         return (1.0 - alphas[:, None]) * r_xy + alphas[:, None] * t_xy
 
-    if is_baseline:
+    if is_baseline or use_informed_proposal:
         theta = theta._replace(mean=mean_from_state(x0))
 
     print("JIT warm-up…", end=" ", flush=True)
@@ -395,12 +396,10 @@ def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REP
         key, subkey = jax.random.split(key)
         trajs, costs = ctrl.run_sis(subkey, x, theta)
 
-        if method == 'mppi':
-            total_costs = jnp.sum(costs, axis=1)
-            temperature = float(jnp.std(jnp.where(jnp.isfinite(total_costs), total_costs, 0.0))) * MPPI_TEMPERATURE
-            # mppi_update expects (num_knots, particles, action) / (num_knots, particles)
+        if method in ('mppi', 'biased_mppi'):
+            temperature = MPPI_TEMPERATURE  # fixed inverse-temperature (canonical MPPI), not adaptively scaled by cost std
             theta, _ = mppi_update(theta, trajs.transpose(1, 0, 2), costs.T, max(temperature, 1e-6))
-        elif method == 'cem':
+        elif method in ('cem', 'biased_cem'):
             # cem_update expects (particles,) total costs; selects top elite_frac fraction
             theta, _ = cem_update(theta, trajs, jnp.sum(costs, axis=1),
                                   elite_frac=CEM_NUM_ELITES / particles)
@@ -670,7 +669,7 @@ def main():
     parser.add_argument('--save-gif', action='store_true')
     parser.add_argument('--seed', type=int, default=SEED)
     parser.add_argument('--particles', type=int, default=PARTICLES)
-    parser.add_argument('--method', choices=['pfmp', 'mppi', 'dial', 'ps', 'cem'], default='pfmp')
+    parser.add_argument('--method', choices=['pfmp', 'mppi', 'biased_mppi', 'biased_cem', 'dial', 'ps', 'cem'], default='pfmp')
     parser.add_argument('--corridor', action='store_true',
                         help='Use fixed narrow-corridor obstacles (legacy default)')
     parser.add_argument('--n-obs', type=int, default=None,
@@ -725,19 +724,25 @@ def main():
         n_replans   = scenarios[0][4]
 
         methods = [
-            ('pfmp_0',   False, 0.0 ),
-            ('pfmp_025', False, 0.25),
-            ('pfmp_05',  False, 0.5 ),
-            ('ps',       True,  0.0 ),
-            ('mppi',     True,  0.0 ),
-            ('cem',      True,  0.0 ),
-            ('dial',     True,  0.0 ),
+            ('pfmp_0',      False, 0.0 ),
+            ('pfmp_025',    False, 0.25),
+            ('pfmp_05',     False, 0.5 ),
+            ('biased_mppi', False, 0.0 ),
+            ('biased_cem',  False, 0.0 ),
+            ('ps',          True,  0.0 ),
+            ('mppi',        True,  0.0 ),
+            ('cem',         True,  0.0 ),
+            ('dial',        True,  0.0 ),
         ]
         results = {}
 
         for method, is_baseline, ess_thresh in methods:
-            # Apply tuned params for this method if available
-            p = _tuned.get(method.split('_')[0] if method.startswith('pfmp') else method, {})
+            # Apply tuned params for this method if available. The proposal-axis
+            # ablations mirror their no-proposal base so only the proposal differs:
+            # biased_mppi <- mppi, biased_cem <- cem.
+            _base = {'biased_mppi': 'mppi', 'biased_cem': 'cem'}.get(
+                method, method.split('_')[0] if method.startswith('pfmp') else method)
+            p = _tuned.get(_base, {})
             pos_weight_m    = p.get('pos_weight',      POS_WEIGHT)
             angle_weight_m  = p.get('angle_weight',    ANGLE_WEIGHT)
             u_stdev_m       = p.get('u_stdev',         U_STDEV)
@@ -770,7 +775,7 @@ def main():
             def simulate_one(key, x0, theta,
                              _mppi_temp=mppi_temp_m, _cem_elites=cem_elites_m,
                              _dial_b1=dial_beta1_m, _dial_b2=dial_beta2_m):
-                if is_baseline:
+                if is_baseline or method in ('biased_mppi', 'biased_cem'):
                     alphas = jnp.linspace(0.0, 1.0, NUM_KNOTS)
                     theta = theta._replace(
                         mean=(1 - alphas[:, None]) * x0[6:8] + alphas[:, None] * x0[0:2])
@@ -780,11 +785,11 @@ def main():
                     key, subkey = jax.random.split(key)
                     trajs, costs = ctrl.run_sis(subkey, x, theta)
 
-                    if method == 'mppi':
+                    if method in ('mppi', 'biased_mppi'):
                         total = jnp.sum(costs, axis=1)
                         temp = jnp.maximum(jnp.std(total) * _mppi_temp, 1e-6)
                         theta, _ = mppi_update(theta, trajs.transpose(1, 0, 2), costs.T, temp)
-                    elif method == 'cem':
+                    elif method in ('cem', 'biased_cem'):
                         theta, _ = cem_update(theta, trajs, jnp.sum(costs, axis=1),
                                               elite_frac=_cem_elites / args.particles)
                     elif method == 'dial':

@@ -79,7 +79,7 @@ def cost_fn(x: jax.Array, u: jax.Array, th: Params, t: float) -> float:
     loc = x[:2]
     sdf_val = jnp.min(jax.vmap(lambda bounds: sdf_aabb(loc, bounds))(th.obstacles))
     obstacle_loss = jnp.nan_to_num(100. * hinge_loss(sdf_val, 0.25),
-                                   nan=0.0, posinf=jnp.inf, neginf=0.0)
+                                   nan=0.0, posinf=1e6, neginf=0.0)
     goal_loss = jnp.linalg.norm(loc - th.goal) / 10.
     return obstacle_loss**2 + goal_loss**2
 
@@ -520,8 +520,11 @@ def run_experiment():
             trajs_i, costs_i = jax.vmap(
                 sample_and_evaluate, in_axes=(0, None, 0, 0, 0, None)
             )(iter_keys_mppi, pfmp_sis, nominal_mppi, x0_batch, thetas, noise)
-            weights = jnp.exp(-costs_i / MPPI_TEMPERATURE)
-            weights = weights / jnp.sum(weights, axis=-1, keepdims=True)
+            finite = jnp.isfinite(costs_i)
+            costs_clipped = jnp.where(finite, costs_i, jnp.max(jnp.where(finite, costs_i, -jnp.inf), axis=-1, keepdims=True))
+            weights = jnp.exp(-costs_clipped / MPPI_TEMPERATURE)
+            weights = jnp.where(finite, weights, 0.0)  # zero (not inf*0=nan) for non-finite
+            weights = weights / jnp.maximum(jnp.sum(weights, axis=-1, keepdims=True), 1e-10)
             if trajs_i.ndim == 4:
                 nominal_mppi = jnp.sum(trajs_i * weights[:, :, None, None], axis=1)
             else:

@@ -466,6 +466,13 @@ HORIZON              = 2.264
 ESS_THRESH           = 0.552
 STEP_SIZE            = 0.288
 
+# Baseline (PS/MPPI/CEM) perturbation-proposal settings. The baselines perturb a
+# straight-line warm-start with Gaussian noise of std BASE_U_STDEV; untuned.
+BASE_U_STDEV         = GAUSS_STD
+MPPI_TEMPERATURE     = 1.0
+CEM_ELITE_FRAC       = 0.1
+STEP_LEN             = HORIZON / (NUM_KNOTS - 1)
+
 
 class Params(NamedTuple):
     goal: jax.Array
@@ -474,6 +481,9 @@ class Params(NamedTuple):
     q_max: jax.Array
     robot: dict
     step_size: float = STEP_SIZE
+    mean: jax.Array = None        # (num_knots, dof) warm-start for baselines
+    u_stdev: float = BASE_U_STDEV  # perturbation std for baselines
+    step_len: float = STEP_LEN     # knot time spacing for baseline proposal
 
 
 def cost_fn(x, u, theta, t):
@@ -521,23 +531,53 @@ def proposal(key, x, u, theta, t):
     return init(key, x, theta)
 
 
+# Perturbation proposal for the PS/MPPI/CEM baselines: Gaussian noise around a
+# warm-start plan theta.mean (a straight line from q_start to q_goal). Mirrors
+# the Gaussian-perturbation proposal used by the MuJoCo and push-T baselines.
+def perturbation_init(key, x, theta):
+    return jnp.clip(theta.mean[0] + jax.random.normal(key, x.shape) * theta.u_stdev,
+                    theta.q_min, theta.q_max)
+
+
+def perturbation_proposal(key, x, u, theta, t):
+    idx = jnp.clip(jnp.round(t / theta.step_len).astype(jnp.int32) + 1,
+                   0, theta.mean.shape[0] - 1)
+    return jnp.clip(theta.mean[idx] + jax.random.normal(key, x.shape) * theta.u_stdev,
+                    theta.q_min, theta.q_max)
+
+
 # ============================================================================
 # Benchmark Runners
 # ============================================================================
 
-def run_benchmark_fast(dataset_dir, urdf_path='models/panda_spherized.urdf', n_problems=None, seed=0):
-    """Fast benchmark - no visualization, tests both SIS and SIR."""
+def run_benchmark_fast(dataset_dir, urdf_path='models/panda_spherized.urdf', n_problems=None,
+                       seed=0, tuned_path='figures/mbm_baseline_tune.json'):
+    """Fast benchmark - SIS, SIS/R, and PS/MPPI/CEM + Biased-MPPI/CEM baselines."""
+    import json as _json
     from pfmp import PFMP
     from pfmp.interpolate import hermite_spline
-    
+    from pfmp.algorithm import ps_update, mppi_update, cem_update
+
     robot = load_robot(urdf_path)
     problems = load_mbm_dataset(dataset_dir, max_problems=n_problems)
     n = len(problems)
     print(f"Loaded {n} problems from {dataset_dir}")
-    
+
     if not problems:
         return None
-    
+
+    # Per-method tuned baseline knobs (fall back to module defaults if absent).
+    _tuned = {}
+    if tuned_path and Path(tuned_path).exists():
+        _tuned = {m: v.get('best_params', {}) for m, v in _json.load(open(tuned_path)).items()}
+        print(f"Loaded tuned baseline params for: {sorted(_tuned)}")
+    _ustdev = lambda m: float(_tuned.get(m, {}).get('u_stdev', BASE_U_STDEV))
+    _temp   = lambda m: float(_tuned.get(m, {}).get('mppi_temperature', MPPI_TEMPERATURE))
+    _elite  = lambda m: float(_tuned.get(m, {}).get('cem_elite_frac', CEM_ELITE_FRAC))
+    PS_USTDEV, MPPI_USTDEV, CEM_USTDEV = _ustdev('ps'), _ustdev('mppi'), _ustdev('cem')
+    MPPI_TEMP, BMPPI_TEMP = _temp('mppi'), _temp('biased_mppi')
+    CEM_EF, BCEM_EF = _elite('cem'), _elite('biased_cem')
+
     pfmp = PFMP(
         dynamics, cost_fn, terminal_cost, init, proposal,
         horizon=HORIZON, num_knots=NUM_KNOTS, particles=1000,
@@ -555,7 +595,59 @@ def run_benchmark_fast(dataset_dir, urdf_path='models/panda_spherized.urdf', n_p
         traj, scores = pfmp.run_sir(key, q_start, theta)
         best = jnp.argmin(jnp.sum(scores, axis=-1))
         return traj[best]
-    
+
+    # ---- Baselines: PS / MPPI / CEM ----
+    # Single pass of 1000 perturbation samples around a straight-line warm-start
+    # (no resampling), then the respective update. Equal budget to SIS.
+    pfmp_base = PFMP(
+        dynamics, cost_fn, terminal_cost, perturbation_init, perturbation_proposal,
+        horizon=HORIZON, num_knots=NUM_KNOTS, particles=1000, ess_resample_thresh=0.0,
+    )
+
+    @jax.jit
+    def run_ps(key, q_start, theta):
+        trajs, costs = pfmp_base.run_sis(key, q_start, theta)
+        th, _ = ps_update(theta, trajs, costs)
+        return th.mean
+
+    @jax.jit
+    def run_mppi(key, q_start, theta):
+        trajs, costs = pfmp_base.run_sis(key, q_start, theta)
+        th, _ = mppi_update(theta, trajs.transpose(1, 0, 2), costs.T, MPPI_TEMP)
+        return th.mean
+
+    @jax.jit
+    def run_cem(key, q_start, theta):
+        trajs, costs = pfmp_base.run_sis(key, q_start, theta)
+        th, _ = cem_update(theta, trajs, jnp.sum(costs, axis=1), CEM_EF)
+        return th.mean
+
+    # Biased-MPPI / Biased-CEM: the custom (goal-informed) proposal with the
+    # mean / elite update and no resampling. Isolates the proposal axis against
+    # MPPI / CEM (matched update, perturbation proposal).
+    @jax.jit
+    def run_biased_mppi(key, q_start, theta):
+        trajs, costs = pfmp.run_sis(key, q_start, theta)
+        th, _ = mppi_update(theta, trajs.transpose(1, 0, 2), costs.T, BMPPI_TEMP)
+        return th.mean
+
+    @jax.jit
+    def run_biased_cem(key, q_start, theta):
+        trajs, costs = pfmp.run_sis(key, q_start, theta)
+        th, _ = cem_update(theta, trajs, jnp.sum(costs, axis=1), BCEM_EF)
+        return th.mean
+
+    # method -> (run_fn, perturbation u_stdev)
+    PERTURB_BASELINES = {'ps': (run_ps, PS_USTDEV), 'mppi': (run_mppi, MPPI_USTDEV),
+                         'cem': (run_cem, CEM_USTDEV)}
+    BIASED_BASELINES  = {'biased_mppi': run_biased_mppi, 'biased_cem': run_biased_cem}
+
+    def warm_start_theta(problem, u_stdev):
+        a = jnp.linspace(0.0, 1.0, NUM_KNOTS)[:, None]
+        mean0 = (1 - a) * problem['q_start'] + a * problem['q_goal']
+        return Params(goal=problem['q_goal'], env=problem['env'],
+                      q_min=Q_MIN, q_max=Q_MAX, robot=robot, mean=mean0, u_stdev=u_stdev)
+
     @jax.jit
     def extract_path(traj_knots, q_start, theta):
         tq = jnp.linspace(0, pfmp.horizon, int(pfmp.horizon / pfmp.dt))
@@ -575,12 +667,17 @@ def run_benchmark_fast(dataset_dir, urdf_path='models/panda_spherized.urdf', n_p
     th0 = Params(goal=p0['q_goal'], env=p0['env'], q_min=Q_MIN, q_max=Q_MAX, robot=robot)
     _ = extract_path(run_sis(keys[0], p0['q_start'], th0), p0['q_start'], th0)
     _ = extract_path(run_sir(keys[0], p0['q_start'], th0), p0['q_start'], th0)
+    for fn, ust in PERTURB_BASELINES.values():
+        thb = warm_start_theta(p0, ust)
+        _ = extract_path(fn(keys[0], p0['q_start'], thb), p0['q_start'], thb)
+    for fn in BIASED_BASELINES.values():
+        _ = extract_path(fn(keys[0], p0['q_start'], th0), p0['q_start'], th0)
     jax.effects_barrier()
 
-    results = {k: [] for k in ['sis_success', 'sir_success', 'sis_collision', 'sir_collision',
-                                'sis_dist', 'sir_dist', 'sis_time', 'sir_time']}
+    METHODS = ['sis', 'sir', 'ps', 'mppi', 'cem', 'biased_mppi', 'biased_cem']
+    results = {f'{m}_{k}': [] for m in METHODS for k in ['success', 'collision', 'dist', 'time']}
 
-    print("\nRunning benchmark (SIS + SIR)...")
+    print("\nRunning benchmark (SIS + SIR + PS/MPPI/CEM)...")
     t_total = time.time()
     
     for i, problem in enumerate(problems):
@@ -611,9 +708,37 @@ def run_benchmark_fast(dataset_dir, urdf_path='models/panda_spherized.urdf', n_p
         results['sir_dist'].append(float(sir_dist))
         results['sis_time'].append(sis_time)
         results['sir_time'].append(sir_time)
-        
+
+        # Perturbation baselines (Gaussian proposal around warm-start)
+        for name, (fn, ust) in PERTURB_BASELINES.items():
+            theta_b = warm_start_theta(problem, ust)
+            t0 = time.time()
+            plan = fn(keys[i], problem['q_start'], theta_b)
+            path = extract_path(plan, problem['q_start'], theta_b)
+            b_time = time.time() - t0
+            any_col, col_frac, dist = evaluate_path(path, theta_b)
+            results[f'{name}_success'].append(bool((not any_col) and (dist < 0.5)))
+            results[f'{name}_collision'].append(float(col_frac))
+            results[f'{name}_dist'].append(float(dist))
+            results[f'{name}_time'].append(b_time)
+
+        # Biased baselines (custom proposal + mean/elite update, no resampling)
+        for name, fn in BIASED_BASELINES.items():
+            t0 = time.time()
+            plan = fn(keys[i], problem['q_start'], theta)
+            path = extract_path(plan, problem['q_start'], theta)
+            b_time = time.time() - t0
+            any_col, col_frac, dist = evaluate_path(path, theta)
+            results[f'{name}_success'].append(bool((not any_col) and (dist < 0.5)))
+            results[f'{name}_collision'].append(float(col_frac))
+            results[f'{name}_dist'].append(float(dist))
+            results[f'{name}_time'].append(b_time)
+
         if (i + 1) % 10 == 0 or i == n - 1:
-            print(f"  [{i+1}/{n}] SIS: {np.mean(results['sis_success'])*100:.1f}%, SIR: {np.mean(results['sir_success'])*100:.1f}%")
+            print(f"  [{i+1}/{n}] " + ", ".join(
+                f"{lab}: {np.mean(results[f'{m}_success'])*100:.0f}%"
+                for m, lab in [('sis','SIS'),('sir','SIS/R'),('ps','PS'),('mppi','MPPI'),
+                               ('cem','CEM'),('biased_mppi','bMPPI'),('biased_cem','bCEM')]))
     
     t_total = time.time() - t_total
     
@@ -622,8 +747,10 @@ def run_benchmark_fast(dataset_dir, urdf_path='models/panda_spherized.urdf', n_p
     print(f"{'='*60}")
     print(f"  {'Method':<8} {'Success':>10} {'Collision':>12} {'Dist':>10} {'Time (ms)':>12}")
     print(f"  {'-'*8} {'-'*10} {'-'*12} {'-'*10} {'-'*12}")
-    for m in ['sis', 'sir']:
-        print(f"  {m.upper():<8} {np.mean(results[f'{m}_success'])*100:>9.1f}% "
+    for m in METHODS:
+        label = {'sis': 'SIS', 'sir': 'SIS/R', 'ps': 'PS', 'mppi': 'MPPI', 'cem': 'CEM',
+                 'biased_mppi': 'B-MPPI', 'biased_cem': 'B-CEM'}[m]
+        print(f"  {label:<8} {np.mean(results[f'{m}_success'])*100:>9.1f}% "
               f"{np.mean(results[f'{m}_collision'])*100:>11.1f}% "
               f"{np.mean(results[f'{m}_dist']):>10.3f} {np.mean(results[f'{m}_time'])*1000:>11.1f}")
     
@@ -658,154 +785,206 @@ def add_environment_to_viser(server, env, offset=np.array([0, 0, 0]), prefix="/e
     return handles
 
 
-def run_benchmark_viser(dataset_dir, urdf_path='models/panda_spherized.urdf', n_problems=None, seed=0):
-    """Benchmark with viser visualization - tests both SIS and SIR side by side."""
+def run_benchmark_viser(dataset_dir, urdf_path='models/panda_spherized.urdf', n_problems=None, seed=0, mode='both'):
+    """Benchmark with viser visualization - tests SIS and/or SIR side by side.
+
+    mode: 'sis', 'sir', or 'both' (default).
+    """
     import viser
     from pfmp import PFMP
     from pfmp.interpolate import hermite_spline
-    
+
+    assert mode in ('sis', 'sir', 'both'), f"mode must be 'sis', 'sir', or 'both', got {mode!r}"
+    modes = [m for m in ('sis', 'sir') if mode in (m, 'both')]
+    names = {'sis': 'SIS', 'sir': 'SIR'}
+    trace_colors = {'sis': (33, 150, 243), 'sir': (233, 30, 99)}
+
     robot = load_robot(urdf_path)
     problems = load_mbm_dataset(dataset_dir, max_problems=n_problems)
     n = len(problems)
     print(f"Loaded {n} problems from {dataset_dir}")
-    
+
     if not problems:
         return None
-    
+
     pfmp = PFMP(dynamics, cost_fn, terminal_cost, init, proposal,
                 horizon=1.0, num_knots=5, particles=512, ess_resample_thresh=0.2)
-    
+
     @jax.jit
     def run_sis(key, q_start, theta):
         traj, scores = pfmp.run_sis(key, q_start, theta)
         return traj[jnp.argmin(jnp.sum(scores, axis=-1))]
-    
+
     @jax.jit
     def run_sir(key, q_start, theta):
         traj, scores = pfmp.run_sir(key, q_start, theta)
         return traj[jnp.argmin(jnp.sum(scores, axis=-1))]
-    
+
     @jax.jit
     def extract_path(traj_knots, q_start, theta):
         tq = jnp.linspace(0, pfmp.horizon, int(pfmp.horizon / pfmp.dt))
         us = hermite_spline(tq, pfmp.tk(), traj_knots)
         _, path = jax.lax.scan(lambda x, u: (dynamics(x, u, theta, 0.0)[0], x), q_start, us)
         return path
-    
-    get_spheres_batch = jax.jit(jax.vmap(lambda q: get_sphere_positions(q, robot)))
-    
+
+    run_fns = {'sis': run_sis, 'sir': run_sir}
+
+    # forward_kinematics() only models the 7 revolute arm joints, ending at the
+    # panda_link7 frame. The gripper TCP (panda_grasptarget, between the
+    # fingers) is a fixed translation along link7's local z-axis: 0.107m
+    # (panda_joint8, link7 -> link8/flange) + 0.105m (hand -> grasptarget).
+    # The hand's -45deg yaw doesn't affect this z-aligned offset.
+    GRASP_TARGET_OFFSET = jnp.array([0., 0., 0.107 + 0.105, 1.0])
+
+    def _ee_pos(q):
+        return (forward_kinematics(q, robot)[-1] @ GRASP_TARGET_OFFSET)[:3]
+
+    get_ee_batch = jax.jit(jax.vmap(_ee_pos))
+
+    import yourdfpy
+    from viser.extras import ViserUrdf
+
     server = viser.ViserServer()
     print("Open http://localhost:8080")
-    
-    offset_sis, offset_sir = np.array([-0.8, 0, 0]), np.array([0.8, 0, 0])
-    server.scene.add_grid("/ground_sis", width=2, height=2, position=(offset_sis[0], 0, 0), plane="xy")
-    server.scene.add_grid("/ground_sir", width=2, height=2, position=(offset_sir[0], 0, 0), plane="xy")
-    
-    label_sis = server.scene.add_label("/label_sis", "SIS: 0%", position=tuple(offset_sis + [0, 0, 1.2]))
-    label_sir = server.scene.add_label("/label_sir", "SIR: 0%", position=tuple(offset_sir + [0, 0, 1.2]))
-    
+
+    if len(modes) == 2:
+        offsets = {'sis': np.array([-0.8, 0, 0]), 'sir': np.array([0.8, 0, 0])}
+    else:
+        offsets = {modes[0]: np.array([0.0, 0, 0])}
+
+    for m in modes:
+        off = offsets[m]
+        server.scene.add_grid(f"/ground_{m}", width=2, height=2, position=(off[0], 0, 0), plane="xy")
+
+    labels = {m: server.scene.add_label(f"/label_{m}", f"{names[m]}: 0%", position=tuple(offsets[m] + [0, 0, 1.2]))
+              for m in modes}
+
+    # Real Franka meshes for the animated robots, positioned via parent frames
+    FINGER_OPEN = 0.04
+    urdf = yourdfpy.URDF.load(urdf_path)
+    robots = {}
+    for m in modes:
+        server.scene.add_frame(f"/{m}/robot", position=tuple(offsets[m]), show_axes=False)
+        robots[m] = ViserUrdf(server, urdf, root_node_name=f"/{m}/robot")
+
+    def cfg_with_finger(q):
+        return np.append(np.asarray(q), FINGER_OPEN)
+
+    rate_texts = {}
     with server.gui.add_folder("Stats"):
         problem_text = server.gui.add_text("Problem", initial_value="0/0", disabled=True)
-        sis_rate_text = server.gui.add_text("SIS Success", initial_value="0%", disabled=True)
-        sir_rate_text = server.gui.add_text("SIR Success", initial_value="0%", disabled=True)
-    
-    results = {k: [] for k in ['sis_success', 'sir_success', 'sis_collision', 'sir_collision', 'sis_time', 'sir_time']}
+        for m in modes:
+            rate_texts[m] = server.gui.add_text(f"{names[m]} Success", initial_value="0%", disabled=True)
+
+    pause_button = server.gui.add_button("Pause")
+    with server.gui.add_folder("Step (while paused)"):
+        step_back_button = server.gui.add_button("< Step Back")
+        step_fwd_button = server.gui.add_button("Step Forward >")
+    playback = {"paused": False, "step": 0}
+
+    @pause_button.on_click
+    def _(_) -> None:
+        playback["paused"] = not playback["paused"]
+        pause_button.label = "Resume" if playback["paused"] else "Pause"
+
+    @step_back_button.on_click
+    def _(_) -> None:
+        playback["step"] = -1
+
+    @step_fwd_button.on_click
+    def _(_) -> None:
+        playback["step"] = 1
+
+    results = {k: [] for m in modes for k in [f'{m}_success', f'{m}_collision', f'{m}_time']}
     key = jax.random.key(seed)
-    
-    env_handles, sis_spheres, sir_spheres, ghost_handles = [], [], [], []
-    
+
+    env_handles, trace_handles = [], []
+
     def clear_dynamic():
-        for h in env_handles + sis_spheres + sir_spheres + ghost_handles:
+        for h in env_handles + trace_handles:
             h.remove()
-        env_handles.clear(); sis_spheres.clear(); sir_spheres.clear(); ghost_handles.clear()
-    
-    sphere_radii = np.array(robot['sphere_radii'])
-    
+        env_handles.clear(); trace_handles.clear()
+
     for prob_idx, problem in enumerate(problems):
         print(f"\n=== Problem {prob_idx + 1}/{n}: {problem['name']} ===")
-        
+
         env, q_start, q_goal = problem['env'], problem['q_start'], problem['q_goal']
         theta = Params(goal=q_goal, env=env, q_min=Q_MIN, q_max=Q_MAX, robot=robot)
-        
+
         key, run_key = jax.random.split(key)
-        
-        # Run both methods
-        t0 = time.time()
-        path_sis = extract_path(run_sis(run_key, q_start, theta), q_start, theta)
-        sis_time = time.time() - t0
-        
-        t0 = time.time()
-        path_sir = extract_path(run_sir(run_key, q_start, theta), q_start, theta)
-        sir_time = time.time() - t0
-        
+
+        # Run selected method(s)
+        paths, cols = {}, {}
+        for m in modes:
+            t0 = time.time()
+            paths[m] = extract_path(run_fns[m](run_key, q_start, theta), q_start, theta)
+            results[f'{m}_time'].append(time.time() - t0)
+
         # Evaluate
-        col_sis = np.array(jax.vmap(lambda q: robot_sdf(q, env, robot) < 0)(path_sis))
-        col_sir = np.array(jax.vmap(lambda q: robot_sdf(q, env, robot) < 0)(path_sir))
-        
-        sis_dist = float(jnp.linalg.norm(path_sis[-1] - q_goal))
-        sir_dist = float(jnp.linalg.norm(path_sir[-1] - q_goal))
-        
-        sis_success = not col_sis.any() and sis_dist < 0.5
-        sir_success = not col_sir.any() and sir_dist < 0.5
-        
-        results['sis_success'].append(sis_success)
-        results['sir_success'].append(sir_success)
-        results['sis_collision'].append(col_sis.mean())
-        results['sir_collision'].append(col_sir.mean())
-        results['sis_time'].append(sis_time)
-        results['sir_time'].append(sir_time)
-        
-        print(f"  SIS: col={col_sis.mean():.0%}, dist={sis_dist:.2f}, success={sis_success}")
-        print(f"  SIR: col={col_sir.mean():.0%}, dist={sir_dist:.2f}, success={sir_success}")
-        
+        for m in modes:
+            cols[m] = np.array(jax.vmap(lambda q: robot_sdf(q, env, robot) < 0)(paths[m]))
+            dist = float(jnp.linalg.norm(paths[m][-1] - q_goal))
+            success = not cols[m].any() and dist < 0.5
+
+            results[f'{m}_success'].append(success)
+            results[f'{m}_collision'].append(cols[m].mean())
+
+            print(f"  {names[m]}: col={cols[m].mean():.0%}, dist={dist:.2f}, success={success}")
+
         # Visualization
         clear_dynamic()
-        
-        env_handles.extend(add_environment_to_viser(server, env, offset_sis, "/env_sis"))
-        env_handles.extend(add_environment_to_viser(server, env, offset_sir, "/env_sir"))
-        
-        for i, r in enumerate(sphere_radii):
-            sis_spheres.append(server.scene.add_icosphere(f"/sis/s{i}", radius=float(r), position=(0,0,0), color=(76, 175, 80)))
-            sir_spheres.append(server.scene.add_icosphere(f"/sir/s{i}", radius=float(r), position=(0,0,0), color=(76, 175, 80)))
-        
-        # Start/goal ghosts
-        for prefix, q, color in [("start", q_start, (200,200,200)), ("goal", q_goal, (255,193,7))]:
-            pos = np.array(get_sphere_positions(q, robot))
-            for i, (p, r) in enumerate(zip(pos, sphere_radii)):
-                ghost_handles.append(server.scene.add_icosphere(f"/{prefix}_sis/{i}", float(r), color=color))
-                ghost_handles.append(server.scene.add_icosphere(f"/{prefix}_sir/{i}", float(r), color=color))
-        
+
+        for m in modes:
+            env_handles.extend(add_environment_to_viser(server, env, offsets[m], f"/env_{m}"))
+
         # Update stats
-        sis_rate = np.mean(results['sis_success']) * 100
-        sir_rate = np.mean(results['sir_success']) * 100
-        label_sis.text = f"SIS: {sis_rate:.0f}%"
-        label_sir.text = f"SIR: {sir_rate:.0f}%"
         problem_text.value = f"{prob_idx + 1}/{n}"
-        sis_rate_text.value = f"{sis_rate:.0f}%"
-        sir_rate_text.value = f"{sir_rate:.0f}%"
-        
+        for m in modes:
+            rate = np.mean(results[f'{m}_success']) * 100
+            labels[m].text = f"{names[m]}: {rate:.0f}%"
+            rate_texts[m].value = f"{rate:.0f}%"
+
+        # End-effector traces
+        ee = {}
+        for m in modes:
+            ee[m] = np.array(get_ee_batch(paths[m])) + offsets[m]
+            trace_handles.append(server.scene.add_spline_catmull_rom(
+                f"/ee_trace_{m}", ee[m], color=trace_colors[m], line_width=3.0))
+            trace_handles.append(server.scene.add_icosphere(
+                f"/ee_start_{m}", radius=0.025, position=tuple(ee[m][0]), color=(200, 200, 200)))
+            trace_handles.append(server.scene.add_icosphere(
+                f"/ee_end_{m}", radius=0.025, position=tuple(ee[m][-1]), color=(255, 193, 7)))
+
         # Animate
-        geom_sis = np.array(get_spheres_batch(path_sis))
-        geom_sir = np.array(get_spheres_batch(path_sir))
-        
-        for _ in range(2):
-            for frame in range(len(path_sis)):
-                c_sis = (244, 67, 54) if col_sis[frame] else (76, 175, 80)
-                c_sir = (244, 67, 54) if col_sir[frame] else (76, 175, 80)
-                
-                for s, p in zip(sis_spheres, geom_sis[frame]):
-                    s.position = tuple(p + offset_sis); s.color = c_sis
-                for s, p in zip(sir_spheres, geom_sir[frame]):
-                    s.position = tuple(p + offset_sir); s.color = c_sir
-                
-                time.sleep(0.02)
-    
+        total_frames = len(paths[modes[0]])
+
+        def show_frame(frame):
+            for m in modes:
+                robots[m].update_cfg(cfg_with_finger(paths[m][frame]))
+
+        frame, loops = 0, 0
+        while loops < 2:
+            while playback["paused"]:
+                if playback["step"] != 0:
+                    frame = int(np.clip(frame + playback["step"], 0, total_frames - 1))
+                    playback["step"] = 0
+                    show_frame(frame)
+                time.sleep(0.05)
+
+            show_frame(frame)
+            time.sleep(0.02)
+
+            frame += 1
+            if frame >= total_frames:
+                frame = 0
+                loops += 1
+
     print(f"\n{'='*60}")
     print(f"FINAL RESULTS")
     print(f"{'='*60}")
-    print(f"  SIS: {np.mean(results['sis_success'])*100:.1f}% success, {np.mean(results['sis_collision'])*100:.1f}% collision")
-    print(f"  SIR: {np.mean(results['sir_success'])*100:.1f}% success, {np.mean(results['sir_collision'])*100:.1f}% collision")
-    
+    for m in modes:
+        print(f"  {names[m]}: {np.mean(results[f'{m}_success'])*100:.1f}% success, {np.mean(results[f'{m}_collision'])*100:.1f}% collision")
+
     print("\nVisualization running. Press Ctrl+C to exit.")
     while True:
         time.sleep(1)
@@ -878,6 +1057,13 @@ if __name__ == "__main__":
     
     args = sys.argv[1:]
     
+    mode = 'both'
+    for flag in ('--sis', '--sir', '--both', 'sis', 'sir', 'both'):
+        if flag in args[1:]:
+            mode = flag.lstrip('-')
+            args = [args[0]] + [a for a in args[1:] if a != flag]
+            break
+
     if not args or args[0] == "test":
         urdf = args[1] if len(args) > 1 else 'models/panda_spherized.urdf'
         test_robot(urdf)
@@ -886,7 +1072,7 @@ if __name__ == "__main__":
         dataset = args[1] if len(args) > 1 else "./models/problems/table_pick_panda"
         urdf = args[2] if len(args) > 2 else 'models/panda_spherized.urdf'
         n = int(args[3]) if len(args) > 3 else None
-        run_benchmark_viser(dataset, urdf, n)
+        run_benchmark_viser(dataset, urdf, n, mode=mode)
     elif args[0] == "fast":
         datasets = args[1:] if len(args) > 1 else sorted(Path('models/problems').glob('*_panda'))
         urdf = 'models/panda_spherized.urdf'
@@ -901,5 +1087,5 @@ if __name__ == "__main__":
     print("\nUsage:")
     print("  python benchmark_mbm_simple.py test [urdf]")
     print("  python benchmark_mbm_simple.py fast <dataset> [urdf] [n]")
-    print("  python benchmark_mbm_simple.py viser <dataset> [urdf] [n]")
+    print("  python benchmark_mbm_simple.py viser <dataset> [urdf] [n] [--sis|--sir|--both]")
     print("  python benchmark_mbm_simple.py <dataset> [urdf] [n]")
