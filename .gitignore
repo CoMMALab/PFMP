@@ -244,3 +244,16 @@ paper/
 figures/*.pdf
 *.md
 !README.md
+
+# PPO/REINFORCE scratch (not paper source; mjlab_*.py produce the Learned rows)
+examples/sb3_cartpole.py
+examples/ppo_cartpole.py
+examples/pendulum_reinforce.py
+examples/eval_cartpole.py
+examples/eval_double_cartpole.py
+pfmp/reinforce.py
+
+# fr3 local-only tooling (excluded from tracking)
+fr3/view_proposal.py
+fr3/tee_interface.py
+fr3/view_cost_landscape.py

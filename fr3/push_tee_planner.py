@@ -5,7 +5,10 @@ Real world workspace is 53' 1/8" x 23' 1/4"
 """
 
 import argparse
+import datetime
+import json
 import os
+import time
 from typing import NamedTuple, Tuple
 
 import jax
@@ -21,7 +24,7 @@ from geom_tee import STEM_HALF, CAP_HALF, CAP_CTR
 import pfmp
 
 from ik_cache import (
-    IKCache, ik_from_cache, get_or_build_cache,
+    IKCache, ik_from_cache, reachable_frac, get_or_build_cache,
     WORKSPACE_XY_MIN, WORKSPACE_XY_MAX, IK_CACHE_RESOLUTION, EE_HEIGHT,
 )
 
@@ -81,7 +84,10 @@ def compute_error(th: PushParams, t_qpos: jax.Array) -> jax.Array:
 
 HORIZON   = 2.0
 NUM_KNOTS = 5
-PARTICLES = 4096
+PARTICLES = 2048
+
+VIZ_INTERP_STEPS = 6        # sub-frames to glide the sim arm between replan poses
+VIZ_INTERP_DT    = 0.01     # seconds per sub-frame (~60ms glide at defaults)
 
 SUCCESS_POS_RADIUS = 0.05   # metres
 SUCCESS_ANGLE_TOL  = 0.35   # radians (~20°)
@@ -103,7 +109,7 @@ def dynamics(x: mjx.Data, u: jax.Array, th: PushParams, t: float) -> Tuple[mjx.D
 
 
 TEE_ANNULUS_CENTER = (0.25 + 0.78) / 2   # ideal radial distance from base
-TEE_ANNULUS_WEIGHT = 5.0
+TEE_ANNULUS_WEIGHT = 20.0
 
 def running_cost(x: mjx.Data, u: jax.Array, th: PushParams, t: float) -> jax.Array:
     t_qpos    = x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 3]
@@ -111,7 +117,7 @@ def running_cost(x: mjx.Data, u: jax.Array, th: PushParams, t: float) -> jax.Arr
     error     = compute_error(th, t_qpos)
     err_pos   = jnp.linalg.norm(error[:2])
     err_angle = jnp.abs(error[2])
-    aw        = th.angle_weight * jnp.clip(1.0 - err_pos / 0.25, 0.0, 1.0)
+    aw        = th.angle_weight   # ungated: orientation penalty always on
     radial    = jnp.linalg.norm(t_xy) - TEE_ANNULUS_CENTER
     approach  = th.approach_weight * jnp.linalg.norm(u - t_xy) * jnp.clip(err_pos / 0.25, 0.0, 1.0)
     return th.pos_weight * err_pos ** 2 + aw * err_angle ** 2 + TEE_ANNULUS_WEIGHT * radial ** 2 + approach
@@ -122,7 +128,7 @@ def terminal_cost(x: mjx.Data, th: PushParams) -> jax.Array:
     error     = compute_error(th, t_qpos)
     err_pos   = jnp.linalg.norm(error[:2])
     err_angle = jnp.abs(error[2])
-    aw = th.angle_weight * jnp.clip(1.0 - err_pos / 0.25, 0.0, 1.0)
+    aw = th.angle_weight   # ungated: orientation penalty always on
     return 10.0 * (th.pos_weight * err_pos + aw * err_angle)
 
 
@@ -139,8 +145,12 @@ def mppi_proposal(key: jax.Array, _x: mjx.Data, _u: jax.Array, th: PushParams, t
     return th.mean[idx] + jax.random.normal(key, (2,)) * th.u_stdev
 
 
-def proposal(key: jax.Array, x: mjx.Data, u: jax.Array, th: PushParams, t: float) -> jax.Array:
-    """Three-way mixture: directed toward tee / orbital around tee / random walk."""
+N_REJECT_CANDIDATES = 8      # mask-aware rejection: candidates drawn per proposal call
+REACHABLE_THRESH    = 0.75   # min bilinear reachability to accept a candidate
+
+
+def _sample_mixture(key: jax.Array, x: mjx.Data, u: jax.Array, th: PushParams) -> jax.Array:
+    """One draw from the three-way mixture: directed / orbital / random walk."""
     key_mix, key_a, key_b, key_ang = jax.random.split(key, 4)
     t_xy  = x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 2]
     t_yaw = x.qpos[T_QPOS_OFFSET + 2]
@@ -161,16 +171,35 @@ def proposal(key: jax.Array, x: mjx.Data, u: jax.Array, th: PushParams, t: float
     # Branch 3: random walk
     random_loc = u + jax.random.normal(key_b, (2,)) * th.u_stdev * 2.0
 
-    sample = jnp.where(r < PROPOSAL_MIX, directed,
-             jnp.where(r < PROPOSAL_MIX + ORBITAL_MIX, orbital, random_loc))
+    return jnp.where(r < PROPOSAL_MIX, directed,
+           jnp.where(r < PROPOSAL_MIX + ORBITAL_MIX, orbital, random_loc))
 
-    # Clamp EE sample into the reachable annulus.
-    EE_INNER = 0.30
-    EE_OUTER = 0.775
+
+def proposal(key: jax.Array, x: mjx.Data, u: jax.Array, th: PushParams, t: float) -> jax.Array:
+    """Three-way mixture with mask-aware rejection: draw N candidates from the
+    mixture, keep the first one that lands in the cache's reachable component (so
+    the IK-resolved joint motion tracks the intended EE path instead of arcing
+    across a wrist-flip / unreachable cell). If none clear the threshold, keep the
+    most-reachable candidate and clamp it into the reachable annulus as a fallback.
+    """
+    keys = jax.random.split(key, N_REJECT_CANDIDATES)
+    cands = jax.vmap(lambda k: _sample_mixture(k, x, u, th))(keys)       # (N, 2)
+    fracs = jax.vmap(lambda c: reachable_frac(c, th.ik_cache))(cands)    # (N,)
+
+    ok  = fracs >= REACHABLE_THRESH
+    # First accepted candidate, else the most-reachable one.
+    idx = jnp.where(jnp.any(ok), jnp.argmax(ok), jnp.argmax(fracs))
+    sample = cands[idx]
+
+    # Fallback safety: if even the best candidate is unreachable, project into the
+    # reachable annulus so a degenerate query never reaches the IK cache.
+    accepted = fracs[idx] >= REACHABLE_THRESH
+    EE_INNER, EE_OUTER = 0.30, 0.775
     d = jnp.linalg.norm(sample) + 1e-7
-    sample = jnp.where(d < EE_INNER, sample * (EE_INNER / d), sample)
-    sample = jnp.where(d > EE_OUTER, sample * (EE_OUTER / d), sample)
-    return sample
+    clamped = sample
+    clamped = jnp.where(d < EE_INNER, clamped * (EE_INNER / d), clamped)
+    clamped = jnp.where(d > EE_OUTER, clamped * (EE_OUTER / d), clamped)
+    return jnp.where(accepted, sample, clamped)
 
 
 # ===============================
@@ -238,7 +267,8 @@ def load_scene(xml_path: str):
 #################################################################
 
 def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
-                 optitrack_client, robot_planner, method="sir", temperature=None):
+                 optitrack_client, robot_planner, method="sir", temperature=None,
+                 log_path=None, trial=0, seed=0):
     """Closed-loop realtime push: Optitrack → PFMP → robot controller."""
     from push_tee_optitrack import tee_pose
     from pub_sub.protocol import Command
@@ -266,10 +296,34 @@ def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
     from pfmp.algorithm import ps_update, mppi_update
     if method == "mppi":
         replan = lambda key, data, th: ctrl.run_sis(key, data, th)
-        update = lambda th, tr, co: mppi_update(th, tr.transpose(1, 0, 2), co.T, temperature)
+        def _mppi_update(th, tr, co):
+            import jax.numpy as jnp
+            finite = jnp.isfinite(jnp.sum(co, axis=1))
+            co = jnp.where(finite[:, None], co, jnp.zeros_like(co))
+            return mppi_update(th, tr.transpose(1, 0, 2), co.T, max(float(temperature), 1e-6))
+        update = _mppi_update
     elif method == "ps":
         replan = lambda key, data, th: ctrl.run_sis(key, data, th)
         update = ps_update
+    elif method == "cem":
+        from pfmp.algorithm import cem_update
+        num_elites = max(1, PARTICLES // 10)
+        replan = lambda key, data, th: ctrl.run_sis(key, data, th)
+        update = lambda th, tr, co: cem_update(th, tr, jnp.sum(co, axis=1),
+                                               elite_frac=num_elites / PARTICLES)
+    elif method == "dial":
+        from pfmp import dial_sigma
+        replan = lambda key, data, th: ctrl.run_sis(key, data, th)
+        def _dial_update(th, tr, co):
+            theta_out = th
+            for i in range(5, 0, -1):
+                sigma = float(np.mean([dial_sigma(i, h, th.u_stdev, 5, NUM_KNOTS, 1.0, 1.0)
+                                       for h in range(NUM_KNOTS)]))
+                total = jnp.sum(co, axis=1)
+                temp = float(jnp.maximum(jnp.std(total), 1e-6))
+                theta_out, _ = mppi_update(theta_out, tr.transpose(1, 0, 2), co.T, temp)
+            return theta_out, jnp.zeros(PARTICLES)
+        update = _dial_update
     else:  # sir
         replan = lambda key, data, th: ctrl.run_sir(key, data, th)
         update = ps_update
@@ -279,9 +333,35 @@ def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
     _ = replan(key, mjx_data, theta)
     print("done")
 
+    # Per-trial log record. Written once when the trial ends (goal reached, or
+    # the viewer is closed to abort). `n_cmd_failures` > 0 flags a run
+    # contaminated by non-deterministic controller/robot aborts.
+    t_start = time.time()
+    rec = {
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        "trial": int(trial), "seed": int(seed), "method": method,
+        "goal_xy": [float(theta.goal_xy[0]), float(theta.goal_xy[1])],
+        "goal_yaw": float(theta.goal_angle),
+        "init_tee": [float(mj_data.qpos[T_QPOS_OFFSET]),
+                     float(mj_data.qpos[T_QPOS_OFFSET + 1]),
+                     float(mj_data.qpos[T_QPOS_OFFSET + 2])],
+        "n_replans": 0, "n_cmd_failures": 0, "success": False,
+        "final_pos_err": None, "final_angle_err": None, "duration_s": None,
+    }
+
+    def _write_record():
+        rec["duration_s"] = round(time.time() - t_start, 2)
+        if log_path:
+            with open(log_path, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+        print(f"\n[log] trial {rec['trial']} success={rec['success']} "
+              f"pos_err={rec['final_pos_err']} angle_err={rec['final_angle_err']} "
+              f"aborts={rec['n_cmd_failures']} -> {log_path}")
+
     with mjviewer.launch_passive(mj_model, mj_data) as viewer:
-        print("Realtime loop running. Close viewer to stop.")
+        print("Realtime loop running. Close viewer to stop (logs an abort).")
         while viewer.is_running():
+            rec["n_replans"] += 1
             # 1. Get real tee pose from Optitrack
             rbs = []
             for frame in optitrack_client.MoCap(timeout=None):
@@ -296,37 +376,59 @@ def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
 
                 dist_to_goal  = float(np.linalg.norm(xy - np.array(theta.goal_xy)))
                 angle_err     = float(abs(((yaw - float(theta.goal_angle) + np.pi) % (2 * np.pi)) - np.pi))
+                rec["final_pos_err"]   = round(dist_to_goal, 4)
+                rec["final_angle_err"] = round(angle_err, 4)
                 if dist_to_goal < SUCCESS_POS_RADIUS and angle_err < SUCCESS_ANGLE_TOL:
-                    print(f"\n✓ Goal reached (dist={dist_to_goal*100:.1f}cm, angle={np.degrees(angle_err):.1f}°). Press Enter to continue...")
-                    input()
+                    print(f"\n✓ Goal reached (dist={dist_to_goal*100:.1f}cm, angle={np.degrees(angle_err):.1f}°).")
+                    rec["success"] = True
+                    break
 
             # 2. Run PFMP
             key, subkey = jax.random.split(key)
+            if not np.all(np.isfinite(mj_data.qpos)) or not np.all(np.isfinite(mj_data.ctrl)):
+                print("[warn] NaN/Inf in mj_data — resetting ctrl to zero")
+                mj_data.ctrl[:] = 0.0
+                mujoco.mj_forward(mj_model, mj_data)
             mjx_data = mjx.put_data(mj_model, mj_data)
             trajs, costs = replan(subkey, mjx_data, theta)
             theta, _ = update(theta, trajs, costs)
+            if not np.all(np.isfinite(np.array(theta.mean))):
+                print("[warn] NaN in theta.mean after update — resetting to zeros")
+                theta = theta._replace(mean=jnp.zeros_like(theta.mean))
 
             # 3. Execute one knot before replanning
-            for step in range(1, 2):
-                next_wp = np.clip(np.array(theta.mean[step]),
-                                  np.array(WORKSPACE_XY_MIN), np.array(WORKSPACE_XY_MAX))
-                try:
-                    reply = robot_planner.send_command(Command(xy=next_wp.tolist()))
-                    actual_xy = reply.get("actual_xy")
-                    ee_xy = np.array(actual_xy) if actual_xy else next_wp
-                    q_cmd = np.asarray(ik_from_cache(jnp.array(ee_xy), ik_cache), dtype=float)
-                    mj_data.qpos[:7] = q_cmd
-                    mj_data.ctrl[:7] = q_cmd
-                except Exception as e:
-                    print(f"[planner] command failed: {e}")
+            q_prev  = np.array(mj_data.qpos[:7]).copy()   # last commanded arm pose
+            next_wp = np.clip(np.array(theta.mean[1]),
+                              np.array(WORKSPACE_XY_MIN), np.array(WORKSPACE_XY_MAX))
+            goal_marker_callback(viewer.user_scn, theta)
+            try:
+                reply = robot_planner.send_command(Command(xy=next_wp.tolist()))
+                actual_xy = reply.get("actual_xy")
+                ee_xy = np.array(actual_xy) if actual_xy else next_wp
+                q_cmd = np.asarray(ik_from_cache(jnp.array(ee_xy), ik_cache), dtype=float)
+                mj_data.ctrl[:7] = q_cmd
+                # Smooth viz: glide the sim arm q_prev -> q_cmd across sub-frames so
+                # the display updates independently of the (slow) replan rate instead
+                # of snapping between IK solutions. Purely visual — the real command
+                # was already sent above; the tee (qpos[7:]) is untouched.
+                for s in range(1, VIZ_INTERP_STEPS + 1):
+                    a = s / VIZ_INTERP_STEPS
+                    mj_data.qpos[:7] = (1.0 - a) * q_prev + a * q_cmd
+                    mujoco.mj_forward(mj_model, mj_data)
+                    viewer.sync()
+                    time.sleep(VIZ_INTERP_DT)
+            except Exception as e:
+                print(f"[planner] command failed: {e}")
+                rec["n_cmd_failures"] += 1           # contamination flag
+                mj_data.qpos[:7] = q_prev            # hold pose on failure
+                mujoco.mj_forward(mj_model, mj_data)
+                viewer.sync()
 
             # Shift mean by 1 knot
             new_mean = jnp.concatenate([theta.mean[1:], theta.mean[-1:]])
             theta = theta._replace(mean=new_mean)
 
-            # 4. Update viewer
-            goal_marker_callback(viewer.user_scn, theta)
-            viewer.sync()
+    _write_record()
 
 
 
@@ -337,9 +439,11 @@ def main():
     parser.add_argument('--cache-resolution', type=int, default=IK_CACHE_RESOLUTION,
                         help='IK cache grid resolution')
     parser.add_argument('--init-xy',  type=float, nargs=2, default=[0.4, 0.0], metavar=('X', 'Y'))
-    parser.add_argument('--goal-x',   type=float, default=0.4)
-    parser.add_argument('--goal-y',   type=float, default=-0.35)
+    parser.add_argument('--goal-x',   type=float, default=0.45)
+    parser.add_argument('--goal-y',   type=float, default=0.15)
     parser.add_argument('--goal-yaw', type=float, default=float(4*np.pi/3))
+    parser.add_argument('--log-path', type=str,   default='realtime_log.jsonl',
+                        help='JSONL per-trial log for realtime runs (pass before the subcommand)')
     parser.add_argument('--seed',     type=int,   default=42)
     parser.add_argument('--sample-x', type=float, nargs=2, default=[0.30, 0.55])
     parser.add_argument('--sample-y', type=float, nargs=2, default=[-0.25, 0.25])
@@ -360,15 +464,12 @@ def main():
     dial_p.add_argument("--beta1",        type=float, default=1.0)
     dial_p.add_argument("--beta2",        type=float, default=1.0)
     dial_p.add_argument("--n-inner",      type=int,   default=5)
-    rt = subparsers.add_parser("realtime", help="Closed-loop real robot")
+    rt = subparsers.add_parser("realtime", parents=[shared], help="Closed-loop real robot")
     rt.add_argument("--server",      default="127.0.0.1", help="Motive IP")
     rt.add_argument("--local",       default="127.0.0.1", help="Local IP")
     rt.add_argument("--server-host", default="localhost",  help="Controller host")
     rt.add_argument("--cmd-port",    type=int, default=5555)
-    rt.add_argument("--goal-x",      type=float, default=0.45)
-    rt.add_argument("--goal-y",      type=float, default=0.15)
-    rt.add_argument("--goal-yaw",    type=float, default=float(4*np.pi/3))
-    rt.add_argument("--method",         default="sir", choices=["sir", "ps", "mppi"])
+    rt.add_argument("--method",         default="sir", choices=["sir", "ps", "mppi", "cem", "dial"])
     rt.add_argument("--temperature",    type=float, default=1.0, help="MPPI temperature")
     args = parser.parse_args()
 
@@ -507,7 +608,9 @@ def main():
                 active_ctrl = ctrl_mppi if rt_method in ("ps", "mppi") else ctrl
                 run_realtime(active_ctrl, theta, mj_model, mj_data, ik_cache,
                              optitrack_client, robot_planner,
-                             method=rt_method, temperature=temperature)
+                             method=rt_method, temperature=temperature,
+                             log_path=args.log_path,
+                             trial=getattr(args, "trial", 0), seed=args.seed)
             finally:
                 robot_planner.close()
     else:
