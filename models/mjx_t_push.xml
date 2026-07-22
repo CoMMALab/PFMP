@@ -6,9 +6,17 @@
   </asset>
 
   <worldbody>
-  <!-- workspace footprint: 53-1/8" x 23-1/4", 1.5" from base -->
+  <!-- Acrylic table: 42-1/2" x 74-1/2" = 1.0795 x 1.8923 m, spanning the cage.
+       The back of the FR3 mounting plate is flush with the table's back edge.
+       link0's rear face is 9.0cm behind the base origin; the plate reaches a
+       further ~7cm behind that, placing the table's back edge at x = -0.160
+       (measured against the real setup, not derived from the casing).
+       Base is 1" off-centre on the long axis. The table centre is shifted -1"
+       in y (to the robot's right) so the base sits one inch to the table's +y
+       (robot's left) of centre.
+       x: -0.160 .. 0.920   y: -0.921 .. 0.972 -->
   <geom type="box" name="workspace"
-      pos="0.445 0.0 0.001" size="0.270 0.675 0.001"
+      pos="0.3798 -0.0254 0.001" size="0.5398 0.9462 0.001"
       rgba="0.7 0.7 0.7 0.25" contype="0" conaffinity="0" group="2"/>
   <body name="t_block" pos="0 0 0.020">
       <joint name="t_x"   type="slide" axis="1 0 0" damping="5.0"/>

@@ -76,6 +76,9 @@ STEM_HALF, CAP_HALF, CAP_CTR, THICKNESS, VERTS_LOCAL = _load_dims()
 STEM_CTR = np.array([0.0, 0.0])
 
 # Transform from Optitrack rigid body frame (marker centroid) to tee body frame.
+# Pure translation: assumes the Motive ground plane is set upright (Z-up), so the
+# rigid body frame is not rolled. If --mocap shows roll ~180 deg, fix the ground
+# plane in Motive rather than adding a rotation here.
 OPTI_TO_BODY = np.array([
     [ 1.,  0.,  0., 0.0307 ],
     [ 0.,  1.,  0., 0.0442 ],

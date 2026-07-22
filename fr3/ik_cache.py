@@ -43,7 +43,7 @@ FR3_JOINT_LIMITS = {
 FR3_LIMIT_MARGIN = 0.1  # rad, kept inside each bound
 
 EE_ID     = 12
-EE_HEIGHT = 0.075
+EE_HEIGHT = 0.060
 
 HOME_Q = jnp.array([0., -0.785398, 0., -2.356194, 0., 1.570796, 0.785398])
 REST_WEIGHT = jnp.array([0.0, 0.1, 0.1, 0.1, 1.0, 1.0, 1.0])
@@ -57,9 +57,9 @@ EE_ROTATION = jnp.array([
 
 _CACHE_MAX_JUMP = np.pi / 3   # ~60° — larger jumps indicate a wrist flip
 
-WORKSPACE_XY_MIN = jnp.array([0.15, -0.675])
-WORKSPACE_XY_MAX = jnp.array([0.75,  0.675])
-IK_CACHE_RESOLUTION = 64
+WORKSPACE_XY_MIN = jnp.array([-0.16, -0.85])
+WORKSPACE_XY_MAX = jnp.array([0.85,  0.85])
+IK_CACHE_RESOLUTION = 128
 
 # Clip cells closer to the base than this radius. The folded near-base configs are
 # where the FR3 self-collision-avoidance reflex trips; excluding them is cheaper and
@@ -183,10 +183,11 @@ def ik_from_cache(xy: jax.Array, cache: IKCache) -> jax.Array:
                     cache.q_grid[ix+1, iy  ], cache.q_grid[ix+1, iy+1]])
     wm = w * r
     wsum = wm.sum()
-    # Fall back to plain bilinear if no reachable support (validate_xy rejects it).
+    # No reachable corner means there is nothing valid to interpolate from, so
+    # reject: return NaN rather than a blend of failed IK solves (which put the
+    # EE up to 19cm off target height). Callers must check before commanding.
     q_masked = (wm[:, None] * qs).sum(0) / jnp.where(wsum > 0, wsum, 1.0)
-    q_plain  = (w[:, None] * qs).sum(0)
-    return jnp.where(wsum > 0, q_masked, q_plain)
+    return jnp.where(wsum > 0, q_masked, jnp.nan)
 
 
 @jax.jit

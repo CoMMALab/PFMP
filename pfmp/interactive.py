@@ -20,7 +20,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     mj_model: mujoco.MjModel,
     mj_data: mujoco.MjData,
     frequency: float,
-    ik_interp: Optional[callable] = None,
+    use_dynamics: bool = False,
     initial_knots: jax.Array = None,
     fixed_camera_id: int = None,
     method = "sir",
@@ -29,7 +29,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     max_step: int = int(1e6),
     goal_marker_fn: Optional[callable] = None,
     update_fn: Optional[callable] = None,
-) -> None:
+) -> tuple:
     """Run an interactive simulation with the MPC controller.
 
     This is a deterministic simulation, with the controller and simulation
@@ -145,6 +145,24 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     if record_traj:
         traj = Trajectory()
 
+    if use_dynamics:
+        @jax.jit
+        def _ctrl_window(x0, us, theta):
+            """Per-substep ctrl, plus the qpos the planner's model predicts.
+
+            The ctrl drives the simulation; the predicted qpos is returned only so
+            callers can compare it against what actually happened. Divergence
+            between the two means the planner and the executor are running
+            different models, which is the failure mode this exists to expose.
+            """
+            def body(x, u):
+                x_next, _ = controller.mpc_dynamics(x, u, theta, 0.0)
+                return x_next, (x_next.ctrl, x_next.qpos, x_next.qvel)
+            _, (ctrls, qpos, qvel) = jax.lax.scan(body, x0, us)
+            return ctrls, qpos, qvel
+
+    planned_qpos, actual_qpos = [], []
+
     # Start the simulation
     step = 0
     with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
@@ -161,6 +179,11 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             mjx_data = mjx_data.replace(
                 qpos=jnp.array(mj_data.qpos),
                 qvel=jnp.array(mj_data.qvel),
+                # ctrl is part of the state when the task ramps its actuator
+                # reference (it is the point the ramp starts from). Leaving it
+                # stale makes every rollout begin from an actuator reference the
+                # arm left several replans ago.
+                ctrl=jnp.array(mj_data.ctrl),
                 mocap_pos=jnp.array(mj_data.mocap_pos),
                 mocap_quat=jnp.array(mj_data.mocap_quat),
                 time=mj_data.time,
@@ -197,18 +220,47 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                 knots = policy_params.mean[None, ...]
                 us = np.asarray(interp(tq, tk, knots))[0]  # (ss, nu)
 
+            if use_dynamics:
+                # Ask the controller's own dynamics what ctrl each target implies,
+                # then discard its integration — this loop runs the simulation
+                # itself. Going through mpc_dynamics rather than a separate mapping
+                # callback keeps the planned and executed trajectory on one model;
+                # the old ik_interp was a second copy of the same map that had
+                # already drifted (no reference ramp, so the arm teleported between
+                # IK solutions).
+                #
+                # Computed for the whole replan window in one scan: per-substep
+                # calls meant a host<->device round trip per step, which at 400
+                # substeps per replan dominated everything. The discarded physics
+                # is negligible next to the planner's own rollouts.
+                ctrl_window, qpos_window, qvel_window = _ctrl_window(mjx_data, us, theta)
+                ctrl_window = np.asarray(ctrl_window)
+                qpos_window = np.asarray(qpos_window)
+                qvel_window = np.asarray(qvel_window)
+                planned_qpos.append(qpos_window)
+
             # simulate the system between spline replanning steps
             print(f"T qpos: {mj_data.qpos[7:10]}, mean[0]: {np.array(theta.mean[0])}")
             for i in range(sim_steps_per_replan):
                 step_start = time.time()
 
-                if ik_interp is not None:
-                    target = us[i]
-                    u = ik_interp(target, theta, mjx_data)
+                if use_dynamics:
+                    # Advance with the controller's own dynamics (mjx.step) rather
+                    # than mj_step. The two integrators agree to sub-microradian in
+                    # free flight but disagree sharply the moment contact forms —
+                    # up to 85mm of block displacement over one knot — so stepping
+                    # here in MuJoCo-C meant the planner optimised a push the
+                    # simulation would not reproduce. mj_data is kept in sync for
+                    # rendering and for the next replan's state.
+                    mj_data.ctrl[:] = ctrl_window[i]
+                    mj_data.qpos[:] = qpos_window[i]
+                    mj_data.qvel[:] = qvel_window[i]
+                    mj_data.time += sim_dt
+                    mujoco.mj_forward(mj_model, mj_data)
+                    actual_qpos.append(mj_data.qpos.copy())
                 else:
-                    u = us[i]
-                mj_data.ctrl[:] = np.array(u)
-                mujoco.mj_step(mj_model, mj_data)
+                    mj_data.ctrl[:] = np.array(us[i])
+                    mujoco.mj_step(mj_model, mj_data)
                 
                 # Draw goal marker
                 if goal_marker_fn is not None:
@@ -275,3 +327,11 @@ def run_interactive(  # noqa: PLR0912, PLR0915
 
     if record_traj:
         traj.save()
+
+    # (planned, actual) qpos per substep, when driving through the controller's
+    # dynamics. `planned` is what the planner's model predicted, `actual` is what
+    # the simulation produced from the same controls; comparing them is how model
+    # drift between planner and executor gets caught. Empty otherwise.
+    planned = np.concatenate(planned_qpos) if planned_qpos else np.empty((0,))
+    actual = np.asarray(actual_qpos) if actual_qpos else np.empty((0,))
+    return planned, actual

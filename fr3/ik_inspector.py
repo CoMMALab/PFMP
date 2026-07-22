@@ -140,12 +140,18 @@ def main() -> None:
         jump[:-1, :] = np.maximum(jump[:-1, :], np.max(dx, axis=-1))
         jump[:, :-1] = np.maximum(jump[:, :-1], np.max(dy, axis=-1))
 
+        # cache.reachable is the final mask (reachability + repair + seam + island
+        # removal), so grey = not in the reachable connected component.
+        reach = np.array(cache.reachable) > 0.5
         pts, colors = [], []
         for i, x in enumerate(xs):
             for j, y in enumerate(ys):
                 pts.append([x, y, 1e-3])
-                t = float(np.clip(jump[i, j] / (_CACHE_MAX_JUMP * 2), 0.0, 1.0))
-                colors.append([t, 1.0 - t, 0.0])
+                if not reach[i, j]:
+                    colors.append([0.25, 0.25, 0.25])   # unreachable: grey
+                else:
+                    t = float(np.clip(jump[i, j] / (_CACHE_MAX_JUMP * 2), 0.0, 1.0))
+                    colors.append([t, 1.0 - t, 0.0])     # reachable: green→red by jump
 
         server.scene.add_point_cloud(
             "/jump_map",

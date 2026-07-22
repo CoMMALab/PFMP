@@ -18,9 +18,9 @@ from geom_tee import OPTI_TO_BODY
 sys.path.insert(0, os.path.dirname(__file__))
 
 T_OPTI_TO_WORLD = np.array([
-    [1., 0., 0.,  0.475 ],
-    [0., 1., 0.,  0.410 ],
-    [0., 0., 1.,  0.0075],
+    [1., 0., 0.,  0.42 ],
+    [0., 1., 0.,  0.00 ],
+    [0., 0., 1.,  0.00 ],
     [0., 0., 0.,  1.    ],
 ])
 
@@ -44,7 +44,12 @@ def rb_to_tee_world(rb, T_opti_to_world):
 
 
 def tee_pose(rb):
-    """xy and yaw of the tee in world frame."""
+    """xy and yaw of the tee in world frame.
+
+    Assumes the Motive ground plane is set upright, so the rigid body frame is not
+    rolled and the yaw reads directly. If --mocap shows roll ~180 deg, fix the
+    ground plane in Motive rather than compensating here.
+    """
     T = rb_to_tee_world(rb, T_OPTI_TO_WORLD)
     return T[:2, 3], np.arctan2(T[1, 0], T[0, 0])
 
@@ -82,7 +87,14 @@ def stream_loop(client, args):
                 T = rb_to_tee_world(rbs[0], T_OPTI_TO_WORLD)
                 quat_xyzw = Rotation.from_matrix(T[:3, :3]).as_quat()
                 yaw = np.arctan2(T[1, 0], T[0, 0])
-                print(f"\rxy=({T[0,3]:+.3f}, {T[1,3]:+.3f})  yaw={np.degrees(yaw):+.1f}deg", end="", flush=True)
+                # Full orientation alongside the extracted yaw: if roll/pitch are
+                # ~0 the two agree and any constant offset is a genuine frame
+                # offset; if they sit near +/-180 or wander, atan2(R[1,0],R[0,0])
+                # is reading a tilted frame and the yaw is not what you see.
+                rpy = Rotation.from_matrix(T[:3, :3]).as_euler("xyz", degrees=True)
+                print(f"\rxy=({T[0,3]:+.3f}, {T[1,3]:+.3f})  yaw={np.degrees(yaw):+7.1f}deg"
+                      f"   rpy=({rpy[0]:+7.1f}, {rpy[1]:+7.1f}, {rpy[2]:+7.1f})",
+                      end="", flush=True)
                 mj_data.mocap_pos[mocap_id]  = T[:3, 3]
                 mj_data.mocap_quat[mocap_id] = [quat_xyzw[3], quat_xyzw[0],
                                                  quat_xyzw[1], quat_xyzw[2]]

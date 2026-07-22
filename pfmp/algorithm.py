@@ -143,6 +143,11 @@ class PFMP(NamedTuple):
     particles: int
     ess_resample_thresh: float = 0.5
     dt: float = 0.01
+    # How `u` varies within a knot interval. "hermite" splines u0 -> u1; "zoh"
+    # holds u1 for the whole interval. Use "zoh" when the executor tracks
+    # waypoints itself (e.g. franky moving to each knot), so the rollout scores
+    # the trajectory that is actually run rather than an interpolant that isn't.
+    interp: str = "hermite"
 
     def tk(self, endpoint: bool = True):
         if endpoint:
@@ -167,12 +172,17 @@ class PFMP(NamedTuple):
         elif isinstance(u0, Jet3):
             nout = 3
 
-        tq, us = hermite_interp1d(
-            t0, t1,
-            u0, u1,
-            num=steps_per_knot+1,
-            nout=nout
-        )
+        if self.interp == "zoh":
+            tq = jnp.linspace(t0, t1, steps_per_knot + 1)
+            us = jax.tree.map(
+                lambda v: jnp.broadcast_to(v, (steps_per_knot + 1,) + jnp.shape(v)), u1)
+        else:
+            tq, us = hermite_interp1d(
+                t0, t1,
+                u0, u1,
+                num=steps_per_knot+1,
+                nout=nout
+            )
 
         def interpolate_step(
             carry: tuple[jax.Array, float, float],
