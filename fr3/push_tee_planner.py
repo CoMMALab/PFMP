@@ -103,6 +103,7 @@ VIZ_INTERP_DT    = 0.01     # seconds per sub-frame (~60ms glide at defaults)
 
 SUCCESS_POS_RADIUS = 0.05   # metres
 SUCCESS_ANGLE_TOL  = 0.35   # radians (~20°)
+TRIAL_TIMEOUT_S    = 300.0  # abandon a trial after 5 min, logged as timeout
 
 # OptiTrack loses the tee when the arm occludes it, and there are dead zones the
 # cameras never cover. Planning continues on the last known pose, so warn when
@@ -410,7 +411,7 @@ def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
                           float(mj_data.qpos[T_QPOS_OFFSET + 2])],
         "realized_final": None,
         "placement_err": None,
-        "n_replans": 0, "n_cmd_failures": 0, "success": False,
+        "n_replans": 0, "n_cmd_failures": 0, "success": False, "timeout": False,
         # Tracking health: replans driven by a stale tee pose, and the longest
         # single dropout. Both flag contamination the same way n_cmd_failures does.
         "n_track_dropouts": 0, "n_stale_replans": 0, "max_consec_misses": 0,
@@ -438,8 +439,13 @@ def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
     tracking = {"misses": 0}
 
     with mjviewer.launch_passive(mj_model, mj_data) as viewer:
-        print("Realtime loop running. Close viewer to stop (logs an abort).")
+        print(f"Realtime loop running (timeout {TRIAL_TIMEOUT_S:.0f}s). "
+              f"Close viewer to stop (logs an abort).")
         while viewer.is_running():
+            if time.time() - t_start > TRIAL_TIMEOUT_S:
+                print(f"\n✗ Timeout after {TRIAL_TIMEOUT_S:.0f}s — trial abandoned.")
+                rec["timeout"] = True
+                break
             rec["n_replans"] += 1
             # 1. Get real tee pose from Optitrack
             rbs = []
@@ -548,21 +554,20 @@ def main():
     parser.add_argument('--cache-resolution', type=int, default=IK_CACHE_RESOLUTION,
                         help='IK cache grid resolution')
     parser.add_argument('--init-xy',  type=float, nargs=2, default=[0.4, 0.0], metavar=('X', 'Y'))
-    # Fixed goal, matching the pre-annulus runs so results stay comparable to
-    # them. Pass --spec-goal to use the (seed, trial) goal from tee_problem_gen
-    # instead, which varies per trial.
+    # Manual init/goal, used only when --trial is omitted. With --trial, start and
+    # goal come from the (seed, trial) spec instead.
     parser.add_argument('--goal-x',   type=float, default=0.45)
     parser.add_argument('--goal-y',   type=float, default=-0.35)
     parser.add_argument('--goal-yaw', type=float, default=float(4 * np.pi / 3))
-    parser.add_argument('--spec-goal', action='store_true',
-                        help='use the per-trial goal from tee_problem_gen')
     parser.add_argument('--log-path', type=str,   default='realtime_log.jsonl',
                         help='JSONL per-trial log for realtime runs (pass before the subcommand)')
     parser.add_argument('--seed',     type=int,   default=42)
 
     shared = argparse.ArgumentParser(add_help=False)
-    shared.add_argument('--trial', type=int, default=0,
-                        help='Trial index — matches view_start_region.py seed')
+    shared.add_argument('--trial', type=int, default=None,
+                        help='Trial index. When set, start and goal come from the '
+                             '(seed, trial) spec and the placement view opens first; '
+                             'when omitted, --init-xy and --goal-* are used.')
 
     subparsers = parser.add_subparsers(dest="algorithm", required=True)
     subparsers.add_parser("ps",  parents=[shared], help="Predictive Sampling")
@@ -597,23 +602,28 @@ def main():
         z=EE_HEIGHT,
     )
 
-    # Resolve the trial's problem from the spec. tee_problem_gen is the single
-    # source of truth for (start, goal) so the pose you physically place the tee
-    # on and the goal the planner optimises for can never disagree; --goal-*
-    # override it for one-off manual runs.
+    # With --trial set, tee_problem_gen is the single source of truth for
+    # (start, goal): the placement view shows the start ghost to position the
+    # block on, and the goal the planner optimises for is the matching spec goal,
+    # so the two can never disagree. Without --trial, fall back to --init-xy and
+    # --goal-* for one-off manual runs.
     from tee_problem_gen import sample_problem
-    trial = getattr(args, "trial", 0)
-    spec_init_xy, spec_init_yaw, spec_goal_xy, spec_goal_yaw = sample_problem(
-        args.seed, trial, ik_cache)
-    if args.spec_goal:
+    trial = getattr(args, "trial", None)
+    use_spec = trial is not None
+    if use_spec:
+        spec_init_xy, spec_init_yaw, spec_goal_xy, spec_goal_yaw = sample_problem(
+            args.seed, trial, ik_cache)
         goal_x, goal_y, goal_yaw = float(spec_goal_xy[0]), float(spec_goal_xy[1]), float(spec_goal_yaw)
+        init_x, init_y, init_yaw = float(spec_init_xy[0]), float(spec_init_xy[1]), float(spec_init_yaw)
     else:
+        spec_init_xy = spec_init_yaw = None
         goal_x, goal_y, goal_yaw = args.goal_x, args.goal_y, args.goal_yaw
+        init_x, init_y = float(args.init_xy[0]), float(args.init_xy[1])
+        init_yaw = 0.0
     print(f"Problem (seed {args.seed}, trial {trial}):"
-          f"\n  spec init = ({spec_init_xy[0]:+.3f}, {spec_init_xy[1]:+.3f}, "
-          f"{np.degrees(spec_init_yaw):+.1f}°)"
-          f"\n  spec goal = ({goal_x:+.3f}, {goal_y:+.3f}, {np.degrees(goal_yaw):+.1f}°)"
-          + ("  [per-trial spec]" if args.spec_goal else "  [fixed default]"))
+          f"\n  init = ({init_x:+.3f}, {init_y:+.3f}, {np.degrees(init_yaw):+.1f}°)"
+          f"\n  goal = ({goal_x:+.3f}, {goal_y:+.3f}, {np.degrees(goal_yaw):+.1f}°)"
+          + ("  [per-trial spec]" if use_spec else "  [manual]"))
 
     # Task configuration
     horizon   = HORIZON
@@ -639,10 +649,8 @@ def main():
     t_qpos_xy  = mj_data.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 2]
     print(f"T world xy (xpos):  {t_world_xy}")
     print(f"T qpos[7:9]:        {t_qpos_xy}")
-    # Initial T pose comes from the same problem spec as the goal, so a sim run
-    # and a real run of trial N start from the same place.
-    init_x, init_y = float(spec_init_xy[0]), float(spec_init_xy[1])
-    init_yaw = spec_init_yaw
+    # Initial T pose comes from the same problem spec as the goal (or --init-xy in
+    # manual mode), so a sim run and a real run of trial N start from the same place.
     mj_data.qpos[T_QPOS_OFFSET]     = init_x
     mj_data.qpos[T_QPOS_OFFSET + 1] = init_y
     mj_data.qpos[T_QPOS_OFFSET + 2] = init_yaw
@@ -701,6 +709,20 @@ def main():
         from new_natnet_client.Client import NatNetClient, NatNetParams
         from pub_sub.planner import PlannerClient
 
+        # With --trial, open the placement view first so the block can be set on
+        # the spec start (and the spec goal) before the trial runs. Launched as a
+        # subprocess so its OptiTrack client fully closes before the planner opens
+        # its own — two live NatNet clients to Motive conflict.
+        if use_spec:
+            import subprocess
+            print("Opening placement view — position the block on the ghost, "
+                  "then close the window to start the trial.")
+            subprocess.run(
+                [sys.executable, os.path.join(os.path.dirname(__file__), "tee_problem_gen.py"),
+                 "--server", str(args.server), "--local", str(args.local),
+                 "--seed", str(args.seed), "--trial", str(trial)],
+                check=False)
+
         # Goal already resolved from the problem spec above.
         theta = theta._replace(
             goal_xy=jnp.array([goal_x, goal_y]),
@@ -747,8 +769,9 @@ def main():
                              optitrack_client, robot_planner,
                              method=rt_method, temperature=temperature,
                              log_path=args.log_path,
-                             trial=trial, seed=args.seed,
-                             spec_init=(spec_init_xy[0], spec_init_xy[1], spec_init_yaw))
+                             trial=(trial if trial is not None else -1), seed=args.seed,
+                             spec_init=((spec_init_xy[0], spec_init_xy[1], spec_init_yaw)
+                                        if use_spec else None))
             finally:
                 robot_planner.close()
     else:
