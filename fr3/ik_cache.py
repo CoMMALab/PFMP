@@ -1,36 +1,33 @@
-"""IK cache: build, validate, and look up a precomputed grid of joint solutions.
+"""IK cache: build and look up a grid of joint solutions, backed by GeoFIK.
+
+The grid is built analytically from GeoFIK's closed-form Franka IK (`geofikinpy`),
+in-memory at startup (~0.1s for 128x128) — there is no pickle to save or load.
 
 Usage:
-    python examples/fr3/ik_cache.py               # build and save cache
-    python examples/fr3/ik_cache.py --validate    # load and validate existing cache
+    python ik_cache.py               # build and validate a cache
+    python ik_cache.py --validate    # build and report smoothness only
 """
 
 import argparse
 import os
-import pickle
 import time
-from typing import NamedTuple, Tuple
-from io import StringIO
-from xml.etree import ElementTree as ET
+from collections import deque
+from contextlib import contextmanager
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
-import jax_dataclasses as jdc
-import jaxlie
-import jaxls
 import numpy as np
-import pyroki as pk
-import yourdfpy
+
+import geofikinpy as g
 
 ROBOT_URDF_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "panda_spherized.urdf")
-CACHE_PATH      = os.path.join(os.path.dirname(__file__), "ik_cache.pkl")
 
 # FR3 joint position limits (rad), from franka_description robots/fr3/joint_limits.yaml.
-# The spherized URDF carries Panda limits, which are looser than the FR3 firmware's on
-# joints 4/5 and let IK solutions drift past the FR3 boundary — where the FR3's
-# position-dependent velocity ceiling collapses, tripping joint_velocity_violation.
-# We override with FR3 limits and pull in by FR3_LIMIT_MARGIN so cached solutions keep
-# clear of the boundary.
+# GeoFIK solves full-range Panda IK; we reject any branch that lands outside the FR3
+# limits. No extra inset margin: real-robot testing (go_fr3) reaches cleanly down to
+# ~0.295m, where the near-base elbow (joint 4) sits ~2° inside its hard stop, and the
+# cond(J) branch penalty already steers away from ill-conditioned near-singular poses.
 FR3_JOINT_LIMITS = {
     "panda_joint1": (-2.9007,  2.9007),
     "panda_joint2": (-1.8361,  1.8361),
@@ -40,22 +37,35 @@ FR3_JOINT_LIMITS = {
     "panda_joint6": ( 0.4398,  4.6216),
     "panda_joint7": (-3.0508,  3.0508),
 }
-FR3_LIMIT_MARGIN = 0.1  # rad, kept inside each bound
+FR3_LIMIT_MARGIN = 0.0  # rad, kept inside each bound (0 = raw FR3 limits, matches go_fr3)
+
+_FR3_LO = np.array([FR3_JOINT_LIMITS[f"panda_joint{i}"][0] for i in range(1, 8)]) + FR3_LIMIT_MARGIN
+_FR3_HI = np.array([FR3_JOINT_LIMITS[f"panda_joint{i}"][1] for i in range(1, 8)]) - FR3_LIMIT_MARGIN
 
 EE_ID     = 12
 EE_HEIGHT = 0.060
 
 HOME_Q = jnp.array([0., -0.785398, 0., -2.356194, 0., 1.570796, 0.785398])
-REST_WEIGHT = jnp.array([0.0, 0.1, 0.1, 0.1, 1.0, 1.0, 1.0])
-REST_Q = HOME_Q
+_HOME_Q_NP = np.asarray(HOME_Q)
+Q7_HOME = float(_HOME_Q_NP[6])   # fix joint-7 redundancy so the branch field is smooth
 
+# Straight-down end-effector orientation (EE z-axis pointing at the table).
 EE_ROTATION = jnp.array([
     [1.,  0.,  0.],
     [0., -1.,  0.],
     [0.,  0., -1.],
 ])
+_ROE_NP = np.asarray(EE_ROTATION)
 
-_CACHE_MAX_JUMP = np.pi / 3   # ~60° — larger jumps indicate a wrist flip
+# Branch-selection conditioning penalty (rad per log-unit of cond(J)). Ranking
+# GeoFIK's branches by continuity alone can pick one that is locally close in
+# joint space but passes near a wrist/elbow singularity (cond(J) blows up). This
+# term pulls solutions back into the well-conditioned, de-singularized posture
+# family — the role the numeric solver's rest_cost toward HOME_Q used to play.
+# Value matches go_fr3's reference geofik solve (ik_inspector_geofik.py).
+COND_PENALTY = 0.03
+
+_CACHE_MAX_JUMP = np.pi / 3   # ~60° — larger neighbour jumps indicate a wrist flip
 
 WORKSPACE_XY_MIN = jnp.array([-0.16, -0.85])
 WORKSPACE_XY_MAX = jnp.array([0.85,  0.85])
@@ -63,41 +73,19 @@ IK_CACHE_RESOLUTION = 128
 
 # Clip cells closer to the base than this radius. The folded near-base configs are
 # where the FR3 self-collision-avoidance reflex trips; excluding them is cheaper and
-# far more robust than a self-collision cost (which shattered the solution field).
-WORKSPACE_R_MIN = 0.33
+# far more robust than a self-collision cost. With GeoFIK's cond-penalized branch
+# selection, real-robot testing (go_fr3) confirmed clean pushes down to ~0.295m, so
+# the clip sits just inside that — the near-base solves are ~2x worse conditioned
+# (cond ~19-22 vs ~8-10 further out) but still drive reliably.
+WORKSPACE_R_MIN = 0.29
+
+# Clip cells beyond this |y| off the workspace: the far large-|y| corners are
+# kinematically reachable but the arm swings into the physical cage sides there.
+WORKSPACE_Y_ABS_MAX = 0.78
 
 
-# ── Robot ─────────────────────────────────────────────────────────────────────
-
-def load_panda_robot():
-    urdf = yourdfpy.URDF.load(ROBOT_URDF_PATH)
-    xml_tree = urdf.write_xml()
-    for joint in xml_tree.findall('.//joint[@type="prismatic"]'):
-        joint.set("type", "fixed")
-        for tag in ("axis", "limit", "dynamics"):
-            child = joint.find(tag)
-            if child is not None:
-                joint.remove(child)
-    # Override Panda limits with (margin-tightened) FR3 limits so pyroki's limit_cost
-    # keeps IK solutions inside the FR3 firmware's valid range.
-    for joint in xml_tree.findall('.//joint[@type="revolute"]'):
-        bounds = FR3_JOINT_LIMITS.get(joint.get("name"))
-        if bounds is None:
-            continue
-        lower, upper = bounds[0] + FR3_LIMIT_MARGIN, bounds[1] - FR3_LIMIT_MARGIN
-        limit = joint.find("limit")
-        if limit is not None:
-            limit.set("lower", f"{lower:.4f}")
-            limit.set("upper", f"{upper:.4f}")
-        safety = joint.find("safety_controller")
-        if safety is not None:
-            safety.set("soft_lower_limit", f"{lower:.4f}")
-            safety.set("soft_upper_limit", f"{upper:.4f}")
-    xml_str = ET.tostring(xml_tree.getroot(), encoding="unicode")
-    return pk.Robot.from_urdf(yourdfpy.URDF.load(StringIO(xml_str)))
-
-
-PANDA = load_panda_robot()
+import sys as _sys
+_sys.modules.setdefault('ik_cache', _sys.modules[__name__])
 
 
 # ── Cache type ────────────────────────────────────────────────────────────────
@@ -109,58 +97,102 @@ class IKCache(NamedTuple):
     z:         float
     reachable: jax.Array   # (Nx, Ny) float 1.0/0.0 — IK actually reaches the cell
 
-import sys as _sys
-_sys.modules.setdefault('ik_cache', _sys.modules[__name__])
 IKCache.__module__ = 'ik_cache'
 
 
-# ── IK solver ─────────────────────────────────────────────────────────────────
+# ── GeoFIK analytic solve ───────────────────────────────────────────────────────
 
-def _ee_z_axis_residual(vals, robot, joint_var, target_link_index, weight):
-    Ts   = robot.forward_kinematics(vals[joint_var])
-    R    = jaxlie.SE3(Ts[..., target_link_index, :]).rotation().as_matrix()
-    ee_z = R @ jnp.array([0., 0., 1.])
-    return ((ee_z - jnp.array([0., 0., -1.])) * weight).flatten()
-
-@jdc.jit
-def _make_ik_problem(target_mat4, pos_weight=10.0, ori_weight=5.0, limit_weight=100.0):
-    R    = target_mat4[:3, :3]
-    t    = target_mat4[:3,  3]
-    q    = jaxlie.SO3.from_matrix(R).wxyz
-    T_target   = jaxlie.SE3.from_rotation_and_translation(jaxlie.SO3(q), t)
-    joint_var  = PANDA.joint_var_cls(0)
-    factors = [
-        pk.costs.pose_cost_analytic_jac(PANDA, joint_var, T_target,
-                                         target_link_index=jnp.array(EE_ID),
-                                         pos_weight=pos_weight, ori_weight=0.0),
-        jaxls.Cost(_ee_z_axis_residual, (PANDA, joint_var, jnp.array(EE_ID), ori_weight)),
-        pk.costs.limit_cost(PANDA, joint_var, weight=limit_weight),
-        pk.costs.rest_cost(joint_var, REST_Q, REST_WEIGHT * 0.1),
-    ]
-    return jaxls.LeastSquaresProblem(factors, [joint_var]).analyze(), joint_var
+import ctypes as _ctypes
+try:
+    _libc = _ctypes.CDLL(None)   # for flushing C stdio buffers (fflush(NULL))
+except Exception:
+    _libc = None
 
 
-def _mat4_from_xy(xy, z=EE_HEIGHT):
-    xyz = jnp.array([xy[0], xy[1], z])
-    T   = jnp.eye(4).at[:3, :3].set(EE_ROTATION).at[:3, 3].set(xyz)
-    return T
+@contextmanager
+def _silence_stdio():
+    """GeoFIK prints 'unable to assembly kinematic chain' to fd 1/2 on every
+    unreachable pose. Redirecting the fds isn't enough on its own: geofik's C
+    stdio is block-buffered when fd 1 is not a tty, so the bytes flush to whatever
+    fd 1 points at *when the buffer flushes* — after we restore, i.e. the real
+    terminal. So flush the C buffers (fflush(NULL)) while still pointed at devnull."""
+    o1, o2 = os.dup(1), os.dup(2)
+    dn = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(dn, 1); os.dup2(dn, 2); os.close(dn)
+    try:
+        yield
+    finally:
+        if _libc is not None:
+            _libc.fflush(None)   # flush any buffered geofik output to devnull
+        os.dup2(o1, 1); os.dup2(o2, 2); os.close(o1); os.close(o2)
 
 
-@jax.jit
-def ik_step_from_mat4(prev_q, target_mat4):
-    prob, joint_var = _make_ik_problem(target_mat4)
-    sol = prob.solve(
-        initial_vals=jaxls.VarValues.make([joint_var.with_value(prev_q)]),
-        verbose=False,
-        linear_solver="dense_cholesky",
-        trust_region=jaxls.TrustRegionConfig(lambda_initial=1.),
-    )
-    q = sol[joint_var]
-    return q, q
+def _wrap(d: np.ndarray) -> np.ndarray:
+    """Wrap joint-angle differences to (-pi, pi]."""
+    return (d + np.pi) % (2 * np.pi) - np.pi
+
+
+def _rotz(theta):
+    c, s = np.cos(theta), np.sin(theta)
+    return np.array([[c, -s, 0.], [s, c, 0.], [0., 0., 1.]])
+
+
+def cond_number(q) -> float:
+    """Condition number of the geometric Jacobian at q (sigma_max / sigma_min)."""
+    J = np.asarray(g.J_from_q(np.asarray(q, float))).T   # (6, 7)
+    s = np.linalg.svd(J, compute_uv=False)
+    s = s[s > 1e-9]
+    return float(s.max() / s.min()) if len(s) else float("inf")
+
+
+def _valid_branches(x, y, z, q7=Q7_HOME):
+    """All GeoFIK IK branches for a straight-down tool at (x, y, z) within the
+    tightened FR3 joint limits. Empty list ⇒ unreachable.
+
+    Only the tool z-axis is constrained (roll about it is a free gauge DOF), so we
+    rotate the target roll with the target's polar angle — R = Rz(atan2 y, x) @ EE_ROTATION.
+    This lets q1 absorb the azimuth (q1 ≈ theta) instead of forcing GeoFIK to fight
+    it with the elbow/wrist, matching go_fr3's production gauge.
+    """
+    R_target = _rotz(np.arctan2(y, x)) @ _ROE_NP
+    with _silence_stdio():
+        sols = g.ik_q7(np.array([x, y, z], float), R_target, float(q7))
+    out = []
+    for s in sols:
+        s = np.asarray(s, float)
+        if np.all(np.isfinite(s)) and np.all(s >= _FR3_LO) and np.all(s <= _FR3_HI):
+            out.append(s)
+    return out
+
+
+def _best_branch(branches, seed_q):
+    """Pick the branch minimizing continuity distance to seed_q plus a
+    log(cond(J)) conditioning penalty (keeps the elbow/wrist out of near-singular
+    postures). Returns (branch, max_per_joint_jump_vs_seed)."""
+    seed = np.asarray(seed_q, float)
+    best, best_score, best_jump = None, np.inf, np.inf
+    for b in branches:
+        w = _wrap(b - seed)
+        score = float(np.linalg.norm(w)) + COND_PENALTY * np.log1p(cond_number(b))
+        if score < best_score:
+            best, best_score, best_jump = b, score, float(np.abs(w).max())
+    return best, best_jump
+
+
+def ik_solve(xy, seed_q=_HOME_Q_NP, z=EE_HEIGHT, q7=Q7_HOME):
+    """Exact analytic IK for a single (x, y): the best conditioned branch
+    continuous with seed_q, or None if unreachable. This is the host-side path —
+    no grid, no interpolation."""
+    branches = _valid_branches(float(xy[0]), float(xy[1]), z, q7)
+    if not branches:
+        return None
+    return _best_branch(branches, seed_q)[0]
 
 
 def ik_step_from_xy(prev_q, xy, z=EE_HEIGHT):
-    return ik_step_from_mat4(prev_q, _mat4_from_xy(xy, z))[0]
+    """Analytic IK for `xy`, continuous with `prev_q`. Returns NaNs if unreachable."""
+    q = ik_solve(xy, np.asarray(prev_q, float), z)
+    return jnp.asarray(q) if q is not None else jnp.full(7, jnp.nan)
 
 
 # ── Cache lookup (JAX, used by planner) ───────────────────────────────────────
@@ -184,8 +216,7 @@ def ik_from_cache(xy: jax.Array, cache: IKCache) -> jax.Array:
     wm = w * r
     wsum = wm.sum()
     # No reachable corner means there is nothing valid to interpolate from, so
-    # reject: return NaN rather than a blend of failed IK solves (which put the
-    # EE up to 19cm off target height). Callers must check before commanding.
+    # reject: return NaN rather than a blend of failed IK solves. Callers check.
     q_masked = (wm[:, None] * qs).sum(0) / jnp.where(wsum > 0, wsum, 1.0)
     return jnp.where(wsum > 0, q_masked, jnp.nan)
 
@@ -213,11 +244,9 @@ def reachable_frac(xy: jax.Array, cache: IKCache) -> jax.Array:
 
 # ── Target validation ─────────────────────────────────────────────────────────
 
-@jax.jit
-def _ee_position(q: jax.Array) -> jax.Array:
-    """World EE (x, y, z) for a joint config, via forward kinematics."""
-    Ts = PANDA.forward_kinematics(q)
-    return jaxlie.SE3(Ts[..., EE_ID, :]).translation()
+def _ee_position(q) -> np.ndarray:
+    """World EE (x, y, z) for a joint config, via GeoFIK forward kinematics."""
+    return np.asarray(g.franka_fk(np.asarray(q, float)))[:3, 3]
 
 
 def validate_xy(xy, cache: IKCache, tol: float = 0.01, z: float = EE_HEIGHT):
@@ -228,20 +257,12 @@ def validate_xy(xy, cache: IKCache, tol: float = 0.01, z: float = EE_HEIGHT):
     `q` is not proof the target is reachable. This runs forward kinematics on the
     interpolated `q` and compares the achieved EE position to the request.
 
-    Returns (ok, info) where info has:
-      in_bounds:  xy within [xy_min, xy_max] before clamping
-      residual:   ||achieved_xy - target_xy|| (m)
-      z_error:    |achieved_z - z| (m)
-      q:          the interpolated joint config
-      achieved:   achieved EE (x, y, z)
-    Both the residual and z_error must be within `tol` for ok=True. A large
-    residual with in_bounds=True flags a discontinuity/wrist-flip cell.
+    Returns (ok, info) with in_bounds / reachable / residual / z_error / q / achieved.
     """
     xy = np.asarray(xy, dtype=float)
     xy_min = np.asarray(cache.xy_min); xy_max = np.asarray(cache.xy_max)
     in_bounds = bool(np.all(xy >= xy_min) and np.all(xy <= xy_max))
 
-    # Reachable support: are any of the four surrounding grid corners reachable?
     r = np.asarray(cache.reachable); Nx, Ny = r.shape
     uv = np.clip((xy - xy_min) / (xy_max - xy_min), 0.0, 1.0)
     ix = int(np.clip(np.floor(uv[0] * (Nx - 1)), 0, Nx - 2))
@@ -249,7 +270,7 @@ def validate_xy(xy, cache: IKCache, tol: float = 0.01, z: float = EE_HEIGHT):
     reachable = bool(r[ix:ix+2, iy:iy+2].sum() > 0.5)
 
     q = ik_from_cache(jnp.asarray(xy), cache)
-    achieved = np.asarray(_ee_position(q), dtype=float)
+    achieved = _ee_position(q)
     residual = float(np.linalg.norm(achieved[:2] - xy))
     z_error = float(abs(achieved[2] - z))
     ok = in_bounds and reachable and residual <= tol and z_error <= tol
@@ -263,150 +284,78 @@ def validate_xy(xy, cache: IKCache, tol: float = 0.01, z: float = EE_HEIGHT):
     }
 
 
-# ── Build & validate ───────────────────────────────────────────────────────────
-
-_REACH_TOL = 0.005   # m — FK residual above this means the cell isn't reachable
-
-
-def _compute_reachable(q_grid, xs, ys, z) -> np.ndarray:
-    """Boolean (Nx, Ny) mask: does each cell's solution actually reach its target?
-
-    Clips the unreachable regions — the near-base blob (too close for a straight-
-    down EE) and the far corners (beyond max reach).
-    """
-    Nx, Ny = q_grid.shape[:2]
-    reach = np.zeros((Nx, Ny), bool)
-    for i in range(Nx):
-        ee  = np.asarray(_ee_position(jnp.asarray(q_grid[i])))          # (Ny, 3)
-        tgt = np.stack([np.full(Ny, xs[i]), ys, np.full(Ny, z)], axis=1)
-        reach[i] = np.linalg.norm(ee - tgt, axis=1) < _REACH_TOL
-    return reach
-
-
-def _neighbour_flips(q_grid, reach, i, j, thresh) -> int:
-    """Count reachable neighbours cell (i,j) disagrees with by > thresh (rad)."""
-    Nx, Ny = reach.shape
-    c = 0
-    for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-        ni, nj = i + di, j + dj
-        if 0 <= ni < Nx and 0 <= nj < Ny and reach[ni, nj]:
-            d = (q_grid[i, j] - q_grid[ni, nj] + np.pi) % (2 * np.pi) - np.pi
-            if np.abs(d).max() > thresh:
-                c += 1
-    return c
-
-
-def _repair_flips(q_grid, reach, xs, ys, z, n_sweeps=6, verbose=True) -> int:
-    """Re-solve reachable cells that flip vs their reachable neighbours, seeding
-    from a consistent neighbour. Accept only if it lowers local disagreement, so
-    the already-smooth interior is never disturbed. Returns remaining flip edges.
-    """
-    thresh = _CACHE_MAX_JUMP
-    Nx, Ny = reach.shape
-    for _ in range(n_sweeps):
-        changed = 0
-        flips = [(i, j) for i in range(Nx) for j in range(Ny)
-                 if reach[i, j] and _neighbour_flips(q_grid, reach, i, j, thresh) > 0]
-        if not flips:
-            break
-        for i, j in flips:
-            # Seed from the reachable neighbour that is most consistent with the bulk.
-            best, seed_ij = 99, None
-            for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                ni, nj = i + di, j + dj
-                if 0 <= ni < Nx and 0 <= nj < Ny and reach[ni, nj]:
-                    fc = _neighbour_flips(q_grid, reach, ni, nj, thresh)
-                    if fc < best:
-                        best, seed_ij = fc, (ni, nj)
-            if seed_ij is None:
-                continue
-            before = _neighbour_flips(q_grid, reach, i, j, thresh)
-            new_q = np.asarray(ik_step_from_xy(jnp.asarray(q_grid[seed_ij]),
-                                               jnp.array([float(xs[i]), float(ys[j])]), z))
-            old_q = q_grid[i, j].copy()
-            q_grid[i, j] = new_q
-            if _neighbour_flips(q_grid, reach, i, j, thresh) < before:
-                changed += 1
-            else:
-                q_grid[i, j] = old_q
-        if changed == 0:
-            break
-    remaining = sum(_neighbour_flips(q_grid, reach, i, j, thresh)
-                    for i in range(Nx) for j in range(Ny) if reach[i, j]) // 2
-    if verbose:
-        print(f"  repair: {remaining} reachable flip edge(s) remaining")
-    return remaining
-
+# ── Build ──────────────────────────────────────────────────────────────────────
 
 def build_ik_cache(xy_min, xy_max, resolution=IK_CACHE_RESOLUTION,
                    z=EE_HEIGHT, verbose=True) -> IKCache:
+    """Build a smooth, connected grid of Franka IK solutions from GeoFIK.
+
+    For every cell we take GeoFIK's exact analytic branches (empty ⇒ unreachable),
+    then flood-fill from the workspace centre picking, at each step, the branch
+    nearest the parent cell's solution. This yields a globally consistent branch
+    field (safe to bilinearly interpolate) and, as a by-product, an exact reachable
+    mask that is the single connected component around the centre — replacing the
+    old FK-residual reachability + flip-repair + seam + island heuristics wholesale.
+    """
     xy_min, xy_max = jnp.asarray(xy_min), jnp.asarray(xy_max)
     xs = np.linspace(float(xy_min[0]), float(xy_max[0]), resolution)
     ys = np.linspace(float(xy_min[1]), float(xy_max[1]), resolution)
+    N = resolution
 
     if verbose:
-        print(f"Building IK cache: {resolution}×{resolution} = {resolution**2} points")
+        print(f"Building IK cache (GeoFIK): {N}×{N} = {N**2} points")
 
-    t0     = time.perf_counter()
-    q_grid = np.zeros((resolution, resolution, 7))
-    home   = jnp.array(HOME_Q)
-
+    t0 = time.perf_counter()
+    branches = np.empty((N, N), dtype=object)
     for i, x in enumerate(xs):
-        if verbose and i % 10 == 0:
-            print(f"  row {i}/{resolution}…")
         for j, y in enumerate(ys):
-            q_grid[i, j] = np.array(ik_step_from_xy(home, jnp.array([float(x), float(y)]), z))
-
+            branches[i, j] = _valid_branches(x, y, z)
     if verbose:
         elapsed = time.perf_counter() - t0
-        print(f"  done in {elapsed:.1f}s ({resolution**2 / elapsed:.0f} solves/s)")
+        has_sol = sum(1 for i in range(N) for j in range(N) if branches[i, j])
+        print(f"  solved in {elapsed*1000:.0f}ms ({N**2/elapsed:.0f} solves/s); "
+              f"{has_sol}/{N**2} cells have ≥1 branch")
 
-    # Clip the near-base disk (self-collision-prone folds).
+    # Near-base disk clip + far-side cage clip on |y|.
     X, Y = np.meshgrid(xs, ys, indexing="ij")
-    radius_ok = np.sqrt(X**2 + Y**2) >= WORKSPACE_R_MIN
-    reach = _compute_reachable(q_grid, xs, ys, z) & radius_ok
-    if verbose:
-        print(f"  reachable cells (r >= {WORKSPACE_R_MIN}): {int(reach.sum())}/{reach.size}")
-    _repair_flips(q_grid, reach, xs, ys, z, verbose=verbose)
-    reach = _compute_reachable(q_grid, xs, ys, z) & radius_ok  # repair may shift reachability
+    workspace_ok = (np.sqrt(X**2 + Y**2) >= WORKSPACE_R_MIN) & (np.abs(Y) <= WORKSPACE_Y_ABS_MAX)
 
-    # Mask out the residual branch-cut seam: any reachable cell that still flips
-    # against a reachable neighbour is unusable (interpolation across it is
-    # meaningless), so fold it into the unreachable mask. Iterate until the
-    # remaining reachable region is fully smooth.
-    Nx, Ny = reach.shape
-    while True:
-        seam = [(i, j) for i in range(Nx) for j in range(Ny)
-                if reach[i, j] and _neighbour_flips(q_grid, reach, i, j, _CACHE_MAX_JUMP) > 0]
-        if not seam:
-            break
-        for i, j in seam:
-            reach[i, j] = False
-    if verbose:
-        print(f"  reachable after seam mask: {int(reach.sum())}/{reach.size}")
+    def usable(i, j):
+        return workspace_ok[i, j] and len(branches[i, j]) > 0
 
-    # Drop islands: keep only the connected reachable component containing the
-    # working center, so ik_from_cache never lands in a small isolated pocket.
-    from collections import deque
+    # Seed at the cell nearest the workspace centre that is usable.
     ci = int(np.argmin(np.abs(xs - float((xy_min[0] + xy_max[0]) / 2))))
     cj = int(np.argmin(np.abs(ys - float((xy_min[1] + xy_max[1]) / 2))))
-    if not reach[ci, cj]:  # center unreachable → fall back to largest component's seed
-        idx = np.argwhere(reach)
-        ci, cj = idx[len(idx) // 2]
-    keep = np.zeros_like(reach)
-    dq = deque([(ci, cj)]); keep[ci, cj] = True
+    if not usable(ci, cj):
+        cand = [(i, j) for i in range(N) for j in range(N) if usable(i, j)]
+        if not cand:
+            raise RuntimeError("GeoFIK found no reachable cell in the workspace")
+        ci, cj = min(cand, key=lambda ij: (ij[0] - ci) ** 2 + (ij[1] - cj) ** 2)
+
+    q_grid = np.zeros((N, N, 7))
+    reach = np.zeros((N, N), bool)
+    q_grid[ci, cj] = _best_branch(branches[ci, cj], _HOME_Q_NP)[0]
+    reach[ci, cj] = True
+
+    # Flood-fill the connected reachable component, choosing at each cell the
+    # branch continuous with its (already-solved) parent. Cells whose best branch
+    # would still jump more than _CACHE_MAX_JUMP are treated as a branch-cut
+    # boundary and left unreachable, so interpolation never crosses a seam.
+    dq = deque([(ci, cj)])
     while dq:
         i, j = dq.popleft()
         for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
             ni, nj = i + di, j + dj
-            if 0 <= ni < Nx and 0 <= nj < Ny and reach[ni, nj] and not keep[ni, nj]:
-                keep[ni, nj] = True
+            if not (0 <= ni < N and 0 <= nj < N) or reach[ni, nj] or not usable(ni, nj):
+                continue
+            b, jump = _best_branch(branches[ni, nj], q_grid[i, j])
+            if jump <= _CACHE_MAX_JUMP:
+                q_grid[ni, nj] = b
+                reach[ni, nj] = True
                 dq.append((ni, nj))
-    dropped = int(reach.sum() - keep.sum())
-    reach = keep
+
     if verbose:
-        print(f"  reachable after island removal: {int(reach.sum())}/{reach.size} "
-              f"({dropped} island cell(s) dropped)")
+        print(f"  reachable (connected, smooth): {int(reach.sum())}/{reach.size}")
 
     return IKCache(xy_min=xy_min, xy_max=xy_max, q_grid=jnp.array(q_grid), z=z,
                    reachable=jnp.asarray(reach, dtype=jnp.float32))
@@ -435,22 +384,13 @@ def validate_cache(cache: IKCache) -> bool:
 
 def get_or_build_cache(xy_min=WORKSPACE_XY_MIN, xy_max=WORKSPACE_XY_MAX,
                        resolution=IK_CACHE_RESOLUTION, z=EE_HEIGHT,
-                       path=CACHE_PATH) -> IKCache:
-    if os.path.exists(path):
-        print(f"Loading cache from {path}…")
-        with open(path, "rb") as f:
-            cache = pickle.load(f)
-        if validate_cache(cache):
-            return cache
-        print("  Validation failed — using cache anyway (run ik_cache.py directly to rebuild).")
-        return cache
-
+                       path=None) -> IKCache:
+    """Build the IK cache in memory. GeoFIK makes this a sub-second operation, so
+    there is no persistence — `path` is accepted for call-site compatibility and
+    ignored."""
     cache = build_ik_cache(xy_min, xy_max, resolution=resolution, z=z)
     if not validate_cache(cache):
-        print("WARNING: rebuilt cache still has discontinuities")
-    with open(path, "wb") as f:
-        pickle.dump(cache, f)
-    print(f"  Saved to {path}")
+        print("WARNING: built cache still has discontinuities")
     return cache
 
 
@@ -458,14 +398,10 @@ def get_or_build_cache(xy_min=WORKSPACE_XY_MIN, xy_max=WORKSPACE_XY_MAX,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--validate", action="store_true", help="Validate existing cache only")
-    parser.add_argument("--cache", default=CACHE_PATH)
+    parser.add_argument("--validate", action="store_true",
+                        help="Build and report smoothness only")
     parser.add_argument("--resolution", type=int, default=IK_CACHE_RESOLUTION)
     args = parser.parse_args()
 
-    if args.validate:
-        with open(args.cache, "rb") as f:
-            cache = pickle.load(f)
-        validate_cache(cache)
-    else:
-        get_or_build_cache(resolution=args.resolution, path=args.cache)
+    cache = build_ik_cache(WORKSPACE_XY_MIN, WORKSPACE_XY_MAX, resolution=args.resolution)
+    validate_cache(cache)

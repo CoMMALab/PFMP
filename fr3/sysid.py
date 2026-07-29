@@ -14,14 +14,13 @@ import sys
 import time
 from typing import Optional, Tuple
 
-import jax.numpy as jnp
 import mujoco
 import mujoco.viewer
 import numpy as np
 import zmq
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from ik_cache import ik_from_cache, get_or_build_cache
+from ik_cache import ik_solve, get_or_build_cache, HOME_Q
 
 sys.path.insert(0, os.path.dirname(__file__))
 from push_tee_optitrack import tee_pose, T_OPTI_TO_WORLD, opti_to_mjx
@@ -48,8 +47,13 @@ def make_sweep_waypoints(sweep_x=SWEEP_X, y_lo=SWEEP_Y_LO,
 def exec_sim(mj_model, mj_data, ik_cache, waypoints, steps_per_wp=500):
     tee_traj, ee_traj = [], []
     with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
+        seed_q = np.asarray(HOME_Q, float)
         for i, wp in enumerate(waypoints):
-            target_q = np.asarray(ik_from_cache(jnp.asarray(wp), ik_cache))
+            target_q = ik_solve(np.asarray(wp, float), seed_q)
+            if target_q is None:
+                raise ValueError(f"waypoint {np.asarray(wp).tolist()} is unreachable")
+            target_q = np.asarray(target_q, float)
+            seed_q = target_q
             mj_data.ctrl[:7] = target_q
             for step in range(steps_per_wp):
                 mujoco.mj_step(mj_model, mj_data)

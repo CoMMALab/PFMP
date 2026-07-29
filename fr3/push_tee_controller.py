@@ -21,11 +21,20 @@ import numpy as np
 import zmq
 
 sys.path.insert(0, os.path.dirname(__file__))
-from ik_cache import ik_from_cache, get_or_build_cache, HOME_Q
+from ik_cache import ik_solve, get_or_build_cache, HOME_Q
+
+
+def _current_q(robot):
+    """Robot's current joint config as an IK seed (falls back to HOME_Q)."""
+    if robot is None:
+        return np.asarray(HOME_Q, float)
+    try:
+        return np.asarray(robot.current_joint_state.position, float)
+    except Exception:
+        return np.asarray(HOME_Q, float)
 from pub_sub.controller import ControllerEndpoint
 from pub_sub.protocol import Command, decode_json, encode_json
 
-import jax.numpy as jnp
 import franky
 
 
@@ -44,9 +53,11 @@ def robot_current_xy(robot) -> np.ndarray:
 # recover from errors
 # time.sleep()
 
-def go_pushing_plane(robot: franky.Robot, target_xy: np.ndarray, ik_cache) -> None:
+def go_pushing_plane(robot: franky.Robot, target_xy: np.ndarray, ik_cache=None) -> None:
     target_xy = np.asarray(target_xy, dtype=float)
-    target_q = np.array(ik_from_cache(jnp.array(target_xy), ik_cache))
+    target_q = ik_solve(target_xy, _current_q(robot))
+    if target_q is None:
+        raise ValueError(f"target {target_xy.tolist()} is unreachable")
     robot.move(franky.JointMotion(target_q.tolist()))
 
 def go_home(robot: franky.Robot) -> None:
@@ -55,9 +66,10 @@ def go_home(robot: franky.Robot) -> None:
 def execute_xy(robot: franky.Robot, target_xy: np.ndarray, ik_cache=None) -> None:
     target_xy = np.asarray(target_xy, dtype=float)
     if ik_cache is not None:
-        import jax.numpy as jnp
-        target_q = np.asarray(ik_from_cache(jnp.array(target_xy), ik_cache), dtype=float)
-        robot.move(franky.JointMotion(target_q.tolist()))
+        target_q = ik_solve(target_xy, _current_q(robot))
+        if target_q is None:
+            raise ValueError(f"target {target_xy.tolist()} is unreachable")
+        robot.move(franky.JointMotion(np.asarray(target_q, float).tolist()))
     else:
         current_xy = robot_current_xy(robot)
         delta_xy = target_xy - current_xy
@@ -98,14 +110,13 @@ def main(args):
             recv_timeout_ms=0,  # non-blocking REP
         )
 
-    # init arm position in pushing plane
-    if robot is not None:
-        go_pushing_plane(robot, args.init_xy, ik_cache)
-        current_xy = np.asarray(args.init_xy, dtype=float)
-        print('moved to init_xy:', args.init_xy)
+    # Stay at home; the planner triggers the descend onto the pushing plane when
+    # planning starts (Command action="descend") and homes us when it finishes.
+    current_xy = None  # not on the plane yet
+    if robot is None:
+        print(f"[dry-run] at home; will descend to init_xy {args.init_xy} on planner signal")
     else:
-        current_xy = np.asarray(args.init_xy, dtype=float)
-        print(f"[dry-run] would move to init_xy: {args.init_xy}")
+        print(f"At home. Awaiting descend signal (init_xy {args.init_xy}).")
 
     if args.mode == 'server':
         print(f"\nLoop running in SERVER mode.")
@@ -134,6 +145,27 @@ def main(args):
 
                     if cmd is not None:
                         print(f"[server] received command: {cmd}")
+                        action = getattr(cmd, "action", "") or ""
+                        if action in ("home", "descend"):
+                            # Lifecycle commands: home on finish, descend on start.
+                            try:
+                                if robot is None:
+                                    print(f"[dry-run] would {action}")
+                                elif action == "home":
+                                    go_home(robot); current_xy = None
+                                else:  # descend
+                                    go_pushing_plane(robot, args.init_xy, ik_cache)
+                                    current_xy = np.asarray(args.init_xy, dtype=float)
+                                endpoint.reply_command(accepted=True)
+                            except Exception as e:
+                                print(f"[server] {action} failed: {e!r}")
+                                if robot is not None:
+                                    try:
+                                        robot.recover_from_errors()
+                                    except Exception as rec_e:
+                                        print(f"[server] recover_from_errors failed: {rec_e!r}")
+                                endpoint.reply_command(accepted=False, reason=f"{action} failed: {e}")
+                            continue
                         try:
                             target_xy = np.asarray(cmd.xy, dtype=float)
                         except Exception as e:

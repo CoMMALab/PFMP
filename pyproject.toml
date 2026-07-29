@@ -31,7 +31,12 @@ dependencies = [
     "franky-control==1.1.1",
     "optuna>=4.8.0",
     "new-natnet-client>=6.0.1",
+    "geofikinpy",
 ]
+
+[tool.uv.sources]
+# Vendored analytic Franka IK (GeoFIK pybind wrapper); builds the C++ ext in place.
+geofikinpy = { path = "fr3/geofikinpy_src", editable = true }
 
 [tool.setuptools.packages.find]
 # Only include the pfmp package, exclude experiments

@@ -77,6 +77,11 @@ def ps_update(theta: PyTree, trajs: jax.Array, costs: jax.Array):
 
 # Model Predictive Path Integral
 def mppi_update(theta: PyTree, trajs: jax.Array, costs: jax.Array, temperature: float):
+    # Numerically stable softmax: shift by the per-row min cost so exp() cannot
+    # underflow to all-zeros (which would make the normalization 0/0 = NaN). The
+    # shift is a constant factor that cancels in the normalization, so this is
+    # mathematically identical to exp(-costs/temperature) where that is finite.
+    costs = costs - jnp.min(costs, axis=1, keepdims=True)
     weights = jnp.exp(-costs / temperature)
     weights = weights / jnp.sum(weights, axis=1, keepdims=True)
     new_mean = jax.tree.map(lambda u: jnp.sum(u * weights[:, :, None], axis=1), trajs)

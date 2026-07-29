@@ -80,6 +80,7 @@ def run_batch(  # noqa: PLR0912, PLR0915
     ik_interp = None,
     sample_problem = None,
     temperature: float = 1.0,
+    update_fn = None,
 ) -> Trajectory:
     """Run batched simulations with the MPC controller using MJX.
 
@@ -175,11 +176,14 @@ def run_batch(  # noqa: PLR0912, PLR0915
         # Batch theta (uniform for warmup)
         theta_batched = jax.tree.map(lambda x: jnp.repeat(jnp.array(x)[None], num, axis=0), theta)
 
-        # Update rule (U): MAP (best trajectory) for SIS/SIR/learned; mean
-        # (cost-weighted average, MPPI) for Biased-MPPI. mppi_update expects a
-        # (knots, particles, ...) layout, so transpose the (particles, knots)
-        # trajectories/costs that run_sis returns.
-        if algorithm == "biased_mppi":
+        # Update rule (U). A caller-supplied `update_fn(theta, trajs, costs) ->
+        # (theta_out, weights)` overrides the defaults, so the proposal x update x
+        # resampling axes can be swept without new algorithm strings (used by the
+        # push-T method matrix). Defaults preserve prior behaviour: MAP for
+        # SIS/SIR/learned; cost-weighted mean (MPPI) for Biased-MPPI.
+        if update_fn is not None:
+            _pfmp_update = update_fn
+        elif algorithm == "biased_mppi":
             def _pfmp_update(t, tr, c):
                 return mppi_update(t, tr.transpose(1, 0, 2), c.T, temperature)
         else:
@@ -205,11 +209,18 @@ def run_batch(  # noqa: PLR0912, PLR0915
             # Simulate forward
             def sim_step_fn(mjx_data_inner, u):
                 if ik_interp is not None:
-                    ctrl = jax.vmap(ik_interp)(u, theta_batched)
+                    # Advance via the controller's OWN dynamics so execution ramps
+                    # the joint reference toward the IK target at bounded velocity
+                    # (matching both the planner's rollout model and the real
+                    # robot's bounded-velocity motion) instead of slamming ctrl to
+                    # the full IK target — a slam spikes contact forces (NaNs) and
+                    # diverges from the trajectory the planner actually optimized.
+                    mjx_data_inner, _ = jax.vmap(
+                        lambda d, uu, th: controller.mpc_dynamics(d, uu, th, d.time)
+                    )(mjx_data_inner, u, theta_batched)
                 else:
-                    ctrl = u
-                mjx_data_inner = mjx_data_inner.replace(ctrl=ctrl)
-                mjx_data_inner = jax.vmap(lambda m, d: mjx.step(m, d), in_axes=[None,0])(mjx_model, mjx_data_inner)
+                    mjx_data_inner = mjx_data_inner.replace(ctrl=u)
+                    mjx_data_inner = jax.vmap(lambda m, d: mjx.step(m, d), in_axes=[None,0])(mjx_model, mjx_data_inner)
                 cost = jax.vmap(lambda d, c, t: controller.mpc_running_cost(d, c, t, d.time))(
                     mjx_data_inner, u, theta_batched
                 )

@@ -18,8 +18,8 @@ from geom_tee import OPTI_TO_BODY
 sys.path.insert(0, os.path.dirname(__file__))
 
 T_OPTI_TO_WORLD = np.array([
-    [1., 0., 0.,  0.42 ],
-    [0., 1., 0.,  0.00 ],
+    [1., 0., 0.,  0.44 ],
+    [0., 1., 0.,  -0.01 ],
     [0., 0., 1.,  0.00 ],
     [0., 0., 0.,  1.    ],
 ])

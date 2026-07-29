@@ -5,7 +5,11 @@ from typing import NamedTuple, Literal, Any
 
 
 class Command(NamedTuple):
-    xy: list[float]
+    xy: list[float] = None
+    # "" = move to xy (default); "descend" = go from home down onto the pushing
+    # plane; "home" = return to the home configuration. Lets the planner drive the
+    # arm's descend-on-start / home-on-finish lifecycle.
+    action: str = ""
 
 class TeeBelief(NamedTuple):
     mean: list[float]        # (3,)

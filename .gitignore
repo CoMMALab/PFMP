@@ -213,7 +213,7 @@ figures/cache_orphans/
 figures/ablation_N*/
 
 # Robot run log + stray artifacts
-realtime_log.jsonl
+*.jsonl
 MUJOCO_LOG.TXT
 *.zip
 

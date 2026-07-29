@@ -24,9 +24,10 @@ from geom_tee import STEM_HALF, CAP_HALF, CAP_CTR
 import pfmp
 
 from ik_cache import (
-    IKCache, ik_from_cache, get_or_build_cache,
+    IKCache, ik_from_cache, ik_solve, get_or_build_cache, HOME_Q,
     WORKSPACE_XY_MIN, WORKSPACE_XY_MAX, IK_CACHE_RESOLUTION, EE_HEIGHT,
 )
+from push_tee_controller import VELOCITY_SCALE
 
 # ===============================
 # Configuration
@@ -84,7 +85,7 @@ def compute_error(th: PushParams, t_qpos: jax.Array) -> jax.Array:
 
 HORIZON   = 8.0
 NUM_KNOTS = 5
-PARTICLES = 2048
+PARTICLES = 256
 
 # 2s knots at dt=0.02 (mjx_scene.xml) = 100 substeps per knot. Reach saturates
 # around 1s — the arm covers ~12cm in 0.5s and ~28cm by 1.0s, against a proposal
@@ -134,7 +135,6 @@ ORBITAL_Y_OFFSET = 0.04  # metres up the tee stem for the orbital centre
 # matters for the first few steps after a direction change but not for where the
 # arm ends up.
 FR3_DQ_MAX     = jnp.array([2.62, 2.62, 2.62, 2.62, 5.26, 4.18, 5.26])   # rad/s
-VELOCITY_SCALE = 0.2   # franky relative_dynamics_factor, see push_tee_controller
 
 
 def dynamics(x: mjx.Data, u: jax.Array, th: PushParams, t: float) -> Tuple[mjx.Data, jax.Array]:
@@ -162,7 +162,7 @@ def dynamics(x: mjx.Data, u: jax.Array, th: PushParams, t: float) -> Tuple[mjx.D
 
 
 TEE_ANNULUS_CENTER = (0.25 + 0.78) / 2   # ideal radial distance from base
-TEE_ANNULUS_WEIGHT = 0.3
+TEE_ANNULUS_WEIGHT = 0.3   # radial shaping toward TEE_ANNULUS_CENTER (keeps tee in recoverable band)
 
 def running_cost(x: mjx.Data, u: jax.Array, th: PushParams, t: float) -> jax.Array:
     t_qpos    = x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 3]
@@ -326,7 +326,8 @@ def load_scene(xml_path: str):
 
 def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
                  optitrack_client, robot_planner, method="sir", temperature=None,
-                 log_path=None, trial=0, seed=0, spec_init=None):
+                 log_path=None, trial=0, seed=0, spec_init=None,
+                 timeout=TRIAL_TIMEOUT_S):
     """Closed-loop realtime push: Optitrack → PFMP → robot controller."""
     from push_tee_optitrack import tee_pose
     from pub_sub.protocol import Command
@@ -352,7 +353,14 @@ def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
             user_scn.ngeom += 1
 
     from pfmp.algorithm import ps_update, mppi_update
-    if method == "mppi":
+    # The two design axes are logged separately so the analysis can isolate each:
+    #   proposal axis: custom object-centric (sir, biased_*) vs Gaussian (plain)
+    #   update axis:   mppi / cem / ps / dial / sir  (the biased_ prefix only
+    #                  swaps the proposal; the update rule is its plain counterpart)
+    axis_proposal = "custom" if method in ("sir", "biased_mppi", "biased_cem") else "gaussian"
+    base_method = method[len("biased_"):] if method.startswith("biased_") else method
+    axis_update = base_method
+    if base_method == "mppi":
         replan = lambda key, data, th: ctrl.run_sis(key, data, th)
         def _mppi_update(th, tr, co):
             import jax.numpy as jnp
@@ -360,16 +368,16 @@ def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
             co = jnp.where(finite[:, None], co, jnp.zeros_like(co))
             return mppi_update(th, tr.transpose(1, 0, 2), co.T, max(float(temperature), 1e-6))
         update = _mppi_update
-    elif method == "ps":
+    elif base_method == "ps":
         replan = lambda key, data, th: ctrl.run_sis(key, data, th)
         update = ps_update
-    elif method == "cem":
+    elif base_method == "cem":
         from pfmp.algorithm import cem_update
         num_elites = max(1, PARTICLES // 10)
         replan = lambda key, data, th: ctrl.run_sis(key, data, th)
         update = lambda th, tr, co: cem_update(th, tr, jnp.sum(co, axis=1),
                                                elite_frac=num_elites / PARTICLES)
-    elif method == "dial":
+    elif base_method == "dial":
         from pfmp import dial_sigma
         replan = lambda key, data, th: ctrl.run_sis(key, data, th)
         def _dial_update(th, tr, co):
@@ -402,6 +410,7 @@ def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
     rec = {
         "ts": datetime.datetime.now().isoformat(timespec="seconds"),
         "trial": int(trial), "seed": int(seed), "method": method,
+        "proposal": axis_proposal, "update": axis_update,
         "spec_init": ([float(spec_init[0]), float(spec_init[1]), float(spec_init[2])]
                       if spec_init is not None else None),
         "spec_goal": [float(theta.goal_xy[0]), float(theta.goal_xy[1]),
@@ -436,14 +445,26 @@ def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
               f"dropouts={rec['n_track_dropouts']} (max {rec['max_consec_misses']} consec, "
               f"{rec['n_stale_replans']}/{rec['n_replans']} stale replans) -> {log_path}")
 
+    def _lifecycle(action):
+        """Tell the controller to descend (planning start) / home (finish).
+        Never let a failed lifecycle signal abort the trial."""
+        try:
+            robot_planner.send_command(Command(action=action))
+        except Exception as e:
+            print(f"[lifecycle] {action} signal failed: {e!r}")
+
+    # Descend onto the pushing plane before planning begins.
+    print("Descending onto pushing plane…")
+    _lifecycle("descend")
+
     tracking = {"misses": 0}
 
     with mjviewer.launch_passive(mj_model, mj_data) as viewer:
-        print(f"Realtime loop running (timeout {TRIAL_TIMEOUT_S:.0f}s). "
+        print(f"Realtime loop running (timeout {timeout:.0f}s). "
               f"Close viewer to stop (logs an abort).")
         while viewer.is_running():
-            if time.time() - t_start > TRIAL_TIMEOUT_S:
-                print(f"\n✗ Timeout after {TRIAL_TIMEOUT_S:.0f}s — trial abandoned.")
+            if time.time() - t_start > timeout:
+                print(f"\n✗ Timeout after {timeout:.0f}s — trial abandoned.")
                 rec["timeout"] = True
                 break
             rec["n_replans"] += 1
@@ -520,7 +541,10 @@ def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
                 reply = robot_planner.send_command(Command(xy=next_wp.tolist()))
                 actual_xy = reply.get("actual_xy")
                 ee_xy = np.array(actual_xy) if actual_xy else next_wp
-                q_cmd = np.asarray(ik_from_cache(jnp.array(ee_xy), ik_cache), dtype=float)
+                # Sim-viz IK only (the real command was already sent). Exact
+                # analytic branch, continuous with the last shown pose.
+                q_cmd = ik_solve(ee_xy, q_prev)
+                q_cmd = np.asarray(q_cmd if q_cmd is not None else q_prev, dtype=float)
                 mj_data.ctrl[:7] = q_cmd
                 # Smooth viz: glide the sim arm q_prev -> q_cmd across sub-frames so
                 # the display updates independently of the (slow) replan rate instead
@@ -544,6 +568,10 @@ def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
             theta = theta._replace(mean=new_mean)
 
     _write_record()
+
+    # Planning finished — return the arm to home.
+    print("Returning to home…")
+    _lifecycle("home")
 
 
 
@@ -586,7 +614,10 @@ def main():
     rt.add_argument("--local",       default="127.0.0.1", help="Local IP")
     rt.add_argument("--server-host", default="localhost",  help="Controller host")
     rt.add_argument("--cmd-port",    type=int, default=5555)
-    rt.add_argument("--method",         default="sir", choices=["sir", "ps", "mppi", "cem", "dial"])
+    rt.add_argument("--timeout",     type=float, default=TRIAL_TIMEOUT_S,
+                    help="seconds before abandoning a trial (default 300; use ~120 for stuck-prone baselines)")
+    rt.add_argument("--method",         default="sir",
+                    choices=["sir", "ps", "mppi", "biased_mppi", "cem", "biased_cem", "dial"])
     rt.add_argument("--temperature",    type=float, default=1.0, help="MPPI temperature")
     args = parser.parse_args()
 
@@ -632,7 +663,9 @@ def main():
 
     # Initial end-effector position
     init_xy = jnp.array(args.init_xy)
-    q0 = ik_from_cache(init_xy, ik_cache)
+    q0 = ik_solve(np.asarray(args.init_xy, float), np.asarray(HOME_Q))
+    if q0 is None:
+        raise RuntimeError(f"init xy {np.asarray(args.init_xy)} is unreachable")
     mj_data.qpos[:7] = np.array(q0)
     # ctrl is the ramp's starting reference in `dynamics`, so it must begin at the
     # current pose. Left at zeros, every rollout ramps from the zero configuration
@@ -763,17 +796,29 @@ def main():
 
             try:
                 rt_method = getattr(args, "method", "sir")
-                temperature = args.temperature if rt_method == "mppi" else None
-                active_ctrl = ctrl_mppi if rt_method in ("ps", "mppi") else ctrl
+                temperature = args.temperature if rt_method in ("mppi", "biased_mppi") else None
+                # Proposal (active_ctrl) is decoupled from the update rule: the
+                # custom object-centric proposal (`ctrl`) is used by our method and
+                # the biased-* baselines; the Gaussian proposal (`ctrl_mppi`) by the
+                # plain baselines. This isolates the proposal axis (plain vs biased)
+                # from the update axis (mppi/cem/sir), matching the sim sweep.
+                _custom_proposal = rt_method in ("sir", "biased_mppi", "biased_cem")
+                active_ctrl = ctrl if _custom_proposal else ctrl_mppi
                 run_realtime(active_ctrl, theta, mj_model, mj_data, ik_cache,
                              optitrack_client, robot_planner,
                              method=rt_method, temperature=temperature,
                              log_path=args.log_path,
                              trial=(trial if trial is not None else -1), seed=args.seed,
                              spec_init=((spec_init_xy[0], spec_init_xy[1], spec_init_yaw)
-                                        if use_spec else None))
+                                        if use_spec else None),
+                             timeout=args.timeout)
             finally:
                 robot_planner.close()
+        # Realtime trial done; the log record is already written and the robot
+        # planner closed above. Skip the native-stack teardown (NatNet client
+        # __exit__ + JAX/XLA + MuJoCo viewer) that segfaults on unwind by exiting
+        # immediately — nothing below this point needs to run for a realtime run.
+        os._exit(0)
     else:
         from pfmp.algorithm import cem_update, mppi_update
 
