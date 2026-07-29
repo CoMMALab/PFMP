@@ -24,7 +24,7 @@ from geom_tee import STEM_HALF, CAP_HALF, CAP_CTR
 import pfmp
 
 from ik_cache import (
-    IKCache, ik_from_cache, ik_solve, get_or_build_cache, HOME_Q,
+    IKCache, ik_from_cache, ik_solve, get_or_build_cache, reachable_r_center, HOME_Q,
     WORKSPACE_XY_MIN, WORKSPACE_XY_MAX, IK_CACHE_RESOLUTION, EE_HEIGHT,
 )
 from push_tee_controller import VELOCITY_SCALE
@@ -161,7 +161,8 @@ def dynamics(x: mjx.Data, u: jax.Array, th: PushParams, t: float) -> Tuple[mjx.D
     return x_next, u
 
 
-TEE_ANNULUS_CENTER = (0.25 + 0.78) / 2   # ideal radial distance from base
+TEE_ANNULUS_CENTER = 0.549   # reachable radial midpoint; main pins this exactly
+                             # from the cache via reachable_r_center()
 TEE_ANNULUS_WEIGHT = 0.3   # radial shaping toward TEE_ANNULUS_CENTER (keeps tee in recoverable band)
 
 def running_cost(x: mjx.Data, u: jax.Array, th: PushParams, t: float) -> jax.Array:
@@ -632,6 +633,10 @@ def main():
         resolution=args.cache_resolution,
         z=EE_HEIGHT,
     )
+    # Pin the annulus cost center to the arm's actual reachable midpoint, so the
+    # radial shaping tracks the robot geometry instead of a hand-picked radius.
+    global TEE_ANNULUS_CENTER
+    TEE_ANNULUS_CENTER = reachable_r_center(ik_cache)
 
     # With --trial set, tee_problem_gen is the single source of truth for
     # (start, goal): the placement view shows the start ghost to position the

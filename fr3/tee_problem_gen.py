@@ -28,10 +28,14 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 _XML = os.path.join(os.path.dirname(__file__), "..", "models", "mjx_t_push.xml")
 
-# Annulus band the tee is sampled from. Kept inside the cost's ideal radius
-# (TEE_ANNULUS_CENTER = 0.515) and outside ik_cache.WORKSPACE_R_MIN = 0.33.
-SAMPLE_R_MIN   = 0.42
-SAMPLE_R_MAX   = 0.60
+# Annulus band the tee is sampled from, centered on the arm's reachable radial
+# midpoint (ik_cache.reachable_r_center) so the task lives in the middle of the
+# workspace. sample_problem pins the center from the passed cache; these are the
+# fallback values (center 0.549) when no cache is given.
+SAMPLE_R_HALFWIDTH = 0.09
+SAMPLE_R_CENTER    = 0.549
+SAMPLE_R_MIN   = SAMPLE_R_CENTER - SAMPLE_R_HALFWIDTH
+SAMPLE_R_MAX   = SAMPLE_R_CENTER + SAMPLE_R_HALFWIDTH
 SAMPLE_PHI_MAX = np.deg2rad(55.0)   # half-angle of the frontal wedge, about +x
 
 # Controlled start->goal separation.
@@ -42,9 +46,16 @@ GOAL_DYAW_MAX  = np.pi              # required yaw change, symmetric
 REACHABLE_THRESH = 0.75             # min reachable_frac for both endpoints
 _MAX_RESAMPLE    = 200
 
+# The arm descends to this EE position (matches push_tee_planner's --init-xy
+# default) before planning. Reject block inits whose actual footprint (T-shape
+# SDF, orientation-aware) sits under the descending end-effector — a fixed
+# bounding radius would carve out far too much of the workspace.
+EE_START      = np.array([0.4, 0.0])
+EE_CLEARANCE  = 0.03   # pusher radius (~0.02) + ~1cm margin from the tee surface
 
-def _on_annulus(rng):
-    r   = rng.uniform(SAMPLE_R_MIN, SAMPLE_R_MAX)
+
+def _on_annulus(rng, r_min, r_max):
+    r   = rng.uniform(r_min, r_max)
     phi = rng.uniform(-SAMPLE_PHI_MAX, SAMPLE_PHI_MAX)
     return np.array([r * np.cos(phi), r * np.sin(phi)])
 
@@ -64,13 +75,19 @@ def sample_problem(seed, trial, cache=None):
     rng = np.random.default_rng([seed, trial])
 
     frac = None
+    r_min, r_max = SAMPLE_R_MIN, SAMPLE_R_MAX
     if cache is not None:
         import jax.numpy as jnp
-        from ik_cache import reachable_frac
+        from ik_cache import reachable_frac, reachable_r_center
         frac = lambda xy: float(reachable_frac(jnp.asarray(xy), cache))
+        # Pin the sampling band to the arm's reachable radial midpoint so the
+        # task sits in the center of the workspace, tracking the same geometry
+        # as the annulus cost in push_tee_planner.
+        rc = reachable_r_center(cache)
+        r_min, r_max = rc - SAMPLE_R_HALFWIDTH, rc + SAMPLE_R_HALFWIDTH
 
     for _ in range(_MAX_RESAMPLE):
-        init_xy = _on_annulus(rng)
+        init_xy = _on_annulus(rng, r_min, r_max)
         d       = rng.uniform(PUSH_DIST_MIN, PUSH_DIST_MAX)
         heading = rng.uniform(-np.pi, np.pi)
         goal_xy = init_xy + d * np.array([np.cos(heading), np.sin(heading)])
@@ -80,7 +97,7 @@ def sample_problem(seed, trial, cache=None):
         r = np.linalg.norm(goal_xy)
         if r < 1e-9:
             continue
-        goal_xy = goal_xy * (np.clip(r, SAMPLE_R_MIN, SAMPLE_R_MAX) / r)
+        goal_xy = goal_xy * (np.clip(r, r_min, r_max) / r)
         if np.linalg.norm(goal_xy - init_xy) < PUSH_DIST_MIN * 0.6:
             continue
 
@@ -89,6 +106,12 @@ def sample_problem(seed, trial, cache=None):
             continue
 
         init_yaw = rng.uniform(-np.pi, np.pi)
+        # Orientation-aware: reject if the descending EE lands within EE_CLEARANCE
+        # of the actual T-shape surface at this init pose (uses the tee SDF, not a
+        # bounding radius, so only genuinely-fouled placements are dropped).
+        from geom_tee import sdf_world
+        if sdf_world(EE_START, init_xy, init_yaw) < EE_CLEARANCE:
+            continue
         goal_yaw = _wrap(init_yaw + rng.uniform(-GOAL_DYAW_MAX, GOAL_DYAW_MAX))
         return init_xy, float(init_yaw), goal_xy, float(goal_yaw)
 
@@ -156,19 +179,35 @@ def main():
     ax.set_title("Place tee at ghost  |  orange=live  |  gray=target init  |  blue=sampling region")
     ax.grid(True, alpha=0.3)
 
-    # Sampling annulus (axes swapped: y→x-axis, x→y-axis)
-    arc = np.linspace(-SAMPLE_PHI_MAX, SAMPLE_PHI_MAX, 200)
-    for r in (SAMPLE_R_MIN, SAMPLE_R_MAX):
-        ax.plot(r * np.sin(arc), r * np.cos(arc),
-                color="steelblue", lw=1.5, alpha=0.7, zorder=2)
-    ax.fill(np.concatenate([SAMPLE_R_MAX * np.sin(arc), SAMPLE_R_MIN * np.sin(arc[::-1])]),
-            np.concatenate([SAMPLE_R_MAX * np.cos(arc), SAMPLE_R_MIN * np.cos(arc[::-1])]),
-            color="steelblue", alpha=0.12, label="Sampling annulus", zorder=2)
-
     cache = None
     if not args.no_mask:
         from ik_cache import get_or_build_cache
         cache = get_or_build_cache()
+
+    # IK reachable region (axes swapped: y→x-axis, x→y-axis). Shaded underneath
+    # everything so the sampling band and ghosts read against the true workspace.
+    r_min, r_max = SAMPLE_R_MIN, SAMPLE_R_MAX
+    if cache is not None:
+        from ik_cache import reachable_r_center
+        reach = np.asarray(cache.reachable) > 0.5
+        xs = np.linspace(float(cache.xy_min[0]), float(cache.xy_max[0]), reach.shape[0])
+        ys = np.linspace(float(cache.xy_min[1]), float(cache.xy_max[1]), reach.shape[1])
+        X, Y = np.meshgrid(xs, ys, indexing="ij")
+        ax.contourf(Y, X, reach.astype(float), levels=[0.5, 1.5],
+                    colors=["darkseagreen"], alpha=0.18, zorder=0)
+        ax.contour(Y, X, reach.astype(float), levels=[0.5],
+                   colors="darkseagreen", linewidths=1.2, alpha=0.6, zorder=1)
+        rc = reachable_r_center(cache)
+        r_min, r_max = rc - SAMPLE_R_HALFWIDTH, rc + SAMPLE_R_HALFWIDTH
+
+    # Sampling annulus (axes swapped: y→x-axis, x→y-axis)
+    arc = np.linspace(-SAMPLE_PHI_MAX, SAMPLE_PHI_MAX, 200)
+    for r in (r_min, r_max):
+        ax.plot(r * np.sin(arc), r * np.cos(arc),
+                color="steelblue", lw=1.5, alpha=0.7, zorder=2)
+    ax.fill(np.concatenate([r_max * np.sin(arc), r_min * np.sin(arc[::-1])]),
+            np.concatenate([r_max * np.cos(arc), r_min * np.cos(arc[::-1])]),
+            color="steelblue", alpha=0.12, label="Sampling annulus", zorder=2)
 
     init_xy, init_yaw, goal_xy, goal_yaw = sample_problem(args.seed, args.trial, cache)
     print(f"Trial {args.trial} (seed {args.seed}):")

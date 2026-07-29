@@ -361,6 +361,21 @@ def build_ik_cache(xy_min, xy_max, resolution=IK_CACHE_RESOLUTION,
                    reachable=jnp.asarray(reach, dtype=jnp.float32))
 
 
+def reachable_r_center(cache: IKCache) -> float:
+    """Radial midpoint of the reachable region: (min_reachable_r + max_reachable_r)/2.
+
+    The natural 'center' of the arm's workspace, equidistant from the near-base
+    and far-reach boundaries. Used to pin the task's annulus cost and sampling
+    band to the robot's actual geometry rather than hand-picked radii.
+    """
+    r = np.asarray(cache.reachable) > 0.5
+    xs = np.linspace(float(cache.xy_min[0]), float(cache.xy_max[0]), r.shape[0])
+    ys = np.linspace(float(cache.xy_min[1]), float(cache.xy_max[1]), r.shape[1])
+    X, Y = np.meshgrid(xs, ys, indexing="ij")
+    rad = np.hypot(X, Y)[r]
+    return float((rad.min() + rad.max()) / 2)
+
+
 def validate_cache(cache: IKCache) -> bool:
     """Report the worst neighbour jump among *reachable* cell pairs only —
     discontinuities across the unreachable mask boundary are expected and handled
