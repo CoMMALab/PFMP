@@ -64,40 +64,72 @@ def ess(costs: jax.Array) -> jax.Array:
 
 def dial_sigma(i: int, h: int, sigma_max: float, N: int, H: int,
                beta1: float, beta2: float) -> float:
-    """DIAL-MPC annealing schedule (Eq. 7): σ_{i,h} = σ_max · exp(−(N−i)/(β₁N) − (H−h)/(β₂H))."""
+    """DIAL-MPC annealing schedule (matches Hydrax `DIAL.sample_knots`):
+    σ_{i,h} = σ_max · exp(−(N−i)/(β₁N) − (H−1−h)/(β₂H)). The (H−1−h) term (not
+    H−h) is what lets the terminal knot sample at the full σ_max, exp(0)."""
     import math
-    return sigma_max * math.exp(-(N - i) / (beta1 * N) - (H - h) / (beta2 * H))
+    return sigma_max * math.exp(-(N - i) / (beta1 * N) - (H - 1 - h) / (beta2 * H))
 
 
-def ps_update(theta: PyTree, trajs: jax.Array, costs: jax.Array):
-    best_idx = jnp.argmin(jnp.sum(costs, axis=1))
-    new_mean = jax.tree.map(lambda u: u[best_idx], trajs)
-    theta = theta._replace(mean = new_mean)
-    return theta, costs[:,best_idx]
+# ── Update rules (U) — uniform signature ─────────────────────────────────────
+# Every update rule is  update(theta, trajs, costs, *hyperparams) -> (theta, aux)
+# with the SAME convention:
+#     trajs : PyTree, each leaf (P, K, ...)   particles × knots × action
+#     costs : (P, K)                          per-knot cost, particle-major
+# Reducing the knot axis (summing to a total return) is each rule's own job, so
+# call sites just pass what run_sir/run_sis return — no transpose, no pre-sum.
 
-# Model Predictive Path Integral
-def mppi_update(theta: PyTree, trajs: jax.Array, costs: jax.Array, temperature: float):
-    # Numerically stable softmax: shift by the per-row min cost so exp() cannot
-    # underflow to all-zeros (which would make the normalization 0/0 = NaN). The
-    # shift is a constant factor that cancels in the normalization, so this is
-    # mathematically identical to exp(-costs/temperature) where that is finite.
-    costs = costs - jnp.min(costs, axis=1, keepdims=True)
-    weights = jnp.exp(-costs / temperature)
-    weights = weights / jnp.sum(weights, axis=1, keepdims=True)
-    new_mean = jax.tree.map(lambda u: jnp.sum(u * weights[:, :, None], axis=1), trajs)
-    theta = theta._replace(mean=new_mean)
-    return theta, jnp.sum(costs * weights, axis=1)
+def _check_update_shapes(trajs, costs):
+    """Runtime contract shared by all update rules: costs (P, K), trajs leaves
+    (P, K, ...). Shapes are static under jit/vmap, so this fails at trace time on
+    a mismatched call instead of silently reducing the wrong axis."""
+    assert costs.ndim == 2, f"costs must be (P, K); got {costs.shape}"
+    P, K = costs.shape
+    for u in jax.tree.leaves(trajs):
+        assert u.ndim >= 2 and u.shape[0] == P and u.shape[1] == K, (
+            f"trajs leaf {u.shape} inconsistent with costs (P={P}, K={K})")
 
-# Cross-Entropy Method
-def cem_update(theta: PyTree, trajs: jax.Array, costs: jax.Array, elite_frac: float):
-    num_elite = int(elite_frac * trajs.shape[0])
-    elite_idxs = jnp.argsort(costs, axis=0)[:num_elite]
-    new_mean = jax.tree.map(lambda u: jnp.mean(u[elite_idxs], axis=0), trajs)
+
+# Predictive Sampling: keep the single lowest-total-cost trajectory (MAP).
+def ps_update(theta: PyTree, trajs: PyTree, costs: jax.Array, *_):
+    _check_update_shapes(trajs, costs)
+    best = jnp.argmin(jnp.sum(costs, axis=1))             # total return per particle
+    new_mean = jax.tree.map(lambda u: u[best], trajs)
+    return theta._replace(mean=new_mean), costs[best]     # (K,) costs of the chosen traj
+
+
+# Model Predictive Path Integral: softmax over trajectories by TOTAL return, one
+# weight per trajectory applied to every knot. Stable softmax (shift by the min
+# total) so exp() cannot underflow to all-zeros -> 0/0 = NaN.
+def mppi_update(theta: PyTree, trajs: PyTree, costs: jax.Array, temperature: float):
+    _check_update_shapes(trajs, costs)
+    total = jnp.sum(costs, axis=1)                        # (P,) total return
+    total = total - jnp.min(total)
+    weights = jnp.exp(-total / temperature)
+    weights = weights / jnp.sum(weights)                  # (P,) one weight per trajectory
+    new_mean = jax.tree.map(lambda u: jnp.sum(u * weights[:, None, None], axis=0), trajs)
+    return theta._replace(mean=new_mean), weights
+
+
+# Cross-Entropy Method: mean (and std) of the lowest-total-cost elite fraction.
+def cem_update(theta: PyTree, trajs: PyTree, costs: jax.Array, elite_frac: float,
+               stdev_floor: float = 0.0):
+    _check_update_shapes(trajs, costs)
+    total = jnp.sum(costs, axis=1)                        # (P,) total return
+    num_elite = max(1, int(elite_frac * total.shape[0]))
+    elite = jnp.argsort(total)[:num_elite]
+    new_mean = jax.tree.map(lambda u: jnp.mean(u[elite], axis=0), trajs)
     updates = {"mean": new_mean}
-    if hasattr(theta, "du_stdev"):
-        updates["du_stdev"] = jax.tree.map(lambda u: jnp.std(u[elite_idxs], axis=0), trajs)
-    theta = theta._replace(**updates)
-    return theta, jnp.mean(costs[elite_idxs], axis=0)
+    # Refit the sampling covariance from the elites — the "CE" in CEM, and the
+    # mechanism that lets the distribution concentrate. Only when `stdev` is
+    # per-knot: the elite std is (K, ...), which a scalar-stdev proposal cannot
+    # consume. `stdev_floor` guards the degenerate case where every elite is
+    # identical (controls are projected onto a discrete reachable grid, so exact
+    # ties happen) and the std collapses to zero, freezing exploration.
+    if hasattr(theta, "stdev") and jnp.ndim(theta.stdev) > 0:
+        updates["stdev"] = jax.tree.map(
+            lambda u: jnp.maximum(jnp.std(u[elite], axis=0), stdev_floor), trajs)
+    return theta._replace(**updates), jnp.mean(total[elite])
 
 # Mujoco XLA helper functions
 def mjx_hydrax_cost(task: Task):
@@ -210,9 +242,9 @@ class PFMP(NamedTuple):
 
         Unlike `transition_model`/`unroll`, this proposes nothing and samples
         nothing: it is the forward model of an already-chosen plan (e.g.
-        `theta.mean`). Returns the *dense* trajectory — every integration substep,
-        x0 first — so the leaves have shape (num_intervals*steps_per_knot + 1, ...).
-        Handy for scoring, analysis, or visualising what a plan is predicted to do.
+        `theta.mean`). Returns the *dense* trajectory. Every integration substep,
+        starting at x0. The leaves have shape (num_intervals*steps_per_knot + 1, ...).
+        Use for scoring, analysis, or visualising what a plan is predicted to do.
 
         us: (num_knots, action_dim) control knots.
         """

@@ -38,6 +38,12 @@ dependencies = [
 # Vendored analytic Franka IK (GeoFIK pybind wrapper); builds the C++ ext in place.
 geofikinpy = { path = "fr3/geofikinpy_src", editable = true }
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: compiles an MJX rollout (~10s each); deselect with -m 'not slow'",
+]
+
 [tool.setuptools.packages.find]
 # Only include the pfmp package, exclude experiments
 include = ["pfmp*"]

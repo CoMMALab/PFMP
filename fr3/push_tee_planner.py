@@ -55,7 +55,7 @@ class PushParams(NamedTuple):
     goal_angle: jax.Array
     pos_weight: float
     angle_weight: float
-    u_stdev: float
+    stdev: float
     gripper_site_id: int
     approach_weight: float = 0.0
 
@@ -125,6 +125,12 @@ PUSH_OVERSHOOT  = 1.0
 PUSH_RADIUS     = 0.16  # just outside tee cap half-extent
 ORBITAL_Y_OFFSET = 0.04  # metres up the tee stem for the orbital centre
 
+# Lower bound on CEM's refitted covariance. Controls are projected onto a
+# discrete reachable grid, so elites can coincide exactly and the elite std can
+# collapse to 0, which would freeze the proposal. This is a degeneracy guard, not
+# a tuned exploration parameter.
+CEM_STDEV_FLOOR = 0.005
+
 
 # Franky drives the arm with Ruckig, which ramps the *joint* reference under
 # velocity/acceleration/jerk limits rather than jumping to the target. Commanding
@@ -188,13 +194,32 @@ def terminal_cost(x: mjx.Data, th: PushParams) -> jax.Array:
     return 10.0 * (th.pos_weight * err_pos + aw * err_angle)
 
 
+def _sigma_at(th: PushParams, idx) -> jax.Array:
+    """Sampling noise for knot `idx`.
+
+    Supports both conventions: a scalar `stdev` (fixed-noise methods — PS, MPPI,
+    SIR/SIS, and DIAL, which overwrites it per annealing level) and a per-knot
+    array of shape (num_knots, 2) (CEM, whose covariance is refit from the elites
+    each replan). `jnp.ndim` is static, so this costs nothing under jit and the
+    scalar path is bit-identical to reading `th.stdev` directly.
+    """
+    return th.stdev if jnp.ndim(th.stdev) == 0 else th.stdev[idx]
+
+
+def _knot_index(t: float) -> jax.Array:
+    """Knot whose interval contains time `t` (shared by the proposals)."""
+    step_len = HORIZON / (NUM_KNOTS - 1)
+    return jnp.clip(jnp.floor(t / step_len).astype(jnp.int32) + 1, 0, NUM_KNOTS - 1)
+
+
 def init_control(key: jax.Array, x: mjx.Data, th: PushParams) -> jax.Array:
     """Same mixture as `proposal`, seeded from the warm-started mean.
 
     The orbital branch is anchored to the tee rather than the mean, so particles
     stay feasible even if the mean has drifted outside the reachable set.
     """
-    return _project_reachable(_sample_mixture(key, x, th.mean[0], th), th)
+    return _project_reachable(
+        _sample_mixture(key, x, th.mean[0], th, _sigma_at(th, 0)), th)
 
 
 def mppi_proposal(key: jax.Array, _x: mjx.Data, _u: jax.Array, th: PushParams, t: float) -> jax.Array:
@@ -203,10 +228,9 @@ def mppi_proposal(key: jax.Array, _x: mjx.Data, _u: jax.Array, th: PushParams, t
     Snapped to the reachable mask, same as `proposal`. This is a feasibility
     constraint, not a task-informed bias, so every method gets it.
     """
-    step_len = HORIZON / (NUM_KNOTS - 1)
-    idx = jnp.clip(jnp.floor(t / step_len).astype(jnp.int32) + 1, 0, NUM_KNOTS - 1)
+    idx = _knot_index(t)
     return _project_reachable(
-        th.mean[idx] + jax.random.normal(key, (2,)) * th.u_stdev, th)
+        th.mean[idx] + jax.random.normal(key, (2,)) * _sigma_at(th, idx), th)
 
 
 def _project_reachable(u: jax.Array, th: PushParams) -> jax.Array:
@@ -230,8 +254,12 @@ def _project_reachable(u: jax.Array, th: PushParams) -> jax.Array:
     return jnp.array([X.reshape(-1)[flat], Y.reshape(-1)[flat]])
 
 
-def _sample_mixture(key: jax.Array, x: mjx.Data, u: jax.Array, th: PushParams) -> jax.Array:
-    """One draw from the three-way mixture: directed / orbital / random walk."""
+def _sample_mixture(key: jax.Array, x: mjx.Data, u: jax.Array, th: PushParams,
+                    sigma: jax.Array) -> jax.Array:
+    """One draw from the three-way mixture: directed / orbital / random walk.
+
+    `sigma` is the noise scale for this knot (see `_sigma_at`), passed in rather
+    than read off `th` so CEM's per-knot fitted covariance works here too."""
     key_mix, key_a, key_b, key_ang = jax.random.split(key, 4)
     t_xy  = x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 2]
     t_yaw = x.qpos[T_QPOS_OFFSET + 2]
@@ -241,7 +269,7 @@ def _sample_mixture(key: jax.Array, x: mjx.Data, u: jax.Array, th: PushParams) -
     direction = t_xy - u
     dist      = jnp.linalg.norm(direction) + 1e-7
     directed  = u + (direction / dist) * (jnp.minimum(dist, STEP_LEN_VEL) * PUSH_OVERSHOOT)
-    directed  = directed + jax.random.normal(key_a, (2,)) * th.u_stdev
+    directed  = directed + jax.random.normal(key_a, (2,)) * sigma
 
     # Branch 2: orbit around a point shifted up the tee stem (body-frame +y).
     stem_up     = jnp.array([-jnp.sin(t_yaw), jnp.cos(t_yaw)])
@@ -250,7 +278,7 @@ def _sample_mixture(key: jax.Array, x: mjx.Data, u: jax.Array, th: PushParams) -
     orbital     = orbital_ctr + PUSH_RADIUS * jnp.array([jnp.cos(angle), jnp.sin(angle)])
 
     # Branch 3: random walk
-    random_loc = u + jax.random.normal(key_b, (2,)) * th.u_stdev * 2.0
+    random_loc = u + jax.random.normal(key_b, (2,)) * sigma * 2.0
 
     return jnp.where(r < PROPOSAL_MIX, directed,
            jnp.where(r < PROPOSAL_MIX + ORBITAL_MIX, orbital, random_loc))
@@ -260,7 +288,8 @@ def proposal(key: jax.Array, x: mjx.Data, u: jax.Array, th: PushParams, t: float
     """Three-way mixture, resampled until the draw lands in the reachable mask, so
     the IK-resolved joint motion tracks the intended EE path instead of arcing
     across a wrist-flip / unreachable cell."""
-    return _project_reachable(_sample_mixture(key, x, u, th), th)
+    return _project_reachable(
+        _sample_mixture(key, x, u, th, _sigma_at(th, _knot_index(t))), th)
 
 
 # ===============================
@@ -379,39 +408,61 @@ def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
     #   proposal axis: custom object-centric (sir, biased_*) vs Gaussian (plain)
     #   update axis:   mppi / cem / ps / dial / sir  (the biased_ prefix only
     #                  swaps the proposal; the update rule is its plain counterpart)
-    axis_proposal = "custom" if method in ("sir", "biased_mppi", "biased_cem") else "gaussian"
+    axis_proposal = "custom" if method in ("sir", "sis", "biased_mppi", "biased_cem") else "gaussian"
     base_method = method[len("biased_"):] if method.startswith("biased_") else method
     axis_update = base_method
+    is_dial = False   # dial re-samples per annealing level, handled in the loop
+    needs_per_knot_stdev = False   # CEM refits a per-knot covariance; others use a scalar
     if base_method == "mppi":
         replan = lambda key, data, th: ctrl.run_sis(key, data, th)
         def _mppi_update(th, tr, co):
             import jax.numpy as jnp
             finite = jnp.isfinite(jnp.sum(co, axis=1))
             co = jnp.where(finite[:, None], co, jnp.zeros_like(co))
-            return mppi_update(th, tr.transpose(1, 0, 2), co.T, max(float(temperature), 1e-6))
+            return mppi_update(th, tr, co, max(float(temperature), 1e-6))
         update = _mppi_update
     elif base_method == "ps":
+        replan = lambda key, data, th: ctrl.run_sis(key, data, th)
+        update = ps_update
+    elif base_method == "sis":
+        # SIR with resampling turned off (ρ=0): same object proposal (via
+        # active_ctrl) and same ps_update as sir, only run_sis vs run_sir. The
+        # clean single-axis ablation for the effect of resampling.
         replan = lambda key, data, th: ctrl.run_sis(key, data, th)
         update = ps_update
     elif base_method == "cem":
         from pfmp.algorithm import cem_update
         num_elites = max(1, PARTICLES // 10)
         replan = lambda key, data, th: ctrl.run_sis(key, data, th)
-        update = lambda th, tr, co: cem_update(th, tr, jnp.sum(co, axis=1),
-                                               elite_frac=num_elites / PARTICLES)
+        # CEM refits both the mean and the covariance from the elites. The
+        # covariance is per-knot, so theta.stdev is broadcast to (num_knots, 2)
+        # below; it then persists and adapts across replans, which is where CEM's
+        # concentration comes from under receding-horizon control.
+        update = lambda th, tr, co: cem_update(th, tr, co,
+                                               elite_frac=num_elites / PARTICLES,
+                                               stdev_floor=CEM_STDEV_FLOOR)
+        needs_per_knot_stdev = True
     elif base_method == "dial":
         from pfmp import dial_sigma
-        replan = lambda key, data, th: ctrl.run_sis(key, data, th)
-        def _dial_update(th, tr, co):
-            theta_out = th
-            for i in range(5, 0, -1):
-                sigma = float(np.mean([dial_sigma(i, h, th.u_stdev, 5, NUM_KNOTS, 1.0, 1.0)
+        DIAL_N, DIAL_B1, DIAL_B2 = 5, 1.0, 1.0
+        is_dial = True
+        replan = lambda key, data, th: ctrl.run_sis(key, data, th)  # for JIT warm-up
+        update = None   # dial drives its own re-sampling in dial_step below
+
+        def dial_step(key, data, th):
+            """One DIAL-MPC replan: N annealing levels, each re-samples the
+            proposal at the shrinking σ (dial_sigma) around the current mean and
+            folds it in with an MPPI update. σ is now actually applied — it scales
+            the sampling noise (th.stdev), which is the point of DIAL."""
+            base = float(th.stdev)
+            for i in range(DIAL_N, 0, -1):
+                sigma = float(np.mean([dial_sigma(i, h, base, DIAL_N, NUM_KNOTS, DIAL_B1, DIAL_B2)
                                        for h in range(NUM_KNOTS)]))
-                total = jnp.sum(co, axis=1)
-                temp = float(jnp.maximum(jnp.std(total), 1e-6))
-                theta_out, _ = mppi_update(theta_out, tr.transpose(1, 0, 2), co.T, temp)
-            return theta_out, jnp.zeros(PARTICLES)
-        update = _dial_update
+                key, sub = jax.random.split(key)
+                trajs, costs = ctrl.run_sis(sub, data, th._replace(stdev=sigma))
+                temp = float(jnp.maximum(jnp.std(jnp.sum(costs, axis=1)), 1e-6))
+                th, _ = mppi_update(th, trajs, costs, temp)
+            return th
     else:  # sir
         replan = lambda key, data, th: ctrl.run_sir(key, data, th)
         update = ps_update
@@ -424,6 +475,12 @@ def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
     if viz and not use_pred:
         print(f"[viz] method '{method}' uses a non-PFMP controller (no predict()); "
               f"showing the live tee without the plan prediction.")
+
+    # CEM's covariance is per-knot, so widen the scalar stdev to (num_knots, 2).
+    # Every other method keeps the scalar, for which _sigma_at is a no-op.
+    if needs_per_knot_stdev and jnp.ndim(theta.stdev) == 0:
+        theta = theta._replace(
+            stdev=jnp.full((NUM_KNOTS, 2), float(theta.stdev)))
 
     print("JIT warm-up…", end=" ", flush=True)
     mjx_data = mjx.put_data(mj_model, mj_data)
@@ -661,8 +718,12 @@ def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
                 mujoco.mj_forward(mj_model, mj_data_plan)
                 key, subkey = jax.random.split(key)
                 mjx_data = mjx.put_data(mj_model, mj_data_plan)
-                trajs, costs = replan(subkey, mjx_data, theta)
-                theta, _ = update(theta, trajs, costs)
+                if is_dial:
+                    # DIAL runs its own annealed re-sampling loop over one replan.
+                    theta = dial_step(subkey, mjx_data, theta)
+                else:
+                    trajs, costs = replan(subkey, mjx_data, theta)
+                    theta, _ = update(theta, trajs, costs)
                 if not np.all(np.isfinite(np.array(theta.mean))):
                     raise RuntimeError(
                         f"NaN in theta.mean after update (replan {rec['n_replans']}, "
@@ -783,7 +844,7 @@ def main():
     rt.add_argument("--timeout",     type=float, default=TRIAL_TIMEOUT_S,
                     help="seconds before abandoning a trial (default 300; use ~120 for stuck-prone baselines)")
     rt.add_argument("--method",         default="sir",
-                    choices=["sir", "ps", "mppi", "biased_mppi", "cem", "biased_cem", "dial"])
+                    choices=["sir", "sis", "ps", "mppi", "biased_mppi", "cem", "biased_cem", "dial"])
     rt.add_argument("--temperature",    type=float, default=1.0, help="MPPI temperature")
     rt.add_argument("--viz",            action="store_true",
                     help="launch the MuJoCo viewer: orange simulated tee follows the "
@@ -876,7 +937,7 @@ def main():
         goal_angle=float(goal_yaw),
         pos_weight=15.0,
         angle_weight=0.3,
-        u_stdev=0.025,
+        stdev=0.025,
         gripper_site_id=gripper_site_id,
     )
 
@@ -976,7 +1037,7 @@ def main():
                 # the biased-* baselines; the Gaussian proposal (`ctrl_mppi`) by the
                 # plain baselines. This isolates the proposal axis (plain vs biased)
                 # from the update axis (mppi/cem/sir), matching the sim sweep.
-                _custom_proposal = rt_method in ("sir", "biased_mppi", "biased_cem")
+                _custom_proposal = rt_method in ("sir", "sis", "biased_mppi", "biased_cem")
                 active_ctrl = ctrl if _custom_proposal else ctrl_mppi
                 run_realtime(active_ctrl, theta, mj_model, mj_data, ik_cache,
                              optitrack_client, robot_planner,
@@ -1001,7 +1062,7 @@ def main():
 
         if args.algorithm == "cem":
             num_elites = args.num_elites
-            update_fn = lambda th, tr, co: cem_update(th, tr, jnp.sum(co, axis=1),
+            update_fn = lambda th, tr, co: cem_update(th, tr, co,
                                                        elite_frac=num_elites / PARTICLES)
         elif args.algorithm == "dial":
             from pfmp import dial_sigma
@@ -1014,11 +1075,11 @@ def main():
             def dial_update(th, tr, co):
                 theta_out = th
                 for i in range(n_inner, 0, -1):
-                    sigma = float(np.mean([dial_sigma(i, h, th.u_stdev, n_inner, NUM_KNOTS, beta1, beta2)
+                    sigma = float(np.mean([dial_sigma(i, h, th.stdev, n_inner, NUM_KNOTS, beta1, beta2)
                                            for h in range(NUM_KNOTS)]))
                     total = jnp.sum(co, axis=1)
                     temp = float(jnp.maximum(jnp.std(total), 1e-6)) * temperature
-                    theta_out, _ = mppi_update(theta_out, tr.transpose(1, 0, 2), co.T, temp)
+                    theta_out, _ = mppi_update(theta_out, tr, co, temp)
                 return theta_out, jnp.zeros(PARTICLES)
             update_fn = dial_update
 

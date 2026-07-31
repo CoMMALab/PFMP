@@ -613,13 +613,13 @@ def run_benchmark_fast(dataset_dir, urdf_path='models/panda_spherized.urdf', n_p
     @jax.jit
     def run_mppi(key, q_start, theta):
         trajs, costs = pfmp_base.run_sis(key, q_start, theta)
-        th, _ = mppi_update(theta, trajs.transpose(1, 0, 2), costs.T, MPPI_TEMP)
+        th, _ = mppi_update(theta, trajs, costs, MPPI_TEMP)
         return th.mean
 
     @jax.jit
     def run_cem(key, q_start, theta):
         trajs, costs = pfmp_base.run_sis(key, q_start, theta)
-        th, _ = cem_update(theta, trajs, jnp.sum(costs, axis=1), CEM_EF)
+        th, _ = cem_update(theta, trajs, costs, CEM_EF)
         return th.mean
 
     # Biased-MPPI / Biased-CEM: the custom (goal-informed) proposal with the
@@ -628,13 +628,13 @@ def run_benchmark_fast(dataset_dir, urdf_path='models/panda_spherized.urdf', n_p
     @jax.jit
     def run_biased_mppi(key, q_start, theta):
         trajs, costs = pfmp.run_sis(key, q_start, theta)
-        th, _ = mppi_update(theta, trajs.transpose(1, 0, 2), costs.T, BMPPI_TEMP)
+        th, _ = mppi_update(theta, trajs, costs, BMPPI_TEMP)
         return th.mean
 
     @jax.jit
     def run_biased_cem(key, q_start, theta):
         trajs, costs = pfmp.run_sis(key, q_start, theta)
-        th, _ = cem_update(theta, trajs, jnp.sum(costs, axis=1), BCEM_EF)
+        th, _ = cem_update(theta, trajs, costs, BCEM_EF)
         return th.mean
 
     # method -> (run_fn, perturbation u_stdev)

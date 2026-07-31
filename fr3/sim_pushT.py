@@ -64,17 +64,17 @@ def make_update(name, temperature, num_elites, particles):
         def _u(t, tr, c):
             finite = jnp.isfinite(jnp.sum(c, axis=1))
             c = jnp.where(finite[:, None], c, jnp.zeros_like(c))
-            return mppi_update(t, tr.transpose(1, 0, 2), c.T, max(temperature, 1e-6))
+            return mppi_update(t, tr, c, max(temperature, 1e-6))
         return _u
     if name == "cem":
         ef = num_elites / particles
-        return lambda t, tr, c: cem_update(t, tr, jnp.sum(c, axis=1), elite_frac=ef)
+        return lambda t, tr, c: cem_update(t, tr, c, elite_frac=ef)
     if name == "dial":
         def _u(t, tr, c):
             th = t
             for _ in range(5):                       # annealed MPPI passes
                 temp = jnp.maximum(jnp.std(jnp.sum(c, axis=1)), 1e-6)
-                th, _w = mppi_update(th, tr.transpose(1, 0, 2), c.T, temp)
+                th, _w = mppi_update(th, tr, c, temp)
             return th, jnp.zeros(particles)
         return _u
     raise ValueError(name)

@@ -185,7 +185,7 @@ def run_batch(  # noqa: PLR0912, PLR0915
             _pfmp_update = update_fn
         elif algorithm == "biased_mppi":
             def _pfmp_update(t, tr, c):
-                return mppi_update(t, tr.transpose(1, 0, 2), c.T, temperature)
+                return mppi_update(t, tr, c, temperature)
         else:
             _pfmp_update = ps_update
 
