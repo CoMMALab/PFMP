@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from pfmp.algorithm import ps_update, mppi_update, cem_update
+from pfmp.algorithm import ps_update, mppi_update, cem_update, sample_update
 
 
 class Theta(NamedTuple):
@@ -35,6 +35,15 @@ def _rand(shape, seed=0, lo=0.0, hi=1.0):
 
 def _zeros_mean(K, A):
     return Theta(mean=jnp.zeros((K, A)))
+
+
+def _hp(update):
+    """The hyperparameters each rule takes after (theta, trajs, costs)."""
+    if update is ps_update:
+        return ()
+    if update is sample_update:
+        return (jax.random.key(0),)          # Piche-style draw needs a key
+    return (1.0,)                            # mppi temperature / cem elite_frac
 
 
 # ─────────────────────────── ps_update ───────────────────────────
@@ -138,6 +147,18 @@ def test_mppi_update_weights_whole_trajectory_by_total_return():
     assert w.shape == (P,)                       # one weight per trajectory, not per knot
 
 
+@pytest.mark.parametrize("update", [ps_update, mppi_update, cem_update, sample_update])
+def test_updates_handle_scalar_action_spaces(update):
+    """A scalar action gives (P, K) traj leaves, not (P, K, A). A rank-3
+    broadcast would silently produce (P, P, K) rather than erroring."""
+    P, K = 6, 4
+    trajs = _rand((P, K), seed=9)
+    costs = _rand((P, K), seed=10)
+    hp = _hp(update)
+    th, _ = update(Theta(mean=jnp.zeros(K)), trajs, costs, *hp)
+    assert th.mean.shape == (K,), f"{update.__name__} gave {th.mean.shape}"
+
+
 def test_mppi_update_stable_softmax_no_nan_on_large_costs():
     P, K, A = 5, 3, 1
     trajs = _rand((P, K, A), seed=6)
@@ -152,25 +173,83 @@ def test_mppi_update_mean_shape():
     assert th.mean.shape == (K, A)
 
 
+# ─────────────────────────── sample_update ───────────────────────────
+# Piché et al.: draw from the weighted particle set instead of summarising it.
+# It is the stochastic counterpart of ps_update (MAP), so it must return an
+# actual particle — never a blend — and must collapse onto the MAP as T -> 0.
+
+def test_sample_update_returns_an_actual_particle():
+    P, K, A = 8, 3, 2
+    trajs = _rand((P, K, A), seed=11)
+    costs = _rand((P, K), seed=12)
+    th, _ = sample_update(_zeros_mean(K, A), trajs, costs, jax.random.key(0))
+    rows = [np.asarray(trajs[i]) for i in range(P)]
+    assert any(np.allclose(np.asarray(th.mean), r) for r in rows), "not a particle"
+
+
+def test_sample_update_collapses_to_map_at_low_temperature():
+    """T -> 0 makes the categorical draw deterministic on the argmin, so it must
+    agree with ps_update."""
+    P, K, A = 10, 3, 2
+    trajs = _rand((P, K, A), seed=13)
+    costs = _rand((P, K), seed=14)
+    lo, _ = sample_update(_zeros_mean(K, A), trajs, costs, jax.random.key(3), 1e-6)
+    mapp, _ = ps_update(_zeros_mean(K, A), trajs, costs)
+    assert np.allclose(np.asarray(lo.mean), np.asarray(mapp.mean))
+
+
+def test_sample_update_is_stochastic_across_keys():
+    """High temperature -> near-uniform selection, so different keys must pick
+    different particles (otherwise the draw is ignoring the key)."""
+    P, K, A = 32, 3, 2
+    trajs = _rand((P, K, A), seed=15)
+    costs = _rand((P, K), seed=16)
+    picks = {tuple(np.asarray(
+        sample_update(_zeros_mean(K, A), trajs, costs, jax.random.key(s), 10.0)[0].mean.ravel()))
+        for s in range(25)}
+    assert len(picks) > 1
+
+
+def test_sample_update_favours_low_cost_particles():
+    """One clearly-best particle must dominate the draws."""
+    P, K, A = 12, 2, 1
+    trajs = _rand((P, K, A), seed=17)
+    costs = jnp.full((P, K), 100.0).at[7].set(0.0)      # particle 7 far better
+    hits = sum(
+        int(np.allclose(np.asarray(
+            sample_update(_zeros_mean(K, A), trajs, costs, jax.random.key(s))[0].mean),
+            np.asarray(trajs[7])))
+        for s in range(20))
+    assert hits == 20
+
+
+def test_sample_update_aux_is_the_chosen_particles_costs():
+    P, K, A = 6, 4, 2
+    trajs = _rand((P, K, A), seed=18)
+    costs = _rand((P, K), seed=19)
+    th, aux = sample_update(_zeros_mean(K, A), trajs, costs, jax.random.key(1))
+    assert aux.shape == (K,)
+
+
 # ─────────────────────────── shape contract ───────────────────────────
 # The runtime check must reject the exact mistake that caused the MPPI bug:
 # handing an update a transposed (K, P) cost array.
 
-@pytest.mark.parametrize("update", [ps_update, mppi_update, cem_update])
+@pytest.mark.parametrize("update", [ps_update, mppi_update, cem_update, sample_update])
 def test_update_rejects_transposed_costs(update):
     P, K, A = 4, 3, 2
     trajs = _rand((P, K, A))
     bad_costs = _rand((K, P))                    # transposed — must be caught
-    hp = (1.0,) if update is not ps_update else ()
+    hp = _hp(update)
     with pytest.raises(AssertionError):
         update(_zeros_mean(K, A), trajs, bad_costs, *hp)
 
 
-@pytest.mark.parametrize("update", [ps_update, mppi_update, cem_update])
+@pytest.mark.parametrize("update", [ps_update, mppi_update, cem_update, sample_update])
 def test_update_rejects_1d_costs(update):
     P, K, A = 4, 3, 2
     trajs = _rand((P, K, A))
-    hp = (1.0,) if update is not ps_update else ()
+    hp = _hp(update)
     with pytest.raises(AssertionError):
         update(_zeros_mean(K, A), trajs, _rand((P,)), *hp)   # pre-summed no longer allowed
 

@@ -443,26 +443,22 @@ def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
                                                stdev_floor=CEM_STDEV_FLOOR)
         needs_per_knot_stdev = True
     elif base_method == "dial":
-        from pfmp import dial_sigma
-        DIAL_N, DIAL_B1, DIAL_B2 = 5, 1.0, 1.0
+        from pfmp import dial_step as _dial_step
+        # DIAL_N=2 matches the canonical dial-mpc repo's steady-state Ndiffuse for
+        # its SIM config (their real-hardware deploy config drops to Ndiffuse=1,
+        # justified there by a much tighter compute budget than we have here: Go2
+        # locomotion needs replanning far faster than this ~1Hz push-T loop).
+        # DIAL_N_INIT=10 matches their Ndiffuse_init, used only on the trial's
+        # first replan (a one-time higher-fidelity solve from a cold start).
+        DIAL_N, DIAL_N_INIT, DIAL_B1, DIAL_B2 = 2, 10, 1.0, 1.0
         is_dial = True
         replan = lambda key, data, th: ctrl.run_sis(key, data, th)  # for JIT warm-up
-        update = None   # dial drives its own re-sampling in dial_step below
+        update = None   # dial drives its own re-sampling, via dial_step below
 
-        def dial_step(key, data, th):
-            """One DIAL-MPC replan: N annealing levels, each re-samples the
-            proposal at the shrinking σ (dial_sigma) around the current mean and
-            folds it in with an MPPI update. σ is now actually applied — it scales
-            the sampling noise (th.stdev), which is the point of DIAL."""
-            base = float(th.stdev)
-            for i in range(DIAL_N, 0, -1):
-                sigma = float(np.mean([dial_sigma(i, h, base, DIAL_N, NUM_KNOTS, DIAL_B1, DIAL_B2)
-                                       for h in range(NUM_KNOTS)]))
-                key, sub = jax.random.split(key)
-                trajs, costs = ctrl.run_sis(sub, data, th._replace(stdev=sigma))
-                temp = float(jnp.maximum(jnp.std(jnp.sum(costs, axis=1)), 1e-6))
-                th, _ = mppi_update(th, trajs, costs, temp)
-            return th
+        # Thin binding of the shared pfmp.dial_step to this ctrl/beta config, so
+        # the call site below reads the same as every other method's dispatch.
+        dial_step = lambda key, data, th, n=DIAL_N: _dial_step(
+            key, ctrl, data, th, n=n, beta1=DIAL_B1, beta2=DIAL_B2)
     else:  # sir
         replan = lambda key, data, th: ctrl.run_sir(key, data, th)
         update = ps_update
@@ -720,7 +716,10 @@ def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
                 mjx_data = mjx.put_data(mj_model, mj_data_plan)
                 if is_dial:
                     # DIAL runs its own annealed re-sampling loop over one replan.
-                    theta = dial_step(subkey, mjx_data, theta)
+                    # A higher-fidelity solve on the trial's first replan only,
+                    # matching canonical dial-mpc's Ndiffuse_init warm-up.
+                    theta = dial_step(subkey, mjx_data, theta,
+                                      n=DIAL_N_INIT if rec["n_replans"] == 1 else DIAL_N)
                 else:
                     trajs, costs = replan(subkey, mjx_data, theta)
                     theta, _ = update(theta, trajs, costs)

@@ -7,7 +7,7 @@ import jax.numpy as jnp
 from mujoco import mjx
 from dataclasses import dataclass
 from pfmp.interpolate import Jet2, hermite_spline
-from pfmp.algorithm import ps_update, mppi_update
+from pfmp.update import ps_update, mppi_update
 
 
 @dataclass

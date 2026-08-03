@@ -123,7 +123,7 @@ def make_theta(mjx_model, ik_cache, gripper_site_id, init_xy, goal_xy, goal_yaw)
         mean=mean, mjx_model=mjx_model, ik_cache=ik_cache,
         goal_xy=jnp.asarray(goal_xy, dtype=jnp.float32),
         goal_angle=float(goal_yaw),
-        pos_weight=15.0, angle_weight=0.3, u_stdev=0.025,
+        pos_weight=15.0, angle_weight=0.3, stdev=0.025,
         gripper_site_id=gripper_site_id,
     )
 

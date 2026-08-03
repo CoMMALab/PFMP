@@ -40,7 +40,7 @@ NUM_KNOTS = 6         # spline knots
 PARTICLES = 2048      # PFMP particles
 ESS_THRESH = 0.25
 
-N_REPLANS = 2      # closed-loop replan steps to precompute
+N_REPLANS = 12      # closed-loop replan steps to precompute
 STEPS_PER_REPLAN = 100  # sim steps between replans
 
 # 2D workspace — same as pushT_bench
@@ -398,10 +398,10 @@ def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REP
 
         if method in ('mppi', 'biased_mppi'):
             temperature = MPPI_TEMPERATURE  # fixed inverse-temperature (canonical MPPI), not adaptively scaled by cost std
-            theta, _ = mppi_update(theta, trajs.transpose(1, 0, 2), costs.T, max(temperature, 1e-6))
+            theta, _ = mppi_update(theta, trajs, costs, max(temperature, 1e-6))
         elif method in ('cem', 'biased_cem'):
-            # cem_update expects (particles,) total costs; selects top elite_frac fraction
-            theta, _ = cem_update(theta, trajs, jnp.sum(costs, axis=1),
+            # cem_update takes (P, K) per-knot costs and sums internally
+            theta, _ = cem_update(theta, trajs, costs,
                                   elite_frac=CEM_NUM_ELITES / particles)
         elif method == 'dial':
             for i_inner in range(DIAL_N_INNER, 0, -1):
@@ -415,7 +415,7 @@ def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REP
                 trajs_i, costs_i = ctrl.run_sis(subkey_i, x, theta_i)
                 total_costs_i = jnp.sum(costs_i, axis=1)
                 temperature = float(jnp.std(jnp.where(jnp.isfinite(total_costs_i), total_costs_i, 0.0))) * MPPI_TEMPERATURE
-                theta, _ = mppi_update(theta, trajs_i.transpose(1, 0, 2), costs_i.T, max(temperature, 1e-6))
+                theta, _ = mppi_update(theta, trajs_i, costs_i, max(temperature, 1e-6))
         elif method == 'ps':
             theta, _ = ps_update(theta, trajs, costs)
         else:
@@ -788,9 +788,9 @@ def main():
                     if method in ('mppi', 'biased_mppi'):
                         total = jnp.sum(costs, axis=1)
                         temp = jnp.maximum(jnp.std(total) * _mppi_temp, 1e-6)
-                        theta, _ = mppi_update(theta, trajs.transpose(1, 0, 2), costs.T, temp)
+                        theta, _ = mppi_update(theta, trajs, costs, temp)
                     elif method in ('cem', 'biased_cem'):
-                        theta, _ = cem_update(theta, trajs, jnp.sum(costs, axis=1),
+                        theta, _ = cem_update(theta, trajs, costs,
                                               elite_frac=_cem_elites / args.particles)
                     elif method == 'dial':
                         for i_inner in range(DIAL_N_INNER, 0, -1):
@@ -804,7 +804,7 @@ def main():
                             trajs_i, costs_i = ctrl.run_sis(subkey_i, x, theta_i)
                             total_i = jnp.sum(costs_i, axis=1)
                             temp = jnp.maximum(jnp.std(total_i) * _mppi_temp, 1e-6)
-                            theta, _ = mppi_update(theta, trajs_i.transpose(1, 0, 2), costs_i.T, temp)
+                            theta, _ = mppi_update(theta, trajs_i, costs_i, temp)
                     else:
                         theta, _ = ps_update(theta, trajs, costs)
 

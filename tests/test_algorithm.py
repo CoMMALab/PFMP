@@ -62,6 +62,10 @@ def _proposal(key, x, u, th, t):
     return u + jax.random.normal(key, (ACTION_DIM,)) * th.stdev
 
 
+def _rand(shape, seed=0, lo=0.0, hi=1.0):
+    return jnp.asarray(np.random.default_rng(seed).uniform(lo, hi, size=shape))
+
+
 def make_ctrl(interp="zoh", particles=PARTICLES, ess_thresh=0.5):
     return PFMP(
         _dynamics, _running_cost, _terminal_cost, _init, _proposal,
@@ -237,6 +241,74 @@ def test_high_threshold_always_resamples(key, x0, theta):
     _, ancestors, _, _ = make_ctrl(ess_thresh=10.0)._sir(key, x0, theta)
     identity = np.tile(np.arange(PARTICLES), (NUM_INTERVALS, 1))
     assert not np.array_equal(np.asarray(ancestors), identity)
+
+
+# ── choose_path / choose_paths: ancestor tracing ────────────────────────────
+# With resampling, particle i at knot K is not a single trajectory — it is a
+# lineage through the ancestor tree. These pin the backward walk, since an
+# off-by-one there silently returns a trajectory nobody sampled.
+
+def _lineage_fixture():
+    """states[k, p] = 10*k + p, so a value encodes (knot, particle) exactly."""
+    K, P = 3, 2
+    states = jnp.asarray([[10 * k + p for p in range(P)] for k in range(K)], float)
+    ancestors = jnp.asarray([[1, 0],     # step 0->1: p0's parent is p1, p1's is p0
+                             [0, 1]])    # step 1->2: p0's parent is p0, p1's is p1
+    return states, ancestors
+
+
+def test_choose_path_traces_ancestry_backward():
+    states, ancestors = _lineage_fixture()
+    # index 0: knot2 <- p0, knot1 <- p0 (anc[1,0]=0), knot0 <- p1 (anc[0,0]=1)
+    assert np.allclose(np.asarray(PFMP.choose_path(states, ancestors, 0)), [1., 10., 20.])
+    # index 1: knot2 <- p1, knot1 <- p1 (anc[1,1]=1), knot0 <- p0 (anc[0,1]=0)
+    assert np.allclose(np.asarray(PFMP.choose_path(states, ancestors, 1)), [0., 11., 21.])
+
+
+def test_choose_path_returns_knots_in_forward_order():
+    """The walk is backward but the result must read knot 0 -> K-1."""
+    states, ancestors = _lineage_fixture()
+    path = np.asarray(PFMP.choose_path(states, ancestors, 0))
+    assert path[0] // 10 == 0 and path[-1] // 10 == 2      # knot index ascends
+
+
+def test_choose_path_with_identity_ancestors_is_the_particles_own_column():
+    K, P = 4, 3
+    states = _rand((K, P, 2), seed=20)
+    ancestors = jnp.tile(jnp.arange(P), (K - 1, 1))        # nobody resampled
+    for i in range(P):
+        assert np.allclose(np.asarray(PFMP.choose_path(states, ancestors, i)),
+                           np.asarray(states[:, i]))
+
+
+def test_choose_path_shape(ctrl, key, x0, theta):
+    states, ancestors, _, _ = ctrl._sir(key, x0, theta)
+    assert PFMP.choose_path(states, ancestors, 0).shape == (NUM_KNOTS, ACTION_DIM)
+
+
+def test_choose_paths_equals_stacking_choose_path():
+    """The batched and single-index versions must agree, or ancestor tracing
+    differs depending on which entry point a caller reaches for."""
+    states, ancestors = _lineage_fixture()
+    batched = PFMP.choose_paths(states, ancestors, jnp.arange(states.shape[1]))
+    stacked = jnp.stack([PFMP.choose_path(states, ancestors, i)
+                         for i in range(states.shape[1])])
+    assert np.allclose(np.asarray(batched), np.asarray(stacked))
+
+
+def test_choose_path_rebuilds_namedtuple_states():
+    """`get_field_info` exists so the walk can rebuild structured states; this is
+    the path that uses it."""
+    class S(NamedTuple):
+        a: jax.Array
+        b: jax.Array
+    K, P = 3, 2
+    states = S(a=_rand((K, P), seed=21), b=_rand((K, P), seed=22))
+    ancestors = jnp.tile(jnp.arange(P), (K - 1, 1))
+    out = PFMP.choose_path(states, ancestors, 1)
+    assert isinstance(out, S)
+    assert np.allclose(np.asarray(out.a), np.asarray(states.a[:, 1]))
+    assert np.allclose(np.asarray(out.b), np.asarray(states.b[:, 1]))
 
 
 @pytest.mark.parametrize("n", [1, 3, PARTICLES])

@@ -8,6 +8,16 @@ from dataclasses import is_dataclass, fields
 from hydrax.task_base import Task
 from mujoco import mjx
 from .interpolate import hermite_interp1d, Jet1, Jet2, Jet3
+# Re-exported so existing `from pfmp.algorithm import ps_update` (etc.) call
+# sites keep working — the update rules (U) live in update.py. Four of them
+# (ps/sample/mppi/cem) are pure readouts over a completed rollout batch and
+# never call back into the PFMP sampler defined below; dial_step is the
+# exception (it drives its own re-sampling loop, taking the sampler as an
+# argument), included here too for a uniform import surface.
+from .update import (
+    ess, dial_sigma, _check_update_shapes,
+    ps_update, sample_update, mppi_update, cem_update, dial_step,
+)
 
 
 def get_field_info(x):
@@ -48,88 +58,6 @@ def get_field_info(x):
 
     raise TypeError(f"Unsupported state type: {type(x)}")
 
-# Predictive Sampling
-def ess(costs: jax.Array) -> jax.Array:
-    """Effective Sample Size normalised to [0, 1] from costs shaped (particles,) or (particles, horizon).
-
-    1.0 = uniform weights (maximum diversity).
-    1/N = fully degenerate (one particle dominates).
-    """
-    total = jnp.sum(costs, axis=1) if costs.ndim == 2 else costs
-    n = total.shape[0]
-    ws = jnp.exp(-(total - jnp.min(total)))
-    ps = ws / jnp.sum(ws)
-    return (1.0 / jnp.sum(ps ** 2)) / n
-
-
-def dial_sigma(i: int, h: int, sigma_max: float, N: int, H: int,
-               beta1: float, beta2: float) -> float:
-    """DIAL-MPC annealing schedule (matches Hydrax `DIAL.sample_knots`):
-    σ_{i,h} = σ_max · exp(−(N−i)/(β₁N) − (H−1−h)/(β₂H)). The (H−1−h) term (not
-    H−h) is what lets the terminal knot sample at the full σ_max, exp(0)."""
-    import math
-    return sigma_max * math.exp(-(N - i) / (beta1 * N) - (H - 1 - h) / (beta2 * H))
-
-
-# ── Update rules (U) — uniform signature ─────────────────────────────────────
-# Every update rule is  update(theta, trajs, costs, *hyperparams) -> (theta, aux)
-# with the SAME convention:
-#     trajs : PyTree, each leaf (P, K, ...)   particles × knots × action
-#     costs : (P, K)                          per-knot cost, particle-major
-# Reducing the knot axis (summing to a total return) is each rule's own job, so
-# call sites just pass what run_sir/run_sis return — no transpose, no pre-sum.
-
-def _check_update_shapes(trajs, costs):
-    """Runtime contract shared by all update rules: costs (P, K), trajs leaves
-    (P, K, ...). Shapes are static under jit/vmap, so this fails at trace time on
-    a mismatched call instead of silently reducing the wrong axis."""
-    assert costs.ndim == 2, f"costs must be (P, K); got {costs.shape}"
-    P, K = costs.shape
-    for u in jax.tree.leaves(trajs):
-        assert u.ndim >= 2 and u.shape[0] == P and u.shape[1] == K, (
-            f"trajs leaf {u.shape} inconsistent with costs (P={P}, K={K})")
-
-
-# Predictive Sampling: keep the single lowest-total-cost trajectory (MAP).
-def ps_update(theta: PyTree, trajs: PyTree, costs: jax.Array, *_):
-    _check_update_shapes(trajs, costs)
-    best = jnp.argmin(jnp.sum(costs, axis=1))             # total return per particle
-    new_mean = jax.tree.map(lambda u: u[best], trajs)
-    return theta._replace(mean=new_mean), costs[best]     # (K,) costs of the chosen traj
-
-
-# Model Predictive Path Integral: softmax over trajectories by TOTAL return, one
-# weight per trajectory applied to every knot. Stable softmax (shift by the min
-# total) so exp() cannot underflow to all-zeros -> 0/0 = NaN.
-def mppi_update(theta: PyTree, trajs: PyTree, costs: jax.Array, temperature: float):
-    _check_update_shapes(trajs, costs)
-    total = jnp.sum(costs, axis=1)                        # (P,) total return
-    total = total - jnp.min(total)
-    weights = jnp.exp(-total / temperature)
-    weights = weights / jnp.sum(weights)                  # (P,) one weight per trajectory
-    new_mean = jax.tree.map(lambda u: jnp.sum(u * weights[:, None, None], axis=0), trajs)
-    return theta._replace(mean=new_mean), weights
-
-
-# Cross-Entropy Method: mean (and std) of the lowest-total-cost elite fraction.
-def cem_update(theta: PyTree, trajs: PyTree, costs: jax.Array, elite_frac: float,
-               stdev_floor: float = 0.0):
-    _check_update_shapes(trajs, costs)
-    total = jnp.sum(costs, axis=1)                        # (P,) total return
-    num_elite = max(1, int(elite_frac * total.shape[0]))
-    elite = jnp.argsort(total)[:num_elite]
-    new_mean = jax.tree.map(lambda u: jnp.mean(u[elite], axis=0), trajs)
-    updates = {"mean": new_mean}
-    # Refit the sampling covariance from the elites — the "CE" in CEM, and the
-    # mechanism that lets the distribution concentrate. Only when `stdev` is
-    # per-knot: the elite std is (K, ...), which a scalar-stdev proposal cannot
-    # consume. `stdev_floor` guards the degenerate case where every elite is
-    # identical (controls are projected onto a discrete reachable grid, so exact
-    # ties happen) and the std collapses to zero, freezing exploration.
-    if hasattr(theta, "stdev") and jnp.ndim(theta.stdev) > 0:
-        updates["stdev"] = jax.tree.map(
-            lambda u: jnp.maximum(jnp.std(u[elite], axis=0), stdev_floor), trajs)
-    return theta._replace(**updates), jnp.mean(total[elite])
 
 # Mujoco XLA helper functions
 def mjx_hydrax_cost(task: Task):

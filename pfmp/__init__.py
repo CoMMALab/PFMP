@@ -1,7 +1,7 @@
 from .algorithm import PFMP, \
-    ps_update, mppi_update, cem_update, dial_sigma, ess, \
     mjx_hydrax_cost, mjx_linear_gaussian_proposal, mjx_physics, \
     GenericMJXTaskParams
+from .update import ps_update, mppi_update, cem_update, sample_update, dial_step, dial_sigma, ess
 from .interpolate import hermite_spline
 from .interactive import run_interactive
 from .run_batch import run_batch

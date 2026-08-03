@@ -7,7 +7,7 @@ import mujoco.viewer
 import numpy as np
 from mujoco import mjx
 from pfmp.interpolate import Jet2, hermite_spline
-from pfmp.algorithm import ps_update, ess
+from pfmp.update import ps_update, ess
 from hydrax.utils.video import VideoRecorder
 from typing import Optional, Any
 
