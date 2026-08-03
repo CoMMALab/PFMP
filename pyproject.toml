@@ -32,6 +32,7 @@ dependencies = [
     "optuna>=4.8.0",
     "new-natnet-client>=6.0.1",
     "geofikinpy",
+    "pyyaml",
 ]
 
 [tool.uv.sources]

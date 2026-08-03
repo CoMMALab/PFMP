@@ -5,7 +5,7 @@ Runs a scripted EE sweep on both the real robot and MuJoCo, records
 the T-block response in both, and prints a comparison table.
 
 Usage:
-    python examples/fr3/sysid_opti.py --server 192.168.50.181 --local <ip>
+    python examples/fr3/sysid_opti.py --mocap-ip 192.168.50.181 --local-ip <ip>
 """
 
 import argparse
@@ -28,6 +28,7 @@ from new_natnet_client.Client import NatNetClient, NatNetParams
 
 from pub_sub.protocol import Command
 from pub_sub.planner import PlannerClient
+from env import load_env
 
 SCENE_XML_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "mjx_t_push.xml")
 T_QPOS_OFFSET  = 7
@@ -191,10 +192,11 @@ def print_comparison(waypoints, sim_tee, real_tee):
 
 
 def main():
+    env = load_env()
     parser = argparse.ArgumentParser()
-    parser.add_argument("--server",       default="127.0.0.1")
-    parser.add_argument("--local",        default="127.0.0.1")
-    parser.add_argument("--server-host",  default="localhost")
+    parser.add_argument("--mocap-ip",      default=env["mocap_ip"])
+    parser.add_argument("--local-ip",      default=env["local_ip"])
+    parser.add_argument("--controller-ip", default=env["controller_ip"])
     parser.add_argument("--cmd-port",     type=int, default=5555)
     parser.add_argument("--sweep-x",      type=float, default=SWEEP_X)
     parser.add_argument("--sweep-y-lo",   type=float, default=SWEEP_Y_LO)
@@ -211,15 +213,14 @@ def main():
     ik_cache   = get_or_build_cache(path=cache_path)
     waypoints  = make_sweep_waypoints(args.sweep_x, args.sweep_y_lo, args.sweep_y_hi, args.n)
 
-    params = NatNetParams(server_address=args.server, local_ip_address=args.local,
+    params = NatNetParams(server_address=args.mocap_ip, local_ip_address=args.local_ip,
                           use_multicast=False)
     planner = PlannerClient(
-        command_addr=f"tcp://{args.server_host}:{args.cmd_port}",
-        response_addr="tcp://localhost:5556",
-        conflate=False, command_timeout_ms=5000,
+        command_addr=f"tcp://{args.controller_ip}:{args.cmd_port}",
+        command_timeout_ms=5000,
     )
 
-    print(f"Connecting to Motive at {args.server}...")
+    print(f"Connecting to Motive at {args.mocap_ip}...")
     with NatNetClient(params) as client:
         if client is None:
             print("Failed to connect."); return

@@ -1,7 +1,7 @@
 # msg_type.py
 
 import json
-from typing import NamedTuple, Literal, Any
+from typing import NamedTuple, Any
 
 
 class Command(NamedTuple):
@@ -10,23 +10,6 @@ class Command(NamedTuple):
     # plane; "home" = return to the home configuration. Lets the planner drive the
     # arm's descend-on-start / home-on-finish lifecycle.
     action: str = ""
-
-class TeeBelief(NamedTuple):
-    mean: list[float]        # (3,)
-    cov: list[list[float]]   # (3, 3)
-
-class Response(NamedTuple):
-    timestamp: float
-    seq: int
-    rgbd_encoding: Literal["jpeg+z16", "rgb8+d32f", "rgbd_npz"]
-    rgbd_width: int
-    rgbd_height: int
-
-    # Prefer (T, 7), i.e. one row per timestep.
-    joint_q: list[list[float]]  # (T, 7)
-    joint_v: list[list[float]]  # (T, 7)
-
-    beliefs: list[TeeBelief]    # (T,)
 
 def to_jsonable(x: Any) -> Any:
     if isinstance(x, tuple) and hasattr(x, "_asdict"):

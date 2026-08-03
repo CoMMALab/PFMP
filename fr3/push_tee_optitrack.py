@@ -2,18 +2,23 @@
 push_tee_optitrack.py — Motive/OptiTrack perception for the push-T task.
 
 Usage:
-    python examples/fr3/push_tee_optitrack.py --server 192.168.1.100
-    python examples/fr3/push_tee_optitrack.py --server 192.168.1.100 --mocap
+    python examples/fr3/push_tee_optitrack.py --mocap-ip 192.168.1.100
+    python examples/fr3/push_tee_optitrack.py --mocap-ip 192.168.1.100 --mocap
 """
 
 import argparse
 import sys
 import os
+import threading
+import time
+from dataclasses import dataclass
+
 import numpy as np
 from scipy.spatial.transform import Rotation
 
 from new_natnet_client.Client import NatNetClient, NatNetParams
 from geom_tee import OPTI_TO_BODY
+from env import load_env
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -52,6 +57,42 @@ def tee_pose(rb):
     """
     T = rb_to_tee_world(rb, T_OPTI_TO_WORLD)
     return T[:2, 3], np.arctan2(T[1, 0], T[0, 0])
+
+
+@dataclass
+class LiveTee:
+    """Latest tee pose seen by OptiTrack. `track_tee` (its own thread) writes
+    this; planning/render loops read it — always under the caller's lock, since
+    both sides touch it from different threads."""
+    xy: np.ndarray
+    yaw: float
+    seen: bool = False
+    stamp: float = 0.0
+
+    def is_stale(self, max_age: float) -> bool:
+        """True if we've never seen the tee, or the last sighting is older
+        than `max_age` seconds."""
+        return (not self.seen) or (time.time() - self.stamp > max_age)
+
+
+def track_tee(client, live: LiveTee, lock: threading.Lock, stop: threading.Event):
+    """Sole OptiTrack reader: publishes each frame's tee pose into `live`
+    until `stop` is set. Runs on its own thread; `lock` guards `live` against
+    the planning/render loops reading it concurrently."""
+    for frame in client.MoCap(timeout=None):
+        if stop.is_set():
+            return
+        rbs = [rb for rb in frame.rigid_body_data.rigid_bodies if rb.tracking]
+        if not rbs:
+            with lock:
+                live.seen = False
+            continue
+        xy, yaw = tee_pose(rbs[0])
+        with lock:
+            live.xy = xy
+            live.yaw = float(yaw)
+            live.seen = True
+            live.stamp = time.time()
 
 
 def stream_loop(client, args):
@@ -136,19 +177,20 @@ def stream_loop(client, args):
 
 
 def main():
+    env = load_env()
     parser = argparse.ArgumentParser()
-    parser.add_argument("--server", default="127.0.0.1")
-    parser.add_argument("--local",  default="127.0.0.1")
+    parser.add_argument("--mocap-ip", default=env["mocap_ip"])
+    parser.add_argument("--local-ip", default=env["local_ip"])
     parser.add_argument("--mocap",      action="store_true",
                         help="Drive MuJoCo tee body from Optitrack pose")
     parser.add_argument("--inspect-rb", action="store_true",
                         help="Print marker positions in RB frame (one frame)")
     args = parser.parse_args()
 
-    params = NatNetParams(server_address=args.server, local_ip_address=args.local,
+    params = NatNetParams(server_address=args.mocap_ip, local_ip_address=args.local_ip,
                           use_multicast=False)
 
-    print(f"Connecting to Motive at {args.server}...")
+    print(f"Connecting to Motive at {args.mocap_ip}...")
     with NatNetClient(params) as client:
         if client is None:
             print("Failed to connect."); return

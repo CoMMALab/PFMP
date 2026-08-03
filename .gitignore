@@ -112,6 +112,10 @@ ENV/
 env.bak/
 venv.bak/
 
+# fr3/env.py is the loader (committed); fr3/env.yaml is per-machine network
+# config (Motive/robot IPs) and should not be.
+fr3/env.yaml
+
 # Spyder project settings
 .spyderproject
 .spyproject

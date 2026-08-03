@@ -15,7 +15,7 @@ keeps per-trial difficulty roughly constant instead of ranging from trivial to
 impossible, which would otherwise swamp the method comparison in variance.
 
 Usage:
-    python fr3/tee_problem_gen.py --server 192.168.50.181 --local <ip> --trial 0
+    python fr3/tee_problem_gen.py --mocap-ip 192.168.50.181 --local-ip <ip> --trial 0
 """
 
 import argparse
@@ -156,9 +156,12 @@ def main():
     from geom_tee import verts_world
     from new_natnet_client.Client import NatNetClient, NatNetParams
 
+    from env import load_env
+    env = load_env()
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--server",    default="127.0.0.1")
-    parser.add_argument("--local",     default="127.0.0.1")
+    parser.add_argument("--mocap-ip", default=env["mocap_ip"])
+    parser.add_argument("--local-ip", default=env["local_ip"])
     parser.add_argument("--seed",     type=int, default=42)
     parser.add_argument("--trial",    type=int, default=0)
     parser.add_argument("--tol",      type=float, default=0.03, help="Position tolerance (m)")
@@ -277,9 +280,9 @@ def main():
             fig.canvas.draw_idle()
             time.sleep(0.05)
 
-    params = NatNetParams(server_address=args.server, local_ip_address=args.local,
+    params = NatNetParams(server_address=args.mocap_ip, local_ip_address=args.local_ip,
                           use_multicast=False)
-    print(f"Connecting to Motive at {args.server}...")
+    print(f"Connecting to Motive at {args.mocap_ip}...")
     with NatNetClient(params) as client:
         if client is None:
             print("Failed to connect."); return

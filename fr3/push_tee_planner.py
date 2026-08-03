@@ -7,11 +7,11 @@ Real world workspace is 53' 1/8" x 23' 1/4"
 import argparse
 import datetime
 import json
-import contextlib
 import os
 import threading
 import time
-from typing import NamedTuple, Tuple
+from dataclasses import dataclass
+from typing import Callable, NamedTuple, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -22,6 +22,7 @@ from mujoco import mjx
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from geom_tee import STEM_HALF, CAP_HALF, CAP_CTR
+from env import load_env
 
 import pfmp
 
@@ -89,16 +90,7 @@ HORIZON   = 8.0
 NUM_KNOTS = 5
 PARTICLES = 256
 
-# 2s knots at dt=0.02 (mjx_scene.xml) = 100 substeps per knot. Reach saturates
-# around 1s — the arm covers ~12cm in 0.5s and ~28cm by 1.0s, against a proposal
-# whose p90 step is 23cm — so the extra second is not for travel but to let the
-# arm arrive and settle before the knot ends, and to give contact enough substeps
-# to resolve.
 KNOT_INTERVAL = HORIZON / (NUM_KNOTS - 1)
-# Replan once per knot, matching run_realtime, which sends theta.mean[1] and then
-# replans. Derived rather than written out so it cannot drift from the horizon: a
-# longer replan period executes the tail of a plan open-loop, which the robot
-# never does, and lets model error compound uncorrected.
 RUN_INTERACTIVE_FREQUENCY = 1.0 / KNOT_INTERVAL
 
 VIZ_FPS          = 60.0     # render-thread refresh, decoupled from the replan rate
@@ -108,14 +100,6 @@ SUCCESS_POS_RADIUS = 0.05   # metres
 SUCCESS_ANGLE_TOL  = 0.35   # radians (~20°)
 TRIAL_TIMEOUT_S    = 300.0  # abandon a trial after 5 min, logged as timeout
 
-# OptiTrack loses the tee when the arm occludes it, and there are dead zones the
-# cameras never cover. Planning continues on the last known pose, so warn when
-# that pose goes stale — a silently stale tee looks identical to a tracked one.
-#
-# Counted in consecutive missed detections, not seconds: the replan loop runs at
-# ~1Hz (2000 rollouts x multiple knots), so a wall-clock threshold below the loop
-# period would fire on every single miss and every duration would be inflated by
-# a full replan cycle. One miss is one lost look at the tee, whatever it cost.
 TRACK_STALE_MISSES = 2    # consecutive missed detections before warning
 
 PROPOSAL_MIX    = 0.4   # directed toward tee
@@ -125,23 +109,15 @@ PUSH_OVERSHOOT  = 1.0
 PUSH_RADIUS     = 0.16  # just outside tee cap half-extent
 ORBITAL_Y_OFFSET = 0.04  # metres up the tee stem for the orbital centre
 
-# Lower bound on CEM's refitted covariance. Controls are projected onto a
-# discrete reachable grid, so elites can coincide exactly and the elite std can
-# collapse to 0, which would freeze the proposal. This is a degeneracy guard, not
-# a tuned exploration parameter.
-CEM_STDEV_FLOOR = 0.005
+CEM_STDEV_FLOOR = 0.02
 
+# DIAL_N=2 is inspired by the canonical dial-mpc repo's steady-state Ndiffuse for
+# its SIM config (their real-hardware deploy config drops to Ndiffuse=1).
+# DIAL_N_INIT=10 (Ndiffuse_init) only applies to a trial's first replan, a
+# one-time higher-fidelity solve from a cold start.
+DIAL_N, DIAL_N_INIT, DIAL_B1, DIAL_B2 = 2, 10, 1.0, 1.0
 
-# Franky drives the arm with Ruckig, which ramps the *joint* reference under
-# velocity/acceleration/jerk limits rather than jumping to the target. Commanding
-# the IK solution directly instead leaves an overdamped PD chasing a target tens
-# of cm away: a 7cm move was still 16mm short after 400 steps, so every rollout
-# scored pushes from an arm that never arrived. Ramping the reference at the same
-# rate the robot uses keeps the tracking error small, as it is on hardware.
-#
-# Velocity-limited ramp only — Ruckig also shapes acceleration and jerk, which
-# matters for the first few steps after a direction change but not for where the
-# arm ends up.
+# Max Velocity
 FR3_DQ_MAX     = jnp.array([2.62, 2.62, 2.62, 2.62, 5.26, 4.18, 5.26])   # rad/s
 
 
@@ -152,18 +128,9 @@ def dynamics(x: mjx.Data, u: jax.Array, th: PushParams, t: float) -> Tuple[mjx.D
 
     target_qpos = ik_from_cache(u, th.ik_cache)
     delta = target_qpos - x.ctrl[:7]
-    # Scale the whole delta by one factor rather than clipping per joint, so the
-    # joints stay synchronised and the reference keeps its direction. Clipping
-    # each joint separately lets the short-travel ones arrive early while others
-    # saturate, which bends the path and shows up as twitching mid-motion.
     scale = jnp.minimum(1.0, jnp.min(dq_max / (jnp.abs(delta) + 1e-9)))
     step  = delta * scale
 
-    # No acceleration limit: the profile is rectangular (full speed on the first
-    # substep, full stop on arrival) where Ruckig would ramp. Limiting it needs the
-    # *reference* velocity as state, which dynamics does not carry — using the
-    # arm's own qvel as a stand-in throttles the reference against the arm it is
-    # supposed to lead, and the ramp never reaches v_max.
     ctrl = x.ctrl.at[:7].set(x.ctrl[:7] + step)
     x_next = mjx.step(th.mjx_model, x.replace(ctrl=ctrl))
     return x_next, u
@@ -218,31 +185,19 @@ def init_control(key: jax.Array, x: mjx.Data, th: PushParams) -> jax.Array:
     The orbital branch is anchored to the tee rather than the mean, so particles
     stay feasible even if the mean has drifted outside the reachable set.
     """
-    return _project_reachable(
-        _sample_mixture(key, x, th.mean[0], th, _sigma_at(th, 0)), th)
+    return project_reachable(
+        sample_mixture(key, x, th.mean[0], th, _sigma_at(th, 0)), th)
 
 
 def mppi_proposal(key: jax.Array, _x: mjx.Data, _u: jax.Array, th: PushParams, t: float) -> jax.Array:
-    """Gaussian proposal centred on the mean knot at time t (for PS/MPPI baselines).
-
-    Snapped to the reachable mask, same as `proposal`. This is a feasibility
-    constraint, not a task-informed bias, so every method gets it.
-    """
+    """Gaussian proposal centred on the mean knot at time t (for PS/MPPI baselines). """
     idx = _knot_index(t)
-    return _project_reachable(
+    return project_reachable(
         th.mean[idx] + jax.random.normal(key, (2,)) * _sigma_at(th, idx), th)
 
 
-def _project_reachable(u: jax.Array, th: PushParams) -> jax.Array:
-    """Snap an EE waypoint to the nearest reachable grid cell.
-
-    Projecting into a sector *box* is not enough: the true reachable set is not a
-    box (the mask has holes and a curved boundary), so a box-projected control can
-    still land on an unreachable cell, and ik_from_cache then returns NaN. Snapping
-    to the nearest cell that is actually in the mask guarantees a reachable corner
-    for the bilinear lookup, so no control can produce NaN regardless of where the
-    sample fell.
-    """
+def project_reachable(u: jax.Array, th: PushParams) -> jax.Array:
+    """Snap an EE waypoint to the nearest reachable grid cell. """
     cache = th.ik_cache
     Nx, Ny = cache.reachable.shape
     xs = jnp.linspace(cache.xy_min[0], cache.xy_max[0], Nx)
@@ -254,12 +209,9 @@ def _project_reachable(u: jax.Array, th: PushParams) -> jax.Array:
     return jnp.array([X.reshape(-1)[flat], Y.reshape(-1)[flat]])
 
 
-def _sample_mixture(key: jax.Array, x: mjx.Data, u: jax.Array, th: PushParams,
+def sample_mixture(key: jax.Array, x: mjx.Data, u: jax.Array, th: PushParams,
                     sigma: jax.Array) -> jax.Array:
-    """One draw from the three-way mixture: directed / orbital / random walk.
-
-    `sigma` is the noise scale for this knot (see `_sigma_at`), passed in rather
-    than read off `th` so CEM's per-knot fitted covariance works here too."""
+    """ One draw from the three-way mixture: directed / orbital / random walk. """
     key_mix, key_a, key_b, key_ang = jax.random.split(key, 4)
     t_xy  = x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 2]
     t_yaw = x.qpos[T_QPOS_OFFSET + 2]
@@ -285,11 +237,9 @@ def _sample_mixture(key: jax.Array, x: mjx.Data, u: jax.Array, th: PushParams,
 
 
 def proposal(key: jax.Array, x: mjx.Data, u: jax.Array, th: PushParams, t: float) -> jax.Array:
-    """Three-way mixture, resampled until the draw lands in the reachable mask, so
-    the IK-resolved joint motion tracks the intended EE path instead of arcing
-    across a wrist-flip / unreachable cell."""
-    return _project_reachable(
-        _sample_mixture(key, x, u, th, _sigma_at(th, _knot_index(t))), th)
+    """ Three-way mixture """
+    return project_reachable(
+        sample_mixture(key, x, u, th, _sigma_at(th, _knot_index(t))), th)
 
 
 # ===============================
@@ -347,6 +297,154 @@ def _sample_traj(traj: np.ndarray, alpha: float) -> np.ndarray:
     return traj[i] * (1.0 - w) + traj[i + 1] * w
 
 
+def draw_goal_and_plan(user_scn, th) -> None:
+    """Viewer overlay: translucent goal T-marker plus the planned EE path as
+    orange line segments between knots. Resets user_scn's geom count first,
+    so it's safe to call once per frame regardless of what drew last frame."""
+    user_scn.ngeom = 0
+    add_goal_T(user_scn, np.array(th.goal_xy), float(th.goal_angle),
+               rgba=(0.2, 0.8, 0.2, 0.5))
+    knots = np.array(th.mean)
+    z = float(EE_HEIGHT)
+    for k in range(len(knots) - 1):
+        if user_scn.ngeom >= user_scn.maxgeom:
+            break
+        p0 = np.array([knots[k, 0],   knots[k, 1],   z], dtype=np.float64)
+        p1 = np.array([knots[k + 1, 0], knots[k + 1, 1], z], dtype=np.float64)
+        geom = user_scn.geoms[user_scn.ngeom]
+        mujoco.mjv_connector(geom, mujoco.mjtGeom.mjGEOM_LINE, 2.0, p0, p1)
+        geom.rgba[:] = [1.0, 0.5, 0.0, 1.0]
+        user_scn.ngeom += 1
+
+
+class LiveVis:
+    """Optional MuJoCo viewer + render thread that animates the plan's
+    predicted push, fully decoupled from the realtime planning loop: when
+    `enabled=False` (headless collection), every method is a no-op and no
+    viewer/thread is ever created, so the planning loop calls the same
+    interface either way and never has to branch on whether anyone's
+    watching.
+
+    This is a class, not a dataclass, despite the rest of this file preferring
+    dataclasses for state: it owns a thread and a viewer handle with real
+    setup/teardown, not just data.
+
+    Glide state below is written by `update()` (called from the planning
+    loop after each replan) and read by the render thread — always under
+    `self._lock`, separate from the tee-tracking lock the caller passes in
+    for `live` (a `LiveTee`), since planning and rendering write/read each
+    from different threads.
+
+    glide_start/glide_dur: wall-clock start time and duration (s) of the
+        current glide. alpha = (now - glide_start) / glide_dur.
+    arm_traj: (dense, 7) predicted arm joint trajectory over the glide.
+    tee_traj: (dense, 3) predicted tee (x, y, yaw) over the same glide.
+    theta: latest planning params, for the goal/knot-trajectory overlay.
+    """
+
+    TRACKER_Z = 0.020
+
+    def __init__(self, enabled: bool, mj_model, mj_data, theta, live,
+                tee_lock: threading.Lock, timeout: float):
+        self.enabled = enabled
+        self._mj_model = mj_model
+        self._mj_data = mj_data
+        self._live = live
+        self._tee_lock = tee_lock
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self.viewer = None
+        self._thread = None
+        self._tracker_mocapid = -1
+        if not enabled:
+            print(f"Realtime loop running headless (timeout {timeout:.0f}s). Ctrl-C to abort.")
+            return
+
+        import mujoco.viewer as mjviewer
+
+        # The blue translucent t_tracker (mocap body) shows the live OptiTrack tee.
+        _tb = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, "t_tracker")
+        self._tracker_mocapid = int(mj_model.body_mocapid[_tb]) if _tb >= 0 else -1
+
+        q0_arm = np.array(mj_data.qpos[:7], float)
+        tee0 = np.array([float(live.xy[0]), float(live.xy[1]), live.yaw], float)
+        self.glide_start = time.time()
+        self.glide_dur = 0.0
+        self.theta = theta
+        self.arm_traj = q0_arm[None].copy()
+        self.tee_traj = tee0[None].copy()
+
+        self.viewer = mjviewer.launch_passive(mj_model, mj_data)
+        print(f"Realtime loop running (timeout {timeout:.0f}s). Close viewer to stop (logs an abort).")
+        self._thread = threading.Thread(target=self._render_loop, daemon=True)
+
+    def start(self):
+        """Launch the render thread. No-op when disabled (there is none)."""
+        if not self.enabled:
+            return
+        self._thread.start()
+
+    def is_running(self) -> bool:
+        """True while the planning loop should keep going: always True
+        headless, tied to the viewer window otherwise."""
+        return (not self.enabled) or self.viewer.is_running()
+
+    def update(self, theta, glide_dur: float, arm_traj=None, tee_traj=None):
+        """Publish the latest replan's predicted push. No-op when disabled.
+        arm_traj/tee_traj are optional: the headless glide-duration fallback
+        doesn't compute a predicted trajectory to show."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self.glide_start = time.time()
+            self.glide_dur = glide_dur
+            self.theta = theta
+            if arm_traj is not None:
+                self.arm_traj = arm_traj
+                self.tee_traj = tee_traj
+
+    def close(self):
+        """Stop the render thread and close the viewer. No-op when disabled."""
+        if not self.enabled:
+            return
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        self.viewer.close()
+
+    def _render_loop(self):
+        """Sole owner of the display MjData + viewer. Tee follows the live
+        block straight from OptiTrack; the arm glides along the latest
+        predicted push, so both keep moving even while the main thread is
+        blocked in send_command."""
+        dt = 1.0 / VIZ_FPS
+        while not self._stop.is_set() and self.viewer.is_running():
+            with self._tee_lock:
+                xy = self._live.xy.copy()
+                yaw = self._live.yaw
+            with self._lock:
+                glide_start, glide_dur = self.glide_start, self.glide_dur
+                th = self.theta
+                arm_traj, tee_traj = self.arm_traj, self.tee_traj
+            alpha = (1.0 if glide_dur <= 1e-6
+                     else min(1.0, (time.time() - glide_start) / glide_dur))
+
+            self._mj_data.qpos[:7] = _sample_traj(arm_traj, alpha)
+            tee = _sample_traj(tee_traj, alpha)
+            tee_xy, tee_yaw = tee[:2], tee[2]
+            self._mj_data.qpos[T_QPOS_OFFSET]     = float(tee_xy[0])
+            self._mj_data.qpos[T_QPOS_OFFSET + 1] = float(tee_xy[1])
+            self._mj_data.qpos[T_QPOS_OFFSET + 2] = float(tee_yaw)
+            if self._tracker_mocapid >= 0:
+                self._mj_data.mocap_pos[self._tracker_mocapid] = [
+                    float(xy[0]), float(xy[1]), self.TRACKER_Z]
+                self._mj_data.mocap_quat[self._tracker_mocapid] = [
+                    float(np.cos(yaw / 2)), 0.0, 0.0, float(np.sin(yaw / 2))]
+            mujoco.mj_forward(self._mj_model, self._mj_data)
+            draw_goal_and_plan(self.viewer.user_scn, th)
+            self.viewer.sync()
+            time.sleep(dt)
+
+
 # ===============================
 # Main
 # ===============================
@@ -368,6 +466,81 @@ def load_scene(xml_path: str):
 
 #################################################################
 
+
+@dataclass
+class MethodConfig:
+    """Resolved replan/update behavior for one `--method` choice.
+
+    replan: (key, mjx_data, theta) -> (trajs, costs). Used directly by every
+        method except dial (which drives its own loop via dial_step below),
+        and always used once for JIT warm-up regardless of method.
+    update: (theta, trajs, costs) -> (theta, aux). None for dial.
+    dial_step: (key, mjx_data, theta, n) -> theta. None for every other method.
+    axis_proposal, axis_update: logged separately per trial so the analysis can
+        isolate each design axis. The `biased_` prefix only swaps the proposal
+        (handled by which `ctrl` the caller passes in) — the update rule is
+        always its plain counterpart, hence axis_update = base_method.
+    """
+    replan: Callable
+    update: Callable | None
+    is_dial: bool
+    dial_step: Callable | None
+    needs_per_knot_stdev: bool
+    axis_proposal: str
+    axis_update: str
+
+
+def build_method_config(method: str, ctrl, temperature: float | None) -> MethodConfig:
+    """Resolve a `--method` string into the callables run_realtime needs."""
+    from pfmp.algorithm import ps_update, mppi_update
+
+    axis_proposal = "custom" if method in ("sir", "sis", "biased_mppi", "biased_cem") else "gaussian"
+    base_method = method[len("biased_"):] if method.startswith("biased_") else method
+    is_dial = False
+    dial_step_fn = None
+    needs_per_knot_stdev = False
+
+    if base_method == "mppi":
+        replan = lambda key, data, th: ctrl.run_sis(key, data, th)
+        def update(th, tr, co):
+            finite = jnp.isfinite(jnp.sum(co, axis=1))
+            co = jnp.where(finite[:, None], co, jnp.zeros_like(co))
+            return mppi_update(th, tr, co, max(float(temperature), 1e-6))
+    elif base_method == "ps":
+        replan = lambda key, data, th: ctrl.run_sis(key, data, th)
+        update = ps_update
+    elif base_method == "sis":
+        # SIR with resampling turned off (ρ=0): same object proposal (via
+        # active_ctrl) and same ps_update as sir, only run_sis vs run_sir.
+        replan = lambda key, data, th: ctrl.run_sis(key, data, th)
+        update = ps_update
+    elif base_method == "cem":
+        from pfmp.algorithm import cem_update
+        num_elites = max(1, PARTICLES // 10)
+        replan = lambda key, data, th: ctrl.run_sis(key, data, th)
+        # CEM refits both the mean and the covariance from the elites.
+        update = lambda th, tr, co: cem_update(th, tr, co,
+                                               elite_frac=num_elites / PARTICLES,
+                                               stdev_floor=CEM_STDEV_FLOOR)
+        needs_per_knot_stdev = True
+    elif base_method == "dial":
+        from pfmp import dial_step as _dial_step
+        is_dial = True
+        replan = lambda key, data, th: ctrl.run_sis(key, data, th)  # for JIT warm-up
+        update = None   # dial drives its own re-sampling, via dial_step below
+        # Thin binding of the shared pfmp.dial_step to this ctrl/beta config, so
+        # the call site reads the same as every other method's dispatch.
+        dial_step_fn = lambda key, data, th, n: _dial_step(
+            key, ctrl, data, th, n=n, beta1=DIAL_B1, beta2=DIAL_B2)
+    else:  # sir
+        replan = lambda key, data, th: ctrl.run_sir(key, data, th)
+        update = ps_update
+
+    return MethodConfig(replan=replan, update=update, is_dial=is_dial,
+                        dial_step=dial_step_fn, needs_per_knot_stdev=needs_per_knot_stdev,
+                        axis_proposal=axis_proposal, axis_update=base_method)
+
+
 def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
                  optitrack_client, robot_planner, method="sir", temperature=None,
                  log_path=None, trial=0, seed=0, spec_init=None,
@@ -378,123 +551,34 @@ def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
     follows the plan's predicted push (ctrl.predict) and the blue t_tracker mocap
     body shows the live OptiTrack observation, so MPC relocalization is visible.
     Off = fully headless (no viewer, no prediction), for collection. The mocap
-    tracker thread always runs — the control loop needs the live tee pose.
+    tracker thread always runs for state estimation.
     """
-    from push_tee_optitrack import tee_pose
+    from push_tee_optitrack import LiveTee, track_tee
     from pub_sub.protocol import Command
-    import mujoco.viewer as mjviewer
 
     key = jax.random.key(0)
-    gripper_id = theta.gripper_site_id
 
-    def goal_marker_callback(user_scn, th):
-        user_scn.ngeom = 0
-        add_goal_T(user_scn, np.array(th.goal_xy), float(th.goal_angle),
-                   rgba=(0.2, 0.8, 0.2, 0.5))
-        knots = np.array(th.mean)
-        z = float(EE_HEIGHT)
-        for k in range(len(knots) - 1):
-            if user_scn.ngeom >= user_scn.maxgeom:
-                break
-            p0 = np.array([knots[k,0], knots[k,1], z], dtype=np.float64)
-            p1 = np.array([knots[k+1,0], knots[k+1,1], z], dtype=np.float64)
-            geom = user_scn.geoms[user_scn.ngeom]
-            mujoco.mjv_connector(geom, mujoco.mjtGeom.mjGEOM_LINE, 2.0, p0, p1)
-            geom.rgba[:] = [1.0, 0.5, 0.0, 1.0]
-            user_scn.ngeom += 1
-
-    from pfmp.algorithm import ps_update, mppi_update
-    # The two design axes are logged separately so the analysis can isolate each:
-    #   proposal axis: custom object-centric (sir, biased_*) vs Gaussian (plain)
-    #   update axis:   mppi / cem / ps / dial / sir  (the biased_ prefix only
-    #                  swaps the proposal; the update rule is its plain counterpart)
-    axis_proposal = "custom" if method in ("sir", "sis", "biased_mppi", "biased_cem") else "gaussian"
-    base_method = method[len("biased_"):] if method.startswith("biased_") else method
-    axis_update = base_method
-    is_dial = False   # dial re-samples per annealing level, handled in the loop
-    needs_per_knot_stdev = False   # CEM refits a per-knot covariance; others use a scalar
-    if base_method == "mppi":
-        replan = lambda key, data, th: ctrl.run_sis(key, data, th)
-        def _mppi_update(th, tr, co):
-            import jax.numpy as jnp
-            finite = jnp.isfinite(jnp.sum(co, axis=1))
-            co = jnp.where(finite[:, None], co, jnp.zeros_like(co))
-            return mppi_update(th, tr, co, max(float(temperature), 1e-6))
-        update = _mppi_update
-    elif base_method == "ps":
-        replan = lambda key, data, th: ctrl.run_sis(key, data, th)
-        update = ps_update
-    elif base_method == "sis":
-        # SIR with resampling turned off (ρ=0): same object proposal (via
-        # active_ctrl) and same ps_update as sir, only run_sis vs run_sir. The
-        # clean single-axis ablation for the effect of resampling.
-        replan = lambda key, data, th: ctrl.run_sis(key, data, th)
-        update = ps_update
-    elif base_method == "cem":
-        from pfmp.algorithm import cem_update
-        num_elites = max(1, PARTICLES // 10)
-        replan = lambda key, data, th: ctrl.run_sis(key, data, th)
-        # CEM refits both the mean and the covariance from the elites. The
-        # covariance is per-knot, so theta.stdev is broadcast to (num_knots, 2)
-        # below; it then persists and adapts across replans, which is where CEM's
-        # concentration comes from under receding-horizon control.
-        update = lambda th, tr, co: cem_update(th, tr, co,
-                                               elite_frac=num_elites / PARTICLES,
-                                               stdev_floor=CEM_STDEV_FLOOR)
-        needs_per_knot_stdev = True
-    elif base_method == "dial":
-        from pfmp import dial_step as _dial_step
-        # DIAL_N=2 matches the canonical dial-mpc repo's steady-state Ndiffuse for
-        # its SIM config (their real-hardware deploy config drops to Ndiffuse=1,
-        # justified there by a much tighter compute budget than we have here: Go2
-        # locomotion needs replanning far faster than this ~1Hz push-T loop).
-        # DIAL_N_INIT=10 matches their Ndiffuse_init, used only on the trial's
-        # first replan (a one-time higher-fidelity solve from a cold start).
-        DIAL_N, DIAL_N_INIT, DIAL_B1, DIAL_B2 = 2, 10, 1.0, 1.0
-        is_dial = True
-        replan = lambda key, data, th: ctrl.run_sis(key, data, th)  # for JIT warm-up
-        update = None   # dial drives its own re-sampling, via dial_step below
-
-        # Thin binding of the shared pfmp.dial_step to this ctrl/beta config, so
-        # the call site below reads the same as every other method's dispatch.
-        dial_step = lambda key, data, th, n=DIAL_N: _dial_step(
-            key, ctrl, data, th, n=n, beta1=DIAL_B1, beta2=DIAL_B2)
-    else:  # sir
-        replan = lambda key, data, th: ctrl.run_sir(key, data, th)
-        update = ps_update
-
-    # `viz` gates the viewer + render thread; `use_pred` additionally gates the
-    # plan-prediction overlay, which needs the PFMP controller's predict(). With
-    # viz on but a non-PFMP controller (hydrax methods), the viewer still shows
-    # the live tee, just without the predicted push.
-    use_pred = viz and hasattr(ctrl, "predict")
-    if viz and not use_pred:
-        print(f"[viz] method '{method}' uses a non-PFMP controller (no predict()); "
-              f"showing the live tee without the plan prediction.")
+    cfg = build_method_config(method, ctrl, temperature)
 
     # CEM's covariance is per-knot, so widen the scalar stdev to (num_knots, 2).
     # Every other method keeps the scalar, for which _sigma_at is a no-op.
-    if needs_per_knot_stdev and jnp.ndim(theta.stdev) == 0:
+    if cfg.needs_per_knot_stdev and jnp.ndim(theta.stdev) == 0:
         theta = theta._replace(
             stdev=jnp.full((NUM_KNOTS, 2), float(theta.stdev)))
 
     print("JIT warm-up…", end=" ", flush=True)
     mjx_data = mjx.put_data(mj_model, mj_data)
-    _ = replan(key, mjx_data, theta)
+    _ = cfg.replan(key, mjx_data, theta)
     print("done")
 
-    # Per-trial log record. Written once when the trial ends (goal reached, or
-    # the viewer is closed to abort). `n_cmd_failures` > 0 flags a run
-    # contaminated by non-deterministic controller/robot aborts.
+    # Per-trial log record. Written once when the trial ends.
     t_start = time.time()
     # `spec_*` is what tee_problem_gen prescribed for this (seed, trial);
-    # `realized_*` is what OptiTrack actually saw. They differ by however
-    # accurately the tee was placed by hand, so placement slop is recorded as
-    # data rather than assumed away.
+    # `realized_*` is the measured OptiTrack value.
     rec = {
         "ts": datetime.datetime.now().isoformat(timespec="seconds"),
         "trial": int(trial), "seed": int(seed), "method": method,
-        "proposal": axis_proposal, "update": axis_update,
+        "proposal": cfg.axis_proposal, "update": cfg.axis_update,
         "spec_init": ([float(spec_init[0]), float(spec_init[1]), float(spec_init[2])]
                       if spec_init is not None else None),
         "spec_goal": [float(theta.goal_xy[0]), float(theta.goal_xy[1]),
@@ -505,8 +589,6 @@ def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
         "realized_final": None,
         "placement_err": None,
         "n_replans": 0, "n_cmd_failures": 0, "success": False, "timeout": False,
-        # Tracking health: replans driven by a stale tee pose, and the longest
-        # single dropout. Both flag contamination the same way n_cmd_failures does.
         "n_track_dropouts": 0, "n_stale_replans": 0, "max_consec_misses": 0,
         "final_pos_err": None, "final_angle_err": None, "duration_s": None,
     }
@@ -514,296 +596,174 @@ def run_realtime(ctrl, theta, mj_model, mj_data, ik_cache,
         rec["placement_err"] = round(float(np.linalg.norm(
             np.array(rec["realized_init"][:2]) - np.asarray(spec_init[:2]))), 4)
 
-    # Latest observed tee pose, updated each replan. realized_final reads this,
-    # not mj_data.qpos (which is untouched when headless, and holds the *predicted*
-    # pose when the render thread is driving it).
-    obs = {"xy": np.array(rec["realized_init"][:2], float), "yaw": rec["realized_init"][2]}
-
-    def _write_record():
-        rec["duration_s"] = round(time.time() - t_start, 2)
-        rec["realized_final"] = [round(float(obs["xy"][0]), 4),
-                                 round(float(obs["xy"][1]), 4),
-                                 round(float(obs["yaw"]), 4)]
-        if log_path:
-            with open(log_path, "a") as f:
-                f.write(json.dumps(rec) + "\n")
-        print(f"\n[log] trial {rec['trial']} method={rec['method']} success={rec['success']} "
-              f"pos_err={rec['final_pos_err']} angle_err={rec['final_angle_err']} "
-              f"placement_err={rec['placement_err']} "
-              f"aborts={rec['n_cmd_failures']} "
-              f"dropouts={rec['n_track_dropouts']} (max {rec['max_consec_misses']} consec, "
-              f"{rec['n_stale_replans']}/{rec['n_replans']} stale replans) -> {log_path}")
-
-    def _lifecycle(action):
-        """Tell the controller to descend (planning start) / home (finish).
-        Never let a failed lifecycle signal abort the trial."""
-        try:
-            robot_planner.send_command(Command(action=action))
-        except Exception as e:
-            print(f"[lifecycle] {action} signal failed: {e!r}")
+    # Fallback for realized_final below if the loop body never runs (e.g.
+    # timeout <= 0 on the very first check).
+    xy, yaw = np.array(rec["realized_init"][:2], float), rec["realized_init"][2]
 
     # Descend onto the pushing plane before planning begins.
     print("Descending onto pushing plane…")
-    _lifecycle("descend")
+    robot_planner.lifecycle("descend")
 
-    tracking = {"misses": 0}
+    consec_misses = 0   # consecutive stale/missed tee-pose reads
 
     # ── Display / tracking decoupled from planning ────────────────────────────
-    # send_command blocks until franky finishes the push, so the main thread
-    # cannot repaint during a push. A render thread owns the viewer + the display
-    # MjData exclusively and refreshes at VIZ_FPS; a tracker thread is the sole
-    # OptiTrack reader. The planner runs on its own MjData copy (mj_data_plan) so
-    # nothing races on MuJoCo's non-thread-safe data structs.
+    # send_command blocks until franky finishes the push. The planner runs on its
+    # own MjData copy so there are no races.
     st_lock = threading.Lock()
-    q0_arm = np.array(mj_data.qpos[:7], float)
-    live = {"xy": np.array(mj_data.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 2], float),
-            "yaw": float(mj_data.qpos[T_QPOS_OFFSET + 2]), "seen": False, "stamp": 0.0}
-    # Arm glide is time-parameterized: interpolate arm_start -> arm_target over
-    # arm_dur, where arm_dur matches franky's velocity-limited move time, so the
-    # sim arm sweeps across the push in lockstep instead of snapping to the end.
-    tee0 = np.array([float(live["xy"][0]), float(live["xy"][1]), live["yaw"]], float)
-    shared = {"arm_start": q0_arm.copy(), "arm_target": q0_arm.copy(),
-              "arm_t0": time.time(), "arm_dur": 0.0, "theta": theta, "running": True,
-              # Dense predicted push for the executed interval (prediction only): the
-              # arm states that drive the orange tee states, from one predict()
-              # rollout. Both start at the measured pose, so the orange tee snaps
-              # onto the blue actual at each relocalization.
-              "arm_seg": q0_arm[None].copy(), "tee_seg": tee0[None].copy()}
+    stop_event = threading.Event()
+    live = LiveTee(xy=np.array(mj_data.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 2], float),
+                   yaw=float(mj_data.qpos[T_QPOS_OFFSET + 2]))
+    live_vis = LiveVis(viz, mj_model, mj_data, theta, live, st_lock, timeout)
 
     mj_data_plan = mujoco.MjData(mj_model)        # planner-only state (main thread)
     mj_data_plan.qpos[:] = mj_data.qpos
     mj_data_plan.ctrl[:] = mj_data.ctrl
 
-    # The blue translucent t_tracker (mocap body) shows the live OptiTrack tee.
-    _tb = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, "t_tracker")
-    tracker_mocapid = int(mj_model.body_mocapid[_tb]) if _tb >= 0 else -1
-    TRACKER_Z = 0.020
-
-    def tracker():
-        """Sole OptiTrack reader: publishes the latest tee pose into `live`."""
-        for frame in optitrack_client.MoCap(timeout=None):
-            if not shared["running"]:
-                return
-            rbs = [rb for rb in frame.rigid_body_data.rigid_bodies if rb.tracking]
-            if not rbs:
-                with st_lock:
-                    live["seen"] = False
-                continue
-            xy, yaw = tee_pose(rbs[0])
-            with st_lock:
-                live["xy"] = xy
-                live["yaw"] = float(yaw)
-                live["seen"] = True
-                live["stamp"] = time.time()
-
-    def render(viewer):
-        """Sole owner of the display MjData + viewer. Tee follows the live block
-        straight from OptiTrack; the arm eases toward the last commanded pose, so
-        both keep moving even while the main thread is blocked in send_command."""
-        dt = 1.0 / VIZ_FPS
-        while shared["running"] and viewer.is_running():
-            with st_lock:
-                xy = live["xy"].copy()
-                yaw = live["yaw"]
-                a_t0 = shared["arm_t0"]
-                a_dur = shared["arm_dur"]
-                th = shared["theta"]
-                if use_pred:
-                    arm_seg = shared["arm_seg"]
-                    tee_seg = shared["tee_seg"]
-                else:
-                    a_start = shared["arm_start"]
-                    a_target = shared["arm_target"]
-            alpha = 1.0 if a_dur <= 1e-6 else min(1.0, (time.time() - a_t0) / a_dur)
-
-            # Orange simulated tee (t_block) + arm: with prediction both are the
-            # dense predicted-rollout states sampled at the same alpha, so the tee
-            # moves coherently with the arm that pushes it; otherwise the arm eases
-            # toward the command and the tee shows the live pose. Blue tracker
-            # (t_tracker mocap body) is always the live OptiTrack observation, so
-            # the two coincide at each replan and diverge as the block lags.
-            if use_pred:
-                mj_data.qpos[:7] = _sample_traj(arm_seg, alpha)
-                tee = _sample_traj(tee_seg, alpha)
-                tee_xy, tee_yaw = tee[:2], tee[2]
-            else:
-                mj_data.qpos[:7] = a_start + alpha * (a_target - a_start)
-                tee_xy, tee_yaw = xy, yaw
-            mj_data.qpos[T_QPOS_OFFSET]     = float(tee_xy[0])
-            mj_data.qpos[T_QPOS_OFFSET + 1] = float(tee_xy[1])
-            mj_data.qpos[T_QPOS_OFFSET + 2] = float(tee_yaw)
-            if tracker_mocapid >= 0:
-                mj_data.mocap_pos[tracker_mocapid] = [float(xy[0]), float(xy[1]), TRACKER_Z]
-                mj_data.mocap_quat[tracker_mocapid] = [float(np.cos(yaw / 2)), 0.0, 0.0,
-                                                       float(np.sin(yaw / 2))]
-            mujoco.mj_forward(mj_model, mj_data)
-            goal_marker_callback(viewer.user_scn, th)
-            viewer.sync()
-            time.sleep(dt)
-
     q_prev = np.array(mj_data.qpos[:7], float)   # last commanded arm pose
-    # The mocap tracker is load-bearing (the loop plans on the live pose), so it
-    # always runs. The viewer + render thread are display-only and gated by viz.
-    threading.Thread(target=tracker, daemon=True).start()
+    threading.Thread(target=track_tee, args=(optitrack_client, live, st_lock, stop_event),
+                     daemon=True).start()  # begin mocap
+    live_vis.start()
 
-    viewer_cm = mjviewer.launch_passive(mj_model, mj_data) if viz else contextlib.nullcontext(None)
-    with viewer_cm as viewer:
-        if viz:
-            print(f"Realtime loop running (timeout {timeout:.0f}s). Close viewer to stop (logs an abort).")
-            render_thread = threading.Thread(target=render, args=(viewer,), daemon=True)
-            render_thread.start()
-        else:
-            print(f"Realtime loop running headless (timeout {timeout:.0f}s). Ctrl-C to abort.")
-            render_thread = None
-        try:
-            while (viewer.is_running() if viz else True):
-                if time.time() - t_start > timeout:
-                    print(f"\n✗ Timeout after {timeout:.0f}s — trial abandoned.")
-                    rec["timeout"] = True
-                    break
-                rec["n_replans"] += 1
+    try:
+        while live_vis.is_running():
+            # trial < 0: manual/exploratory run (no --trial) — no timeout either.
+            if trial >= 0 and time.time() - t_start > timeout:
+                print(f"\n✗ Timeout after {timeout:.0f}s — trial abandoned.")
+                rec["timeout"] = True
+                break
+            rec["n_replans"] += 1
 
-                # 1. Latest tracked tee pose (from the tracker thread). A pose that
-                #    is missing or older than TRACK_STALE_AGE counts as stale, the
-                #    same contamination signal as a missed detection before.
-                with st_lock:
-                    xy = live["xy"].copy()
-                    yaw = live["yaw"]
-                    stale = (not live["seen"]) or (time.time() - live["stamp"] > TRACK_STALE_AGE)
-                obs["xy"], obs["yaw"] = xy, yaw   # latest observation for realized_final
-                if stale:
-                    tracking["misses"] += 1
-                    rec["n_stale_replans"] += 1
-                    rec["max_consec_misses"] = max(rec["max_consec_misses"],
-                                                   tracking["misses"])
-                    if tracking["misses"] == TRACK_STALE_MISSES:
-                        rec["n_track_dropouts"] += 1
-                    if tracking["misses"] >= TRACK_STALE_MISSES:
-                        print(f"[track] WARNING: tee pose stale for "
-                              f"{tracking['misses']} consecutive replans "
-                              f"({rec['n_track_dropouts']} dropouts this trial)")
-                else:
-                    if tracking["misses"] >= TRACK_STALE_MISSES:
-                        print(f"[track] reacquired after {tracking['misses']} stale replans")
-                    tracking["misses"] = 0
+            # 1. Latest tracked tee pose (from the tracker thread). A pose that
+            #    is missing or older than TRACK_STALE_AGE counts as stale, the
+            #    same contamination signal as a missed detection before.
+            with st_lock:
+                xy = live.xy.copy()
+                yaw = live.yaw
+                stale = live.is_stale(TRACK_STALE_AGE)
+            if stale:
+                consec_misses += 1
+                rec["n_stale_replans"] += 1
+                rec["max_consec_misses"] = max(rec["max_consec_misses"], consec_misses)
+                if consec_misses == TRACK_STALE_MISSES:
+                    rec["n_track_dropouts"] += 1
+                if consec_misses >= TRACK_STALE_MISSES:
+                    print(f"[track] WARNING: tee pose stale for "
+                          f"{consec_misses} consecutive replans "
+                          f"({rec['n_track_dropouts']} dropouts this trial)")
+            else:
+                if consec_misses >= TRACK_STALE_MISSES:
+                    print(f"[track] reacquired after {consec_misses} stale replans")
+                consec_misses = 0
 
-                dist_to_goal  = float(np.linalg.norm(xy - np.array(theta.goal_xy)))
-                angle_err     = float(abs(((yaw - float(theta.goal_angle) + np.pi) % (2 * np.pi)) - np.pi))
-                rec["final_pos_err"]   = round(dist_to_goal, 4)
-                rec["final_angle_err"] = round(angle_err, 4)
-                # Live progress on one rewritten line (goal tolerances in brackets).
-                print(f"\r  [{time.time() - t_start:5.1f}s] "
-                      f"dist {dist_to_goal * 100:5.1f}cm [<{SUCCESS_POS_RADIUS * 100:.0f}]  "
-                      f"angle {np.degrees(angle_err):5.1f}° [<{np.degrees(SUCCESS_ANGLE_TOL):.0f}]  "
-                      f"replan {rec['n_replans']}   ", end="", flush=True)
-                if dist_to_goal < SUCCESS_POS_RADIUS and angle_err < SUCCESS_ANGLE_TOL:
-                    print(f"\n✓ Goal reached (dist={dist_to_goal*100:.1f}cm, angle={np.degrees(angle_err):.1f}°).")
-                    rec["success"] = True
+            dist_to_goal  = float(np.linalg.norm(xy - np.array(theta.goal_xy)))
+            angle_err     = float(abs(((yaw - float(theta.goal_angle) + np.pi) % (2 * np.pi)) - np.pi))
+            rec["final_pos_err"]   = round(dist_to_goal, 4)
+            rec["final_angle_err"] = round(angle_err, 4)
+            # Live progress on one rewritten line (goal tolerances in brackets).
+            print(f"\r  [{time.time() - t_start:5.1f}s] "
+                  f"dist {dist_to_goal * 100:5.1f}cm [<{SUCCESS_POS_RADIUS * 100:.0f}]  "
+                  f"angle {np.degrees(angle_err):5.1f}° [<{np.degrees(SUCCESS_ANGLE_TOL):.0f}]  "
+                  f"replan {rec['n_replans']}   ", end="", flush=True)
+            if dist_to_goal < SUCCESS_POS_RADIUS and angle_err < SUCCESS_ANGLE_TOL:
+                if not rec["success"]:
+                    print(f"\n✓ Goal reached (dist={dist_to_goal*100:.1f}cm, "
+                          f"angle={np.degrees(angle_err):.1f}°).")
+                rec["success"] = True
+                if trial >= 0:
                     break
 
-                # 2. Run PFMP on the planner-private MjData (tee = live pose, arm =
-                #    last commanded pose), so the render thread never races us.
-                mj_data_plan.qpos[:7] = q_prev
-                mj_data_plan.ctrl[:7] = q_prev   # rollout ramp starts from x.ctrl
-                mj_data_plan.qpos[T_QPOS_OFFSET]     = float(xy[0])
-                mj_data_plan.qpos[T_QPOS_OFFSET + 1] = float(xy[1])
-                mj_data_plan.qpos[T_QPOS_OFFSET + 2] = float(yaw)
-                if not np.all(np.isfinite(mj_data_plan.qpos)):
-                    raise RuntimeError(
-                        f"NaN/Inf in mj_data_plan (replan {rec['n_replans']}, method={method})")
-                mujoco.mj_forward(mj_model, mj_data_plan)
-                key, subkey = jax.random.split(key)
-                mjx_data = mjx.put_data(mj_model, mj_data_plan)
-                if is_dial:
-                    # DIAL runs its own annealed re-sampling loop over one replan.
-                    # A higher-fidelity solve on the trial's first replan only,
-                    # matching canonical dial-mpc's Ndiffuse_init warm-up.
-                    theta = dial_step(subkey, mjx_data, theta,
+            # 2. Run PFMP on the planner-private MjData (tee = live pose, arm =
+            #    last commanded pose), so the render thread never races us.
+            mj_data_plan.qpos[:7] = q_prev
+            mj_data_plan.ctrl[:7] = q_prev   # rollout ramp starts from x.ctrl
+            mj_data_plan.qpos[T_QPOS_OFFSET]     = float(xy[0])
+            mj_data_plan.qpos[T_QPOS_OFFSET + 1] = float(xy[1])
+            mj_data_plan.qpos[T_QPOS_OFFSET + 2] = float(yaw)
+            if not np.all(np.isfinite(mj_data_plan.qpos)):
+                raise RuntimeError(
+                    f"NaN/Inf in mj_data_plan (replan {rec['n_replans']}, method={method})")
+            mujoco.mj_forward(mj_model, mj_data_plan)
+            key, subkey = jax.random.split(key)
+            mjx_data = mjx.put_data(mj_model, mj_data_plan)
+            if cfg.is_dial:
+                # DIAL runs its own annealed re-sampling loop over one replan.
+                # A higher-fidelity solve on the trial's first replan only,
+                # matching canonical dial-mpc's Ndiffuse_init warm-up.
+                theta = cfg.dial_step(subkey, mjx_data, theta,
                                       n=DIAL_N_INIT if rec["n_replans"] == 1 else DIAL_N)
-                else:
-                    trajs, costs = replan(subkey, mjx_data, theta)
-                    theta, _ = update(theta, trajs, costs)
-                if not np.all(np.isfinite(np.array(theta.mean))):
-                    raise RuntimeError(
-                        f"NaN in theta.mean after update (replan {rec['n_replans']}, "
-                        f"method={method}). A control left the reachable sector.")
+            else:
+                trajs, costs = cfg.replan(subkey, mjx_data, theta)
+                theta, _ = cfg.update(theta, trajs, costs)
+            if not np.all(np.isfinite(np.array(theta.mean))):
+                raise RuntimeError(
+                    f"NaN in theta.mean after update (replan {rec['n_replans']}, "
+                    f"method={method}). A control left the reachable sector.")
 
-                # 3. Execute one knot before replanning. Project, not just clip: the
-                #    update averages in Cartesian, so a mean of two in-sector knots
-                #    can fall outside it (e.g. +/-105 deg averages to near the base).
-                next_wp = np.asarray(_project_reachable(jnp.asarray(theta.mean[1]), theta))
+            # 3. Execute one knot before replanning, projecting in-bounds because
+            #    some updates can land in infeasible regions.
+            next_wp = np.asarray(project_reachable(jnp.asarray(theta.mean[1]), theta))
 
-                # Predicted execution of THIS command (viz only): roll a constant
-                # "go to next_wp and hold" plan through the same dynamics, dense and
-                # over the full horizon. The arm ramps all the way to the waypoint
-                # at franky's velocity limit while pushing the tee, so playing it at
-                # real time the sim arm reaches next_wp exactly when the real robot
-                # does — no partway stop on long moves. Row 0 is x0's measured pose
-                # (snap-to-actual); arm and tee are one rollout, so they stay
-                # physically coherent throughout.
-                if use_pred:
-                    hold    = jnp.broadcast_to(jnp.asarray(next_wp), (ctrl.num_knots,) + next_wp.shape)
-                    pred_q  = np.asarray(ctrl.predict(mjx_data, hold, theta).qpos)
-                    arm_seg = pred_q[:, :7]                                 # (dense, 7)
-                    tee_seg = pred_q[:, T_QPOS_OFFSET:T_QPOS_OFFSET + 3]    # (dense, 3)
+            # q_target also backstops the seed refinement below if ik_solve on
+            # the realized ee_xy fails, so it's needed regardless of viz.
+            q_target = ik_solve(next_wp, q_prev)
+            q_target = np.asarray(q_target if q_target is not None else q_prev, dtype=float)
 
-                # Publish the sim-arm motion *before* the blocking send so the
-                # render thread sweeps in parallel with the real push. With
-                # prediction the arm and orange tee are the dense states from the
-                # SAME predicted rollout; otherwise the arm eases toward the
-                # commanded waypoint's IK. arm_dur matches franky's velocity-limited
-                # move time so the glide tracks the real robot's pace.
-                if use_pred:
-                    # The dense rollout already moves at franky's velocity limit, so
-                    # play it at its OWN real-time span (one dt per substep) — the
-                    # arm then reaches the waypoint exactly when the real robot does.
-                    # Compressing it into the franky move-time estimate ran it fast.
-                    arm_dur = (len(arm_seg) - 1) * float(ctrl.dt)
-                else:
-                    q_target = ik_solve(next_wp, q_prev)
-                    q_target = np.asarray(q_target if q_target is not None else q_prev, dtype=float)
-                    # Match franky's velocity-limited move time for the linear glide.
-                    arm_dur = float(np.max(np.abs(q_target - q_prev) /
-                                           (np.asarray(FR3_DQ_MAX) * VELOCITY_SCALE)))
-                new_mean = jnp.concatenate([theta.mean[1:], theta.mean[-1:]])
-                theta = theta._replace(mean=new_mean)
-                with st_lock:
-                    shared["arm_t0"] = time.time()
-                    shared["arm_dur"] = arm_dur
-                    shared["theta"] = theta
-                    if use_pred:
-                        shared["arm_seg"] = arm_seg
-                        shared["tee_seg"] = tee_seg
-                    else:
-                        shared["arm_start"] = q_prev.copy()
-                        shared["arm_target"] = q_target
+            if live_vis.enabled:
+                hold     = jnp.broadcast_to(jnp.asarray(next_wp), (ctrl.num_knots,) + next_wp.shape)
+                pred_q   = np.asarray(ctrl.predict(mjx_data, hold, theta).qpos)
+                arm_traj = pred_q[:, :7]                                 # (dense, 7)
+                tee_traj = pred_q[:, T_QPOS_OFFSET:T_QPOS_OFFSET + 3]    # (dense, 3)
+                glide_dur = (len(arm_traj) - 1) * float(ctrl.dt)
+            else:
+                # Match franky's velocity-limited move time; nothing renders
+                # this glide headless, but glide_dur is written below regardless.
+                arm_traj = tee_traj = None
+                glide_dur = float(np.max(np.abs(q_target - q_prev) /
+                                         (np.asarray(FR3_DQ_MAX) * VELOCITY_SCALE)))
+            new_mean = jnp.concatenate([theta.mean[1:], theta.mean[-1:]])
+            theta = theta._replace(mean=new_mean)
+            live_vis.update(theta, glide_dur, arm_traj, tee_traj)
 
-                try:
-                    reply = robot_planner.send_command(Command(xy=next_wp.tolist()))
-                    actual_xy = reply.get("actual_xy")
-                    ee_xy = np.array(actual_xy) if actual_xy else next_wp
-                    # Refine the planning seed with where the arm actually landed.
-                    q_cmd = ik_solve(ee_xy, q_prev)
-                    q_prev = np.asarray(q_cmd if q_cmd is not None else q_target, dtype=float)
-                except Exception as e:
-                    print(f"[planner] command failed: {e}")
-                    rec["n_cmd_failures"] += 1           # contamination flag
-        finally:
-            shared["running"] = False
-            if render_thread is not None:
-                render_thread.join(timeout=1.0)
+            try:
+                reply = robot_planner.send_command(Command(xy=next_wp.tolist()))
+                actual_xy = reply.get("actual_xy")
+                ee_xy = np.array(actual_xy) if actual_xy else next_wp
+                # Refine the planning seed with where the arm actually landed.
+                q_cmd = ik_solve(ee_xy, q_prev)
+                q_prev = np.asarray(q_cmd if q_cmd is not None else q_target, dtype=float)
+            except Exception as e:
+                print(f"[planner] command failed: {e}")
+                rec["n_cmd_failures"] += 1           # contamination flag
+    finally:
+        stop_event.set()
+        live_vis.close()
 
-    _write_record()
+    rec["duration_s"] = round(time.time() - t_start, 2)
+    rec["realized_final"] = [round(float(xy[0]), 4), round(float(xy[1]), 4), round(float(yaw), 4)]
+    # trial < 0 means --trial was never passed (manual/exploratory run) — don't
+    # pollute the trial log with it.
+    logged = bool(log_path) and trial >= 0
+    if logged:
+        with open(log_path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    print(f"\n[log] trial {rec['trial']} method={rec['method']} success={rec['success']} "
+          f"pos_err={rec['final_pos_err']} angle_err={rec['final_angle_err']} "
+          f"placement_err={rec['placement_err']} "
+          f"aborts={rec['n_cmd_failures']} "
+          f"dropouts={rec['n_track_dropouts']} (max {rec['max_consec_misses']} consec, "
+          f"{rec['n_stale_replans']}/{rec['n_replans']} stale replans)"
+          + (f" -> {log_path}" if logged else " (not saved: no --trial)"))
 
     # Planning finished — return the arm to home.
     print("Returning to home…")
-    _lifecycle("home")
+    robot_planner.lifecycle("home")
 
 
 
 #################################################################
 
 def main():
+    env = load_env()
     parser = argparse.ArgumentParser(description="T-block pushing with PFMP")
     parser.add_argument('--cache-resolution', type=int, default=IK_CACHE_RESOLUTION,
                         help='IK cache grid resolution')
@@ -836,13 +796,13 @@ def main():
     dial_p.add_argument("--beta2",        type=float, default=1.0)
     dial_p.add_argument("--n-inner",      type=int,   default=5)
     rt = subparsers.add_parser("realtime", parents=[shared], help="Closed-loop real robot")
-    rt.add_argument("--server",      default="127.0.0.1", help="Motive IP")
-    rt.add_argument("--local",       default="127.0.0.1", help="Local IP")
-    rt.add_argument("--server-host", default="localhost",  help="Controller host")
+    rt.add_argument("--mocap-ip",     default=env["mocap_ip"], help="Motive IP")
+    rt.add_argument("--local-ip",     default=env["local_ip"], help="Local IP")
+    rt.add_argument("--controller-ip", default=env["controller_ip"], help="Controller host")
     rt.add_argument("--cmd-port",    type=int, default=5555)
     rt.add_argument("--timeout",     type=float, default=TRIAL_TIMEOUT_S,
                     help="seconds before abandoning a trial (default 300; use ~120 for stuck-prone baselines)")
-    rt.add_argument("--method",         default="sir",
+    rt.add_argument("--method",         default="sis",
                     choices=["sir", "sis", "ps", "mppi", "biased_mppi", "cem", "biased_cem", "dial"])
     rt.add_argument("--temperature",    type=float, default=1.0, help="MPPI temperature")
     rt.add_argument("--viz",            action="store_true",
@@ -867,11 +827,8 @@ def main():
     global TEE_ANNULUS_CENTER
     TEE_ANNULUS_CENTER = reachable_r_center(ik_cache)
 
-    # With --trial set, tee_problem_gen is the single source of truth for
-    # (start, goal): the placement view shows the start ghost to position the
-    # block on, and the goal the planner optimises for is the matching spec goal,
-    # so the two can never disagree. Without --trial, fall back to --init-xy and
-    # --goal-* for one-off manual runs.
+    # With --trial set, tee_problem_gen sets (start, goal) and displays
+    # an interface for user to position the tee
     from tee_problem_gen import sample_problem
     trial = getattr(args, "trial", None)
     use_spec = trial is not None
@@ -890,23 +847,14 @@ def main():
           f"\n  goal = ({goal_x:+.3f}, {goal_y:+.3f}, {np.degrees(goal_yaw):+.1f}°)"
           + ("  [per-trial spec]" if use_spec else "  [manual]"))
 
-    # Task configuration
-    horizon   = HORIZON
-    num_knots = NUM_KNOTS
-    particles = PARTICLES
-
     # Initial end-effector position
     init_xy = jnp.array(args.init_xy)
     q0 = ik_solve(np.asarray(args.init_xy, float), np.asarray(HOME_Q))
     if q0 is None:
         raise RuntimeError(f"init xy {np.asarray(args.init_xy)} is unreachable")
     mj_data.qpos[:7] = np.array(q0)
-    # ctrl is the ramp's starting reference in `dynamics`, so it must begin at the
-    # current pose. Left at zeros, every rollout ramps from the zero configuration
-    # (arm extended horizontally) and sweeps through the table.
     mj_data.ctrl[:7] = np.array(q0)
 
-    # Initialize mean trajectory: linear interp from EE to T-block position.
     gripper_site_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_SITE, "gripper")
     mujoco.mj_fwdPosition(mj_model, mj_data)
     r_xy = jnp.array(mj_data.site_xpos[gripper_site_id, :2])
@@ -916,15 +864,13 @@ def main():
     t_qpos_xy  = mj_data.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 2]
     print(f"T world xy (xpos):  {t_world_xy}")
     print(f"T qpos[7:9]:        {t_qpos_xy}")
-    # Initial T pose comes from the same problem spec as the goal (or --init-xy in
-    # manual mode), so a sim run and a real run of trial N start from the same place.
     mj_data.qpos[T_QPOS_OFFSET]     = init_x
     mj_data.qpos[T_QPOS_OFFSET + 1] = init_y
     mj_data.qpos[T_QPOS_OFFSET + 2] = init_yaw
     mujoco.mj_forward(mj_model, mj_data)
 
     t_xy = jnp.array(mj_data.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 2])
-    alphas = jnp.linspace(0.0, 1.0, num_knots)
+    alphas = jnp.linspace(0.0, 1.0, NUM_KNOTS)
     init_mean = (1.0 - alphas[:, None]) * r_xy + alphas[:, None] * t_xy
 
     # Create parameters
@@ -941,52 +887,24 @@ def main():
     )
 
     _common = dict(
-        horizon=horizon, num_knots=num_knots, particles=particles,
+        horizon=HORIZON, num_knots=NUM_KNOTS, particles=PARTICLES,
         dt=mj_model.opt.timestep, ess_resample_thresh=0.5,
-        # Hold each knot for its interval instead of splining between knots.
-        # The proposal projects knots into the reachable sector, but a hermite
-        # interpolant between two in-sector knots leaves it ~32% of the time —
-        # the sector is non-convex in Cartesian and hermite overshoots its
-        # endpoints — and those intermediate controls reach the IK cache as NaN.
-        # ZOH also matches execution: one waypoint per knot, as the robot runs.
         interp="zoh",
     )
     ctrl = pfmp.PFMP(dynamics, running_cost, terminal_cost, init_control, proposal, **_common)
     ctrl_mppi = pfmp.PFMP(dynamics, running_cost, terminal_cost, init_control, mppi_proposal, **_common)
 
-    z_traj = float(EE_HEIGHT)
-    traj_rgba = np.array([1.0, 0.5, 0.0, 1.0], dtype=np.float32)
-
-    def goal_marker_callback(user_scn, theta):
-        add_goal_T(user_scn, np.array(theta.goal_xy), float(theta.goal_angle),
-                rgba=(0.2, 0.8, 0.2, 0.5))
-        # Draw planned EE trajectory as orange line segments between knots.
-        knots = np.array(theta.mean)  # (num_knots, 2)
-        for k in range(len(knots) - 1):
-            if user_scn.ngeom >= user_scn.maxgeom:
-                break
-            p0 = np.array([knots[k, 0],   knots[k, 1],   z_traj], dtype=np.float64)
-            p1 = np.array([knots[k+1, 0], knots[k+1, 1], z_traj], dtype=np.float64)
-            geom = user_scn.geoms[user_scn.ngeom]
-            mujoco.mjv_connector(geom, mujoco.mjtGeom.mjGEOM_LINE, 2.0, p0, p1)
-            geom.rgba[:] = traj_rgba
-            user_scn.ngeom += 1
-
     if args.algorithm == "realtime":
         from new_natnet_client.Client import NatNetClient, NatNetParams
         from pub_sub.planner import PlannerClient
 
-        # With --trial, open the placement view first so the block can be set on
-        # the spec start (and the spec goal) before the trial runs. Launched as a
-        # subprocess so its OptiTrack client fully closes before the planner opens
-        # its own — two live NatNet clients to Motive conflict.
         if use_spec:
             import subprocess
             print("Opening placement view — position the block on the ghost, "
                   "then close the window to start the trial.")
             subprocess.run(
                 [sys.executable, os.path.join(os.path.dirname(__file__), "tee_problem_gen.py"),
-                 "--server", str(args.server), "--local", str(args.local),
+                 "--mocap-ip", str(args.mocap_ip), "--local-ip", str(args.local_ip),
                  "--seed", str(args.seed), "--trial", str(trial)],
                 check=False)
 
@@ -997,13 +915,12 @@ def main():
         )
 
         robot_planner = PlannerClient(
-            command_addr=f"tcp://{args.server_host}:{args.cmd_port}",
-            response_addr="tcp://localhost:5556",
-            conflate=False, command_timeout_ms=30000,
+            command_addr=f"tcp://{args.controller_ip}:{args.cmd_port}",
+            command_timeout_ms=30000,
         )
-        params = NatNetParams(server_address=args.server, local_ip_address=args.local,
+        params = NatNetParams(server_address=args.mocap_ip, local_ip_address=args.local_ip,
                               use_multicast=False)
-        print(f"Connecting to Motive at {args.server}...")
+        print(f"Connecting to Motive at {args.mocap_ip}...")
         with NatNetClient(params) as optitrack_client:
             if optitrack_client is None:
                 print("Failed to connect."); return
@@ -1019,10 +936,8 @@ def main():
                     mj_data.qpos[T_QPOS_OFFSET + 1] = float(xy[1])
                     mj_data.qpos[T_QPOS_OFFSET + 2] = float(yaw)
                     t_xy = jnp.array(xy)
-                    alphas = jnp.linspace(0.0, 1.0, num_knots)
-                    r_xy   = jnp.array(mj_data.qpos[
-                        mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_SITE, "gripper")
-                    ] if False else [init_xy[0], init_xy[1]])
+                    alphas = jnp.linspace(0.0, 1.0, NUM_KNOTS)
+                    r_xy = jnp.array([init_xy[0], init_xy[1]])
                     theta = theta._replace(
                         mean=(1.0 - alphas[:, None]) * r_xy + alphas[:, None] * t_xy)
                     print(f"  tee at ({xy[0]:+.3f}, {xy[1]:+.3f}, {np.degrees(yaw):+.1f}°)")
@@ -1031,11 +946,6 @@ def main():
             try:
                 rt_method = getattr(args, "method", "sir")
                 temperature = args.temperature if rt_method in ("mppi", "biased_mppi") else None
-                # Proposal (active_ctrl) is decoupled from the update rule: the
-                # custom object-centric proposal (`ctrl`) is used by our method and
-                # the biased-* baselines; the Gaussian proposal (`ctrl_mppi`) by the
-                # plain baselines. This isolates the proposal axis (plain vs biased)
-                # from the update axis (mppi/cem/sir), matching the sim sweep.
                 _custom_proposal = rt_method in ("sir", "sis", "biased_mppi", "biased_cem")
                 active_ctrl = ctrl if _custom_proposal else ctrl_mppi
                 run_realtime(active_ctrl, theta, mj_model, mj_data, ik_cache,
@@ -1048,10 +958,6 @@ def main():
                              timeout=args.timeout, viz=args.viz)
             finally:
                 robot_planner.close()
-        # Realtime trial done; the log record is already written and the robot
-        # planner closed above. Skip the native-stack teardown (NatNet client
-        # __exit__ + JAX/XLA + MuJoCo viewer) that segfaults on unwind by exiting
-        # immediately — nothing below this point needs to run for a realtime run.
         os._exit(0)
     else:
         from pfmp.algorithm import cem_update, mppi_update
@@ -1094,7 +1000,7 @@ def main():
             record_video=False,
             record_traj=False,
             max_step=8000,
-            goal_marker_fn=goal_marker_callback,
+            goal_marker_fn=draw_goal_and_plan,
             update_fn=update_fn,
         )
 
