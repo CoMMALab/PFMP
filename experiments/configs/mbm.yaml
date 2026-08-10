@@ -1,0 +1,39 @@
+# MotionBenchMaker: open-loop 7-DoF configuration-space planning.
+# Every dataset holds 100 problems; problems batch per dataset because the
+# Environment arrays only share shapes within one.
+task: mbm
+urdf: models/panda_spherized.urdf
+datasets:
+  - models/problems/table_pick_panda
+  - models/problems/table_under_pick_panda
+  - models/problems/bookshelf_small_panda
+  - models/problems/bookshelf_tall_panda
+  - models/problems/bookshelf_thin_panda
+  - models/problems/box_panda
+  - models/problems/cage_panda
+problems_per_dataset: 100
+num: 700
+num_samples: 1000
+seed: 0
+tuned_params: experiments/checkpoints/mbm_tune.json
+algorithms: [sis, sir, mppi, cem, biased_mppi, biased_cem, dial]
+
+# Categorical: one bar group per dataset, so the swept value is a 1-element
+# dataset list and `xticks` carries the label.
+sweep:
+  name: fig_mbm
+  key: datasets
+  values:
+    - [models/problems/table_pick_panda]
+    - [models/problems/table_under_pick_panda]
+    - [models/problems/bookshelf_small_panda]
+    - [models/problems/bookshelf_tall_panda]
+    - [models/problems/bookshelf_thin_panda]
+    - [models/problems/box_panda]
+    - [models/problems/cage_panda]
+  xticks: [table_pick, table_under_pick, bookshelf_small, bookshelf_tall,
+           bookshelf_thin, box, cage]
+  xlabel: ""
+  ylabel: Success rate (%)
+  metric: success
+  kind: rate

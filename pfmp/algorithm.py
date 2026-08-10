@@ -16,7 +16,7 @@ from .interpolate import hermite_interp1d, Jet1, Jet2, Jet3
 # argument), included here too for a uniform import surface.
 from .update import (
     ess, dial_sigma, _check_update_shapes,
-    ps_update, sample_update, mppi_update, cem_update, dial_step,
+    ps_update, sample_update, mppi_update, cem_update, dial_step, dial_update,
 )
 
 

@@ -1,13 +1,13 @@
 """
-2d_pushT.py — T-block pushing with PFMP in 2D (no MuJoCo).
+pushT.py — T-block pushing with PFMP in 2D (no MuJoCo).
 
 A circular robot (green) pushes an orange T-shaped block toward a goal
 pose (x, y, angle). Robot motion is governed by impedance-style PD control
 toward waypoints produced by the PFMP planner.
 
 Usage:
-    python examples/2d_pushT.py
-    python examples/2d_pushT.py --save-gif
+    python examples/pushT.py
+    python examples/pushT.py --save-gif
 """
 
 import os
@@ -83,17 +83,43 @@ T_ANG_DAMP    = 1.5     # T-block angular damping coefficient
 
 # Planner
 U_STDEV          = 0.05  # proposal position noise (m)
-POS_WEIGHT       = 15.0
-ANGLE_WEIGHT     = 1.5
+# Task cost weights. Fixed across every method: the cost defines the task, so
+# tuning it per method would have each algorithm solving a different problem and
+# would confound the proposal/update/resampling axes with four different
+# objectives. Values are round numbers near the median of what independent
+# per-method Optuna searches selected (pos 33.1, angle 2.64, approach 3.06),
+# so they are reasonable for all methods rather than favouring any one.
+POS_WEIGHT       = 30.0
+ANGLE_WEIGHT     = 2.5
+# Auxiliary robot->block shaping. Default was 0, but all four baseline searches
+# independently moved it to 1.4-4.6: perturbation proposals have no
+# object-directed sampling, so they lean on the cost for that guidance. Shared
+# by every method (PFMP included), which keeps the proposal-axis comparison
+# clean while giving the baselines the term they demonstrably want.
+APPROACH_WEIGHT  = 3.0
 MPPI_TEMPERATURE = 0.5
 
 # DIAL-MPC
-DIAL_N_INNER     = 5       # inner refinement iterations per replan
+# Canonical dial-mpc's steady-state Ndiffuse (their config default; FR3 uses
+# the same). Was 5, which matched neither the reference nor our own hardware
+# path and cost 2.5x the rollouts per replan.
+DIAL_N_INNER     = 2
 DIAL_BETA1       = 1.0     # trajectory-level annealing temperature
 DIAL_BETA2       = 1.0     # action-level annealing temperature
+# dial-mpc's `temp_sample`: divides the std-normalised returns before the
+# softmax. Their default is 0.06 (configs use 0.04-0.1); pfmp.dial_step
+# defaults to 1.0 to preserve already-collected FR3 trials, so Push-T passes
+# it explicitly. Tuned by pushT_2d_optuna.
+DIAL_TEMP_SAMPLE = 0.06
 
 # CEM
 CEM_NUM_ELITES   = 10
+# Lower bound on CEM's refitted per-knot covariance, i.e. hydrax's `sigma_min`,
+# which the reference implementation takes as a required argument. Without it
+# the elite std collapses (measured: 0.152 -> 0.0006 over 18 replans at 5
+# elites), the proposal freezes, and CEM stops exploring for most of the
+# episode. Tuned per-method by pushT_2d_optuna.
+CEM_STDEV_FLOOR  = 0.01
 
 # Batch benchmark
 SUCCESS_POS_THRESH   = 0.05   # metres
@@ -110,15 +136,20 @@ class PushParams(NamedTuple):
     goal_angle:  float
     pos_weight:  float
     angle_weight: float
-    u_stdev:     float
+    # Sampling noise. Scalar for the fixed-noise methods (PS/MPPI/SIS/SIR); CEM
+    # refits it per knot, giving shape (num_knots, 2), and DIAL overwrites it per
+    # annealing level. Always read through `_sigma_at`, never directly.
+    stdev:       jax.Array
     step_len:    float       # horizon / (num_knots - 1)
     obstacles:   jax.Array   # (N, 4) each row: [cx, cy, hx, hy]
     ws_min:      jax.Array   # (2,) robot outer clip min
     ws_max:      jax.Array   # (2,) robot outer clip max
     t_ws_min:    jax.Array   # (2,) T-block inner clip min
     t_ws_max:    jax.Array   # (2,) T-block inner clip max
-    du_stdev:       jax.Array = None   # (num_knots, 2) — per-knot std for CEM
-    approach_weight: float    = 0.0    # robot-to-T cost (0 = disabled)
+    # Robot-to-T shaping cost (0 disables it). Callers should pass
+    # APPROACH_WEIGHT explicitly; this default exists only so old constructions
+    # keep working, and does NOT reflect the configured task cost.
+    approach_weight: float    = 0.0
 
 
 # ============================================================
@@ -292,15 +323,35 @@ STEP_LEN_VEL  = 0.05  # step size toward T per knot (m)
 PUSH_OVERSHOOT = 1.0  # step to T centroid (no overshoot)
 
 
+def _sigma_at(theta: PushParams, idx) -> jax.Array:
+    """Sampling noise for knot `idx`.
+
+    Handles both conventions: a scalar `stdev` (PS/MPPI/SIS/SIR, and DIAL, which
+    overwrites it per annealing level) and a per-knot array (CEM, which refits it
+    from the elites each replan). `jnp.ndim` is static, so this is free under jit
+    and the scalar path is identical to reading `theta.stdev` directly.
+    """
+    return theta.stdev if jnp.ndim(theta.stdev) == 0 else theta.stdev[idx]
+
+
+def _knot_index(theta: PushParams, t: float) -> jax.Array:
+    """Knot whose interval contains time `t` (shared by the proposals)."""
+    return jnp.clip(
+        jnp.round(t / theta.step_len).astype(jnp.int32) + 1,
+        0, theta.mean.shape[0] - 1,
+    )
+
+
 def init_control(key: jax.Array, x: jax.Array, theta: PushParams) -> jax.Array:
     key_mix, key_a, key_b = jax.random.split(key, 3)
+    sigma = _sigma_at(theta, 0)
     r_xy = x[6:8]
     t_xy = x[0:2]
     direction = t_xy - r_xy
     dist      = jnp.linalg.norm(direction) + 1e-7
     directed  = r_xy + (direction / dist) * (jnp.minimum(dist, STEP_LEN_VEL) * PUSH_OVERSHOOT)
-    directed  = directed + jax.random.normal(key_a, (2,)) * theta.u_stdev
-    random_loc = r_xy + jax.random.normal(key_b, (2,)) * theta.u_stdev * 2.0
+    directed  = directed + jax.random.normal(key_a, (2,)) * sigma
+    random_loc = r_xy + jax.random.normal(key_b, (2,)) * sigma * 2.0
     return jnp.where(jax.random.uniform(key_mix) < PROPOSAL_MIX, directed, random_loc)
 
 
@@ -308,29 +359,27 @@ def proposal(key: jax.Array, x: jax.Array, _u: jax.Array,
              theta: PushParams, t: float) -> jax.Array:
     """Mixture: push through T centroid (50%) or random walk (50%)."""
     key_mix, key_a, key_b = jax.random.split(key, 3)
+    sigma = _sigma_at(theta, _knot_index(theta, t))
     r_xy = x[6:8]
     t_xy = x[0:2]
     direction = t_xy - r_xy
     dist      = jnp.linalg.norm(direction) + 1e-7
     directed  = r_xy + (direction / dist) * (jnp.minimum(dist, STEP_LEN_VEL) * PUSH_OVERSHOOT)
-    directed  = directed + jax.random.normal(key_a, (2,)) * theta.u_stdev
-    random_loc = r_xy + jax.random.normal(key_b, (2,)) * theta.u_stdev * 2.0
+    directed  = directed + jax.random.normal(key_a, (2,)) * sigma
+    random_loc = r_xy + jax.random.normal(key_b, (2,)) * sigma * 2.0
     return jnp.where(jax.random.uniform(key_mix) < PROPOSAL_MIX, directed, random_loc)
 
 
 def perturbation_init(key: jax.Array, _x: jax.Array, theta: PushParams) -> jax.Array:
     """Perturb around the warm-started mean. Used by PS/MPPI/CEM baselines."""
-    return theta.mean[0] + jax.random.normal(key, (2,)) * theta.u_stdev
+    return theta.mean[0] + jax.random.normal(key, (2,)) * _sigma_at(theta, 0)
 
 
 def perturbation_proposal(key: jax.Array, _x: jax.Array, _u: jax.Array,
                           theta: PushParams, t: float) -> jax.Array:
     """Plan-conditioned: perturbs around theta.mean. Used by PS/MPPI/CEM baselines."""
-    idx = jnp.clip(
-        jnp.round(t / theta.step_len).astype(jnp.int32) + 1,
-        0, theta.mean.shape[0] - 1,
-    )
-    return theta.mean[idx] + jax.random.normal(key, (2,)) * theta.u_stdev
+    idx = _knot_index(theta, t)
+    return theta.mean[idx] + jax.random.normal(key, (2,)) * _sigma_at(theta, idx)
 
 
 # ============================================================
@@ -348,7 +397,7 @@ def _t_verts_world(t_xy: np.ndarray, t_angle: float) -> np.ndarray:
 # Main
 # ============================================================
 
-from pfmp import dial_sigma
+from pfmp import dial_step
 
 
 def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REPLANS):
@@ -377,6 +426,12 @@ def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REP
     if is_baseline or use_informed_proposal:
         theta = theta._replace(mean=mean_from_state(x0))
 
+    # CEM refits a per-knot covariance, so widen the scalar stdev to (K, 2)
+    # first: cem_update only adapts when stdev is already per-knot, which is
+    # what keeps it from clobbering the scalar the fixed-noise methods use.
+    if method in ('cem', 'biased_cem') and jnp.ndim(theta.stdev) == 0:
+        theta = theta._replace(stdev=jnp.full((NUM_KNOTS, 2), theta.stdev))
+
     print("JIT warm-up…", end=" ", flush=True)
     key, subkey = jax.random.split(key)
     _ = ctrl.run_sis(subkey, x0, theta)
@@ -394,32 +449,25 @@ def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REP
 
     for step_i in range(n_replans):
         key, subkey = jax.random.split(key)
-        trajs, costs = ctrl.run_sis(subkey, x, theta)
 
-        if method in ('mppi', 'biased_mppi'):
-            temperature = MPPI_TEMPERATURE  # fixed inverse-temperature (canonical MPPI), not adaptively scaled by cost std
-            theta, _ = mppi_update(theta, trajs, costs, max(temperature, 1e-6))
-        elif method in ('cem', 'biased_cem'):
-            # cem_update takes (P, K) per-knot costs and sums internally
-            theta, _ = cem_update(theta, trajs, costs,
-                                  elite_frac=CEM_NUM_ELITES / particles)
-        elif method == 'dial':
-            for i_inner in range(DIAL_N_INNER, 0, -1):
-                sigmas = jnp.array([
-                    dial_sigma(i_inner, h, U_STDEV, DIAL_N_INNER, NUM_KNOTS,
-                               DIAL_BETA1, DIAL_BETA2)
-                    for h in range(NUM_KNOTS)
-                ])
-                key, subkey_i = jax.random.split(key)
-                theta_i = theta._replace(u_stdev=float(sigmas.mean()))
-                trajs_i, costs_i = ctrl.run_sis(subkey_i, x, theta_i)
-                total_costs_i = jnp.sum(costs_i, axis=1)
-                temperature = float(jnp.std(jnp.where(jnp.isfinite(total_costs_i), total_costs_i, 0.0))) * MPPI_TEMPERATURE
-                theta, _ = mppi_update(theta, trajs_i, costs_i, max(temperature, 1e-6))
-        elif method == 'ps':
-            theta, _ = ps_update(theta, trajs, costs)
+        if method == 'dial':
+            # DIAL owns its re-sampling: one fresh batch per annealing level,
+            # via the shared pfmp.dial_step (see pfmp/update.py).
+            theta = dial_step(subkey, ctrl, x, theta, n=DIAL_N_INNER,
+                              beta1=DIAL_BETA1, beta2=DIAL_BETA2,
+                              temp_sample=DIAL_TEMP_SAMPLE)
         else:
-            theta, _ = ps_update(theta, trajs, costs)
+            trajs, costs = ctrl.run_sis(subkey, x, theta)
+            if method in ('mppi', 'biased_mppi'):
+                temperature = MPPI_TEMPERATURE  # fixed inverse-temperature (canonical MPPI), not adaptively scaled by cost std
+                theta, _ = mppi_update(theta, trajs, costs, max(temperature, 1e-6))
+            elif method in ('cem', 'biased_cem'):
+                # cem_update takes (P, K) per-knot costs and sums internally
+                theta, _ = cem_update(theta, trajs, costs,
+                                      elite_frac=CEM_NUM_ELITES / particles,
+                                      stdev_floor=CEM_STDEV_FLOOR)
+            else:
+                theta, _ = ps_update(theta, trajs, costs)
 
         plans.append(np.array(theta.mean))
 
@@ -443,6 +491,78 @@ def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REP
 
     print(f"Simulation complete — {len(states)} states recorded.")
     return states, plans
+
+
+def make_batched_simulate(method, ctrl, particles, n_replans,
+                          mppi_temp=MPPI_TEMPERATURE, cem_elites=CEM_NUM_ELITES,
+                          dial_b1=DIAL_BETA1, dial_b2=DIAL_BETA2,
+                          dial_temp_sample=DIAL_TEMP_SAMPLE,
+                          dial_n_inner=DIAL_N_INNER,
+                          cem_stdev_floor=CEM_STDEV_FLOOR):
+    """Build `jit(vmap(simulate_one))`: closed-loop rollout for a whole batch of
+    scenarios at once, scanning over replans.
+
+    This is the hot path for both the sweep and the optuna tuner. Running the
+    scenarios as a Python loop instead costs a separate dispatch per
+    (scenario, replan) at only `particles` wide, which badly underutilises the
+    GPU; batching them is worth more than an order of magnitude.
+
+    Returns a callable (keys, x0s, thetas) -> final states, where every argument
+    is stacked along a leading batch axis.
+    """
+    tk0 = jnp.array(ctrl.tk())
+    is_baseline = method in ('mppi', 'dial', 'ps', 'cem')
+
+    def simulate_one(key, x0, theta):
+        if is_baseline or method in ('biased_mppi', 'biased_cem'):
+            alphas = jnp.linspace(0.0, 1.0, NUM_KNOTS)
+            theta = theta._replace(
+                mean=(1 - alphas[:, None]) * x0[6:8] + alphas[:, None] * x0[0:2])
+
+        def replan_step(carry, _):
+            key, x, theta = carry
+            key, subkey = jax.random.split(key)
+
+            if method == 'dial':
+                # DIAL owns its re-sampling: one fresh batch per annealing
+                # level, via the shared pfmp.dial_step.
+                theta = dial_step(subkey, ctrl, x, theta, n=dial_n_inner,
+                                  beta1=dial_b1, beta2=dial_b2,
+                                  temp_sample=dial_temp_sample)
+            else:
+                trajs, costs = ctrl.run_sis(subkey, x, theta)
+                if method in ('mppi', 'biased_mppi'):
+                    # Fixed inverse-temperature (canonical MPPI, Williams et al.),
+                    # matching simulate() and the optuna tuner. This path used to
+                    # scale it by std(total) instead, which silently made a tuned
+                    # temperature mean something different here than where it was
+                    # tuned. DIAL's own std-based schedule lives in dial_step.
+                    theta, _ = mppi_update(theta, trajs, costs, max(mppi_temp, 1e-6))
+                elif method in ('cem', 'biased_cem'):
+                    theta, _ = cem_update(theta, trajs, costs,
+                                          elite_frac=cem_elites / particles,
+                                          stdev_floor=cem_stdev_floor)
+                else:
+                    theta, _ = ps_update(theta, trajs, costs)
+
+            tq = jnp.arange(STEPS_PER_REPLAN) * DT
+            us = hermite_spline(tq, tk0, theta.mean)
+
+            def phys_step(x, args):
+                u, t = args
+                xn, _ = dynamics(x, u, theta, t)
+                return xn, xn
+
+            x, _ = jax.lax.scan(phys_step, x, (us, tq))
+            new_tk = tk0 + STEPS_PER_REPLAN * DT
+            theta = theta._replace(mean=hermite_spline(new_tk, tk0, theta.mean))
+            return (key, x, theta), None
+
+        (_, x_final, _), _ = jax.lax.scan(
+            replan_step, (key, x0, theta), None, length=n_replans)
+        return x_final
+
+    return jax.jit(jax.vmap(simulate_one))
 
 
 def _obs_sdf_np(pt, obs):
@@ -589,14 +709,14 @@ def _build_scenario(seed: int, distance: float | None, n_obs_override: int | Non
         goal_angle=float(goal_angle),
         pos_weight=POS_WEIGHT,
         angle_weight=ANGLE_WEIGHT,
-        u_stdev=U_STDEV,
+        approach_weight=APPROACH_WEIGHT,
+        stdev=U_STDEV,
         step_len=HORIZON / (NUM_KNOTS - 1),
         obstacles=jnp.array(obstacles),
         ws_min=jnp.array(ws_min),
         ws_max=jnp.array(ws_max),
         t_ws_min=jnp.array(t_ws_min),
         t_ws_max=jnp.array(t_ws_max),
-        du_stdev=jnp.full((NUM_KNOTS, 2), U_STDEV),
     )
     n_replans = int(N_REPLANS * max(1.0, distance)) if distance is not None else N_REPLANS
     return x0, theta, ws_min, ws_max, n_replans
@@ -743,24 +863,42 @@ def main():
             _base = {'biased_mppi': 'mppi', 'biased_cem': 'cem'}.get(
                 method, method.split('_')[0] if method.startswith('pfmp') else method)
             p = _tuned.get(_base, {})
-            pos_weight_m    = p.get('pos_weight',      POS_WEIGHT)
-            angle_weight_m  = p.get('angle_weight',    ANGLE_WEIGHT)
-            u_stdev_m       = p.get('u_stdev',         U_STDEV)
-            approach_wt_m   = p.get('approach_weight', 0.0)
+            # The cost function is part of the task, not of the method: every
+            # method minimises the same J, so these are read from the module
+            # constants and NOT from the tuned file. Tuning them per method would
+            # have each algorithm solving a different problem, confounding the
+            # proposal/update/resampling axes with four different objectives.
+            # (`approach_weight` is the worst offender: it pulls the robot toward
+            # the block, which is the job the object-centric proposal is meant to
+            # do, so leaving it tunable blurs the very axis Push-T isolates.)
+            pos_weight_m    = POS_WEIGHT
+            angle_weight_m  = ANGLE_WEIGHT
+            approach_wt_m   = APPROACH_WEIGHT
+            # 'u_stdev' is the pre-2026-08 key for the same knob; accept it so a
+            # restored older tune file doesn't silently fall back to the untuned
+            # default and quietly produce wrong sweep numbers.
+            stdev_val       = p.get('stdev', p.get('u_stdev', U_STDEV))
             mppi_temp_m     = p.get('mppi_temperature', MPPI_TEMPERATURE)
             cem_elites_m    = int(p.get('cem_num_elites', CEM_NUM_ELITES))
+            cem_floor_m     = p.get('cem_stdev_floor', CEM_STDEV_FLOOR)
             dial_beta1_m    = p.get('dial_beta1',      DIAL_BETA1)
             dial_beta2_m    = p.get('dial_beta2',      DIAL_BETA2)
+            dial_temp_m     = p.get('dial_temp_sample', DIAL_TEMP_SAMPLE)
 
+            # CEM refits a per-knot covariance, so it needs stdev already widened
+            # to (K, 2) per batch element; every other method keeps the scalar
+            # (cem_update only adapts a stdev that is already per-knot).
+            stdev_m = (jnp.full((args.batch, NUM_KNOTS, 2), stdev_val)
+                       if method in ('cem', 'biased_cem')
+                       else jnp.full(args.batch, stdev_val))
             theta_batch_m = jax.tree.map(
                 lambda x: x, theta_batch  # start from scenario defaults
             )._replace(
                 pos_weight   =jnp.full(args.batch, pos_weight_m),
                 angle_weight =jnp.full(args.batch, angle_weight_m),
-                u_stdev      =jnp.full(args.batch, u_stdev_m),
+                stdev        =stdev_m,
                 approach_weight=jnp.full(args.batch, approach_wt_m),
                 step_len     =jnp.full(args.batch, HORIZON / (NUM_KNOTS - 1)),
-                du_stdev     =jnp.full((args.batch, NUM_KNOTS, 2), u_stdev_m),
             )
 
             ctrl = PFMP(
@@ -770,62 +908,12 @@ def main():
                 horizon=HORIZON, num_knots=NUM_KNOTS, particles=args.particles,
                 ess_resample_thresh=ess_thresh, dt=DT,
             )
-            tk0 = jnp.array(ctrl.tk())
-
-            def simulate_one(key, x0, theta,
-                             _mppi_temp=mppi_temp_m, _cem_elites=cem_elites_m,
-                             _dial_b1=dial_beta1_m, _dial_b2=dial_beta2_m):
-                if is_baseline or method in ('biased_mppi', 'biased_cem'):
-                    alphas = jnp.linspace(0.0, 1.0, NUM_KNOTS)
-                    theta = theta._replace(
-                        mean=(1 - alphas[:, None]) * x0[6:8] + alphas[:, None] * x0[0:2])
-
-                def replan_step(carry, _):
-                    key, x, theta = carry
-                    key, subkey = jax.random.split(key)
-                    trajs, costs = ctrl.run_sis(subkey, x, theta)
-
-                    if method in ('mppi', 'biased_mppi'):
-                        total = jnp.sum(costs, axis=1)
-                        temp = jnp.maximum(jnp.std(total) * _mppi_temp, 1e-6)
-                        theta, _ = mppi_update(theta, trajs, costs, temp)
-                    elif method in ('cem', 'biased_cem'):
-                        theta, _ = cem_update(theta, trajs, costs,
-                                              elite_frac=_cem_elites / args.particles)
-                    elif method == 'dial':
-                        for i_inner in range(DIAL_N_INNER, 0, -1):
-                            sigma_mean = jnp.mean(jnp.array([
-                                dial_sigma(i_inner, h, theta.u_stdev, DIAL_N_INNER, NUM_KNOTS,
-                                           _dial_b1, _dial_b2)
-                                for h in range(NUM_KNOTS)
-                            ]))
-                            key, subkey_i = jax.random.split(key)
-                            theta_i = theta._replace(u_stdev=sigma_mean)
-                            trajs_i, costs_i = ctrl.run_sis(subkey_i, x, theta_i)
-                            total_i = jnp.sum(costs_i, axis=1)
-                            temp = jnp.maximum(jnp.std(total_i) * _mppi_temp, 1e-6)
-                            theta, _ = mppi_update(theta, trajs_i, costs_i, temp)
-                    else:
-                        theta, _ = ps_update(theta, trajs, costs)
-
-                    tq = jnp.arange(STEPS_PER_REPLAN) * DT
-                    us = hermite_spline(tq, tk0, theta.mean)
-
-                    def phys_step(x, args):
-                        u, t = args
-                        xn, _ = dynamics(x, u, theta, t)
-                        return xn, xn
-
-                    x, _ = jax.lax.scan(phys_step, x, (us, tq))
-                    new_tk = tk0 + STEPS_PER_REPLAN * DT
-                    theta = theta._replace(mean=hermite_spline(new_tk, tk0, theta.mean))
-                    return (key, x, theta), None
-
-                (_, x_final, _), _ = jax.lax.scan(
-                    replan_step, (key, x0, theta), None, length=n_replans)
-                return x_final
-
-            run_batch = jax.jit(jax.vmap(simulate_one))
+            run_batch = make_batched_simulate(
+                method, ctrl, args.particles, n_replans,
+                mppi_temp=mppi_temp_m, cem_elites=cem_elites_m,
+                cem_stdev_floor=cem_floor_m,
+                dial_b1=dial_beta1_m, dial_b2=dial_beta2_m,
+                dial_temp_sample=dial_temp_m)
             print(f"{method}  warm-up…", end=" ", flush=True)
             run_batch(keys_batch, x0_batch, theta_batch_m)[0].block_until_ready()
             print("running…", end=" ", flush=True)
@@ -1012,7 +1100,7 @@ def main():
             suffix = "corridor"
         else:
             suffix = f"random_s{args.seed}"
-        out = Path(__file__).parent.parent / "figures" / f"2d_pushT_{args.method}_{suffix}.gif"
+        out = Path(__file__).parent.parent / "figures" / f"pushT_{args.method}_{suffix}.gif"
         out.parent.mkdir(parents=True, exist_ok=True)
         print(f"Saving gif to {out}…")
         anim.save(str(out), writer='pillow', fps=30, dpi=120)

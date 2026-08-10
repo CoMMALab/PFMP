@@ -1,7 +1,7 @@
 """
 2D push-T distance sweep — success rate vs. problem difficulty.
 
-Mirrors the structure of 2d_geometric.py: run with --experiment to collect
+Mirrors the structure of geometric.py: run with --experiment to collect
 data (caches per-distance JSON), then --plot-only to regenerate figures.
 
 Usage:
@@ -77,7 +77,7 @@ def run_experiment(distances=None, batch=BATCH, particles=PARTICLES, seed=SEED, 
         print(f"  distance={d:.1f}  batch={batch}  particles={particles}")
         print(f"{'='*60}")
         cmd = [
-            sys.executable, "examples/2d_pushT.py",
+            sys.executable, "examples/pushT.py",
             "--distance",  str(d),
             "--batch",     str(batch),
             "--particles", str(particles),

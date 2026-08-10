@@ -25,8 +25,9 @@ from viser.extras import ViserUrdf
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))   # sibling: mbm.py
 
-from fr3.mbm import (
+from mbm import (
     load_robot, load_mbm_dataset, Params, Q_MIN, Q_MAX,
     forward_kinematics, dynamics, cost_fn, terminal_cost, init, proposal,
     add_environment_to_viser,

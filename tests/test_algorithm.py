@@ -1,6 +1,7 @@
 """API-surface tests for the PFMP controller.
 
-Covers the pieces `test_update.py` (update rules) and `test_dial.py` (annealing
+Covers the pieces `test_update.py` (update rules) and
+`test_hydrax_reference.py` (annealing
 schedule) do not: the knot grid, interval integration, rollouts, resampling, and
 ancestor tracing. The emphasis is on **shapes and off-by-one boundaries**, since
 those are silent failure modes — a transposed cost array or a knot-grid that is

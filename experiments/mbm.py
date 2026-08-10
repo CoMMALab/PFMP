@@ -453,22 +453,29 @@ def load_mbm_dataset(dataset_dir, max_problems=None):
 Q_MIN = jnp.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973])
 Q_MAX = jnp.array([2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973])
 
-# Tuned via Optuna over 7 MBM datasets (88.6% success rate)
+# TASK: cost + dynamics. Fixed and identical for every method — these define the
+# problem, so tuning them per method would mean each algorithm solving a
+# different one. Values are frozen Optuna output from a search that maximised
+# SMC's success (88.6% over the 7 datasets), so they are known to favour it;
+# they are held fixed rather than re-fit so the comparison is at least common.
 COL_WEIGHT           = 1768.2
 GOAL_WEIGHT          = 0.0189
 COL_MARGIN           = 0.0133
 TERMINAL_GOAL_WEIGHT = 10.17
-GOAL_FRAC            = 0.339
-GAUSS_FRAC           = 0.333
-GAUSS_STD            = 0.395
-NUM_KNOTS            = 5
-HORIZON              = 2.264
-ESS_THRESH           = 0.552
 STEP_SIZE            = 0.288
 
-# Baseline (PS/MPPI/CEM) perturbation-proposal settings. The baselines perturb a
-# straight-line warm-start with Gaussian noise of std BASE_U_STDEV; untuned.
-BASE_U_STDEV         = GAUSS_STD
+# BUDGET: fixed and shared, so methods are compared at matched compute.
+NUM_KNOTS            = 5
+HORIZON              = 2.264
+
+# METHOD-SPECIFIC defaults, overridden per method by the tuned JSON. These are
+# the proposal / resampling / update axes the benchmark actually compares, so
+# each method tunes its own and nothing here is shared between them.
+GOAL_FRAC            = 0.339   # SMC proposal: mixture weight toward the goal
+GAUSS_FRAC           = 0.333   # SMC proposal: mixture weight on the local Gaussian
+GAUSS_STD            = 0.395   # SMC proposal: local Gaussian width
+ESS_THRESH           = 0.552   # SMC resampling threshold (0 = never, i.e. SIS)
+BASE_U_STDEV         = 0.395   # baselines: perturbation width around the warm start
 MPPI_TEMPERATURE     = 1.0
 CEM_ELITE_FRAC       = 0.1
 STEP_LEN             = HORIZON / (NUM_KNOTS - 1)
@@ -482,8 +489,16 @@ class Params(NamedTuple):
     robot: dict
     step_size: float = STEP_SIZE
     mean: jax.Array = None        # (num_knots, dof) warm-start for baselines
-    u_stdev: float = BASE_U_STDEV  # perturbation std for baselines
+    # Perturbation noise for the baselines. Scalar for the fixed-noise methods
+    # (PS/MPPI); CEM refits it per knot, giving shape (num_knots, dof). Always
+    # read through `_sigma_at`, never directly.
+    stdev: jax.Array = BASE_U_STDEV
     step_len: float = STEP_LEN     # knot time spacing for baseline proposal
+    # SMC's object-informed proposal mixture. On theta rather than module
+    # globals so the tuner can search them per method; `init` reads them here.
+    goal_frac: float = GOAL_FRAC
+    gauss_frac: float = GAUSS_FRAC
+    gauss_std: float = GAUSS_STD
 
 
 def cost_fn(x, u, theta, t):
@@ -519,10 +534,12 @@ def init(key, x, theta):
     k1, k2, k3 = jax.random.split(key, 3)
     r = jax.random.uniform(k1)
     
-    branch = jnp.where(r < GOAL_FRAC, 0, jnp.where(r < GOAL_FRAC + GAUSS_FRAC, 1, 2))
+    branch = jnp.where(r < theta.goal_frac, 0,
+                       jnp.where(r < theta.goal_frac + theta.gauss_frac, 1, 2))
     return jax.lax.switch(branch, [
         lambda _: theta.goal,
-        lambda _: jnp.clip(x + jax.random.normal(k2, x.shape) * GAUSS_STD, theta.q_min, theta.q_max),
+        lambda _: jnp.clip(x + jax.random.normal(k2, x.shape) * theta.gauss_std,
+                           theta.q_min, theta.q_max),
         lambda _: jax.random.uniform(k3, x.shape, minval=theta.q_min, maxval=theta.q_max),
     ], None)
 
@@ -534,15 +551,26 @@ def proposal(key, x, u, theta, t):
 # Perturbation proposal for the PS/MPPI/CEM baselines: Gaussian noise around a
 # warm-start plan theta.mean (a straight line from q_start to q_goal). Mirrors
 # the Gaussian-perturbation proposal used by the MuJoCo and push-T baselines.
+def _sigma_at(theta, idx):
+    """Perturbation noise for knot `idx`.
+
+    Handles both conventions: a scalar `stdev` (PS/MPPI) and a per-knot array
+    (CEM, which refits it from the elites each replan). `jnp.ndim` is static, so
+    this is free under jit and the scalar path is identical to reading
+    `theta.stdev` directly.
+    """
+    return theta.stdev if jnp.ndim(theta.stdev) == 0 else theta.stdev[idx]
+
+
 def perturbation_init(key, x, theta):
-    return jnp.clip(theta.mean[0] + jax.random.normal(key, x.shape) * theta.u_stdev,
+    return jnp.clip(theta.mean[0] + jax.random.normal(key, x.shape) * _sigma_at(theta, 0),
                     theta.q_min, theta.q_max)
 
 
 def perturbation_proposal(key, x, u, theta, t):
     idx = jnp.clip(jnp.round(t / theta.step_len).astype(jnp.int32) + 1,
                    0, theta.mean.shape[0] - 1)
-    return jnp.clip(theta.mean[idx] + jax.random.normal(key, x.shape) * theta.u_stdev,
+    return jnp.clip(theta.mean[idx] + jax.random.normal(key, x.shape) * _sigma_at(theta, idx),
                     theta.q_min, theta.q_max)
 
 
@@ -571,7 +599,10 @@ def run_benchmark_fast(dataset_dir, urdf_path='models/panda_spherized.urdf', n_p
     if tuned_path and Path(tuned_path).exists():
         _tuned = {m: v.get('best_params', {}) for m, v in _json.load(open(tuned_path)).items()}
         print(f"Loaded tuned baseline params for: {sorted(_tuned)}")
-    _ustdev = lambda m: float(_tuned.get(m, {}).get('u_stdev', BASE_U_STDEV))
+    # 'u_stdev' is the pre-2026-08 key for the same knob; accept it so tuned
+    # JSON written before the rename still loads.
+    _ustdev = lambda m: float(_tuned.get(m, {}).get(
+        'stdev', _tuned.get(m, {}).get('u_stdev', BASE_U_STDEV)))
     _temp   = lambda m: float(_tuned.get(m, {}).get('mppi_temperature', MPPI_TEMPERATURE))
     _elite  = lambda m: float(_tuned.get(m, {}).get('cem_elite_frac', CEM_ELITE_FRAC))
     PS_USTDEV, MPPI_USTDEV, CEM_USTDEV = _ustdev('ps'), _ustdev('mppi'), _ustdev('cem')
@@ -637,16 +668,19 @@ def run_benchmark_fast(dataset_dir, urdf_path='models/panda_spherized.urdf', n_p
         th, _ = cem_update(theta, trajs, costs, BCEM_EF)
         return th.mean
 
-    # method -> (run_fn, perturbation u_stdev)
+    # method -> (run_fn, perturbation stdev)
     PERTURB_BASELINES = {'ps': (run_ps, PS_USTDEV), 'mppi': (run_mppi, MPPI_USTDEV),
                          'cem': (run_cem, CEM_USTDEV)}
     BIASED_BASELINES  = {'biased_mppi': run_biased_mppi, 'biased_cem': run_biased_cem}
 
-    def warm_start_theta(problem, u_stdev):
+    def warm_start_theta(problem, stdev):
+        # Scalar stdev throughout: MBM plans open-loop (one sample + one update
+        # per problem), so CEM has no second iteration in which a refit
+        # covariance could be used. Unlike push-T/FR3, there is nothing to widen.
         a = jnp.linspace(0.0, 1.0, NUM_KNOTS)[:, None]
         mean0 = (1 - a) * problem['q_start'] + a * problem['q_goal']
         return Params(goal=problem['q_goal'], env=problem['env'],
-                      q_min=Q_MIN, q_max=Q_MAX, robot=robot, mean=mean0, u_stdev=u_stdev)
+                      q_min=Q_MIN, q_max=Q_MAX, robot=robot, mean=mean0, stdev=stdev)
 
     @jax.jit
     def extract_path(traj_knots, q_start, theta):
