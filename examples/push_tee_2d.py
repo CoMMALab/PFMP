@@ -24,7 +24,8 @@ import numpy as np
 from matplotlib.animation import FuncAnimation
 from matplotlib.patches import Circle, FancyArrowPatch, Polygon
 
-from pfmp import PFMP
+from pfmp import (PFMP, method_decomp, make_perturbation,
+                  sigma_at as _sigma_at, knot_index as _knot_index)
 from pfmp.algorithm import ps_update, mppi_update, cem_update
 from pfmp.interpolate import hermite_spline
 
@@ -121,7 +122,7 @@ CEM_NUM_ELITES   = 10
 # episode. Tuned per-method by pushT_2d_optuna.
 CEM_STDEV_FLOOR  = 0.01
 
-# Batch benchmark
+# Success thresholds, read by geom_runner's push-T `measure`
 SUCCESS_POS_THRESH   = 0.05   # metres
 SUCCESS_ANGLE_THRESH = 0.2    # radians
 
@@ -323,25 +324,6 @@ STEP_LEN_VEL  = 0.05  # step size toward T per knot (m)
 PUSH_OVERSHOOT = 1.0  # step to T centroid (no overshoot)
 
 
-def _sigma_at(theta: PushParams, idx) -> jax.Array:
-    """Sampling noise for knot `idx`.
-
-    Handles both conventions: a scalar `stdev` (PS/MPPI/SIS/SIR, and DIAL, which
-    overwrites it per annealing level) and a per-knot array (CEM, which refits it
-    from the elites each replan). `jnp.ndim` is static, so this is free under jit
-    and the scalar path is identical to reading `theta.stdev` directly.
-    """
-    return theta.stdev if jnp.ndim(theta.stdev) == 0 else theta.stdev[idx]
-
-
-def _knot_index(theta: PushParams, t: float) -> jax.Array:
-    """Knot whose interval contains time `t` (shared by the proposals)."""
-    return jnp.clip(
-        jnp.round(t / theta.step_len).astype(jnp.int32) + 1,
-        0, theta.mean.shape[0] - 1,
-    )
-
-
 def init_control(key: jax.Array, x: jax.Array, theta: PushParams) -> jax.Array:
     key_mix, key_a, key_b = jax.random.split(key, 3)
     sigma = _sigma_at(theta, 0)
@@ -370,18 +352,6 @@ def proposal(key: jax.Array, x: jax.Array, _u: jax.Array,
     return jnp.where(jax.random.uniform(key_mix) < PROPOSAL_MIX, directed, random_loc)
 
 
-def perturbation_init(key: jax.Array, _x: jax.Array, theta: PushParams) -> jax.Array:
-    """Perturb around the warm-started mean. Used by PS/MPPI/CEM baselines."""
-    return theta.mean[0] + jax.random.normal(key, (2,)) * _sigma_at(theta, 0)
-
-
-def perturbation_proposal(key: jax.Array, _x: jax.Array, _u: jax.Array,
-                          theta: PushParams, t: float) -> jax.Array:
-    """Plan-conditioned: perturbs around theta.mean. Used by PS/MPPI/CEM baselines."""
-    idx = _knot_index(theta, t)
-    return theta.mean[idx] + jax.random.normal(key, (2,)) * _sigma_at(theta, idx)
-
-
 # ============================================================
 # Visualisation helpers
 # ============================================================
@@ -402,17 +372,19 @@ from pfmp import dial_step
 
 def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REPLANS):
     """Run closed-loop simulation, return (states, plans)."""
-    is_baseline = method in ('mppi', 'dial', 'ps', 'cem')
-    use_informed_proposal = method in ('biased_mppi', 'biased_cem')
+    # One decoder for the three axes, shared with geom_runner (pfmp.method_decomp).
+    proposal_kind, update_kind, rho = method_decomp(method)
+    informed = proposal_kind == "informed"
+    perturb_init, perturb_proposal = make_perturbation()   # push-T clips in the dynamics
 
     ctrl = PFMP(
         dynamics, running_cost, terminal_cost,
-        perturbation_init     if is_baseline and not use_informed_proposal else init_control,
-        perturbation_proposal if is_baseline and not use_informed_proposal else proposal,
+        init_control if informed else perturb_init,
+        proposal     if informed else perturb_proposal,
         horizon=HORIZON,
         num_knots=NUM_KNOTS,
         particles=particles,
-        ess_resample_thresh=0.0 if is_baseline or use_informed_proposal else ESS_THRESH,
+        ess_resample_thresh=(ESS_THRESH if rho is None else rho),
         dt=DT,
     )
 
@@ -423,13 +395,14 @@ def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REP
         alphas = jnp.linspace(0.0, 1.0, NUM_KNOTS)
         return (1.0 - alphas[:, None]) * r_xy + alphas[:, None] * t_xy
 
-    if is_baseline or use_informed_proposal:
+    # Only the non-resampling methods need a nominal plan to perturb around.
+    if rho == 0.0:
         theta = theta._replace(mean=mean_from_state(x0))
 
     # CEM refits a per-knot covariance, so widen the scalar stdev to (K, 2)
     # first: cem_update only adapts when stdev is already per-knot, which is
     # what keeps it from clobbering the scalar the fixed-noise methods use.
-    if method in ('cem', 'biased_cem') and jnp.ndim(theta.stdev) == 0:
+    if update_kind == "topk" and jnp.ndim(theta.stdev) == 0:
         theta = theta._replace(stdev=jnp.full((NUM_KNOTS, 2), theta.stdev))
 
     print("JIT warm-up…", end=" ", flush=True)
@@ -450,7 +423,7 @@ def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REP
     for step_i in range(n_replans):
         key, subkey = jax.random.split(key)
 
-        if method == 'dial':
+        if update_kind == "diffuse":
             # DIAL owns its re-sampling: one fresh batch per annealing level,
             # via the shared pfmp.dial_step (see pfmp/update.py).
             theta = dial_step(subkey, ctrl, x, theta, n=DIAL_N_INNER,
@@ -458,10 +431,10 @@ def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REP
                               temp_sample=DIAL_TEMP_SAMPLE)
         else:
             trajs, costs = ctrl.run_sis(subkey, x, theta)
-            if method in ('mppi', 'biased_mppi'):
+            if update_kind == "mean":
                 temperature = MPPI_TEMPERATURE  # fixed inverse-temperature (canonical MPPI), not adaptively scaled by cost std
                 theta, _ = mppi_update(theta, trajs, costs, max(temperature, 1e-6))
-            elif method in ('cem', 'biased_cem'):
+            elif update_kind == "topk":
                 # cem_update takes (P, K) per-knot costs and sums internally
                 theta, _ = cem_update(theta, trajs, costs,
                                       elite_frac=CEM_NUM_ELITES / particles,
@@ -493,78 +466,6 @@ def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REP
     return states, plans
 
 
-def make_batched_simulate(method, ctrl, particles, n_replans,
-                          mppi_temp=MPPI_TEMPERATURE, cem_elites=CEM_NUM_ELITES,
-                          dial_b1=DIAL_BETA1, dial_b2=DIAL_BETA2,
-                          dial_temp_sample=DIAL_TEMP_SAMPLE,
-                          dial_n_inner=DIAL_N_INNER,
-                          cem_stdev_floor=CEM_STDEV_FLOOR):
-    """Build `jit(vmap(simulate_one))`: closed-loop rollout for a whole batch of
-    scenarios at once, scanning over replans.
-
-    This is the hot path for both the sweep and the optuna tuner. Running the
-    scenarios as a Python loop instead costs a separate dispatch per
-    (scenario, replan) at only `particles` wide, which badly underutilises the
-    GPU; batching them is worth more than an order of magnitude.
-
-    Returns a callable (keys, x0s, thetas) -> final states, where every argument
-    is stacked along a leading batch axis.
-    """
-    tk0 = jnp.array(ctrl.tk())
-    is_baseline = method in ('mppi', 'dial', 'ps', 'cem')
-
-    def simulate_one(key, x0, theta):
-        if is_baseline or method in ('biased_mppi', 'biased_cem'):
-            alphas = jnp.linspace(0.0, 1.0, NUM_KNOTS)
-            theta = theta._replace(
-                mean=(1 - alphas[:, None]) * x0[6:8] + alphas[:, None] * x0[0:2])
-
-        def replan_step(carry, _):
-            key, x, theta = carry
-            key, subkey = jax.random.split(key)
-
-            if method == 'dial':
-                # DIAL owns its re-sampling: one fresh batch per annealing
-                # level, via the shared pfmp.dial_step.
-                theta = dial_step(subkey, ctrl, x, theta, n=dial_n_inner,
-                                  beta1=dial_b1, beta2=dial_b2,
-                                  temp_sample=dial_temp_sample)
-            else:
-                trajs, costs = ctrl.run_sis(subkey, x, theta)
-                if method in ('mppi', 'biased_mppi'):
-                    # Fixed inverse-temperature (canonical MPPI, Williams et al.),
-                    # matching simulate() and the optuna tuner. This path used to
-                    # scale it by std(total) instead, which silently made a tuned
-                    # temperature mean something different here than where it was
-                    # tuned. DIAL's own std-based schedule lives in dial_step.
-                    theta, _ = mppi_update(theta, trajs, costs, max(mppi_temp, 1e-6))
-                elif method in ('cem', 'biased_cem'):
-                    theta, _ = cem_update(theta, trajs, costs,
-                                          elite_frac=cem_elites / particles,
-                                          stdev_floor=cem_stdev_floor)
-                else:
-                    theta, _ = ps_update(theta, trajs, costs)
-
-            tq = jnp.arange(STEPS_PER_REPLAN) * DT
-            us = hermite_spline(tq, tk0, theta.mean)
-
-            def phys_step(x, args):
-                u, t = args
-                xn, _ = dynamics(x, u, theta, t)
-                return xn, xn
-
-            x, _ = jax.lax.scan(phys_step, x, (us, tq))
-            new_tk = tk0 + STEPS_PER_REPLAN * DT
-            theta = theta._replace(mean=hermite_spline(new_tk, tk0, theta.mean))
-            return (key, x, theta), None
-
-        (_, x_final, _), _ = jax.lax.scan(
-            replan_step, (key, x0, theta), None, length=n_replans)
-        return x_final
-
-    return jax.jit(jax.vmap(simulate_one))
-
-
 def _obs_sdf_np(pt, obs):
     """2D point-to-AABB signed distance (numpy). obs = [cx, cy, hx, hy]."""
     cx, cy, hx, hy = obs
@@ -577,45 +478,8 @@ def _is_clear(pt, obstacles, margin):
     return all(_obs_sdf_np(pt, obs) >= margin for obs in obstacles)
 
 
-def _sample_pose(rng, obstacles, xy_lo, xy_hi, margin, max_tries=500):
-    for _ in range(max_tries):
-        pt = rng.uniform(xy_lo, xy_hi)
-        if _is_clear(pt, obstacles, margin):
-            return pt
-    raise RuntimeError("Could not place point clear of obstacles — try a different seed")
-
-
-def _corridor_obstacles():
-    wall_hw  = 0.02
-    wall_len = 0.20
-    gap_y    = 0.073
-    x_left   = 0.03
-    x_right  = 0.27
-    return np.array([
-        [x_left,  gap_y + wall_len, wall_hw, wall_len],
-        [x_left, -gap_y - wall_len, wall_hw, wall_len],
-        [x_right,  gap_y + wall_len, wall_hw, wall_len],
-        [x_right, -gap_y - wall_len, wall_hw, wall_len],
-    ]), 0.03, 0.27   # x_left, x_right for corridor sampling
-
-
-T_WIDTH = float(2 * 0.0675)   # 0.135 m — full width of T cap
-
-
-def _random_obstacles(rng, n_obs, size_lo=0.03, size_hi=0.09):
-    ws_lo = WORKSPACE_MIN + 0.08
-    ws_hi = WORKSPACE_MAX - 0.08
-    obs = []
-    for _ in range(n_obs):
-        hx = rng.uniform(size_lo, size_hi)
-        hy = rng.uniform(size_lo, size_hi)
-        cx = rng.uniform(ws_lo[0] + hx, ws_hi[0] - hx)
-        cy = rng.uniform(ws_lo[1] + hy, ws_hi[1] - hy)
-        obs.append([cx, cy, hx, hy])
-    return np.array(obs)
-
-
-T_MARGIN = 0.12   # clearance for T-block center
+T_WIDTH = float(2 * 0.0675)   # 0.135 m -- full width of the T cap
+T_MARGIN = 0.12               # clearance for the T-block centre
 
 
 def _random_obstacles_arena(rng, n_obs, half, size_lo, size_hi,
@@ -638,62 +502,31 @@ def _random_obstacles_arena(rng, n_obs, half, size_lo, size_hi,
     return np.array(obs)
 
 
-def _build_scenario(seed: int, distance: float | None, n_obs_override: int | None,
-                    corridor: bool):
-    """Return (x0, theta, ws_min, ws_max, n_replans) for a given seed/config."""
+def _build_scenario(seed: int, distance: float, n_obs_override: int | None = None):
+    """Return (x0, theta, ws_min, ws_max, n_replans) for a given seed/distance.
+
+    `distance` sizes the square arena in T-widths and sets the obstacle count
+    (`int(distance) - 3`) and the replan budget. The corridor and fixed-
+    workspace layouts this used to support were retired with the legacy sweep.
+    """
     rng = np.random.default_rng(seed)
 
-    if distance is not None:
-        half       = distance * T_WIDTH / 2.0
-        t_xy_0     = np.array([-half + T_MARGIN, -half + T_MARGIN])
-        t_angle_0  = rng.uniform(-np.pi, np.pi)
-        goal_xy    = np.array([ half - T_MARGIN,  half - T_MARGIN])
-        goal_angle = rng.uniform(-np.pi, np.pi)
-        n_obs      = max(0, int(distance) - 3) if n_obs_override is None else n_obs_override
-        if n_obs > 0:
-            obstacles = _random_obstacles_arena(rng, n_obs, half,
-                                                size_lo=T_WIDTH * 0.3, size_hi=T_WIDTH * 0.8,
-                                                clear_pts=(t_xy_0, goal_xy))
-        else:
-            obstacles = np.array([[1e6, 1e6, 0.001, 0.001]])  # inactive sentinel
-        ws_min   = np.array([-half - 0.05, -half - 0.05])  # robot outer
-        ws_max   = np.array([ half + 0.05,  half + 0.05])
-        t_ws_min = np.array([-half, -half])               # T inner (actual wall)
-        t_ws_max = np.array([ half,  half])
-
-    elif corridor:
-        obstacles, x_left, x_right = _corridor_obstacles()
-        gap_y = 0.073
-        if seed != SEED:
-            t_xy_0    = _sample_pose(rng, obstacles,
-                                     [WORKSPACE_MIN[0] + 0.05, -gap_y + 0.05],
-                                     [x_left - 0.10,            gap_y - 0.05], T_MARGIN)
-            t_angle_0 = rng.uniform(-np.pi, np.pi)
-            goal_xy   = _sample_pose(rng, obstacles,
-                                     [x_right + 0.15, -gap_y + 0.05],
-                                     [WORKSPACE_MAX[0] - 0.05,  gap_y - 0.05], T_MARGIN)
-            goal_angle = rng.uniform(-np.pi, np.pi)
-        else:
-            t_xy_0    = np.array([-0.15, 0.15])
-            t_angle_0 = 0.0
-            goal_xy   = np.array([ 0.40, 0.0])
-            goal_angle = 0.0
-        ws_min, ws_max = WORKSPACE_MIN, WORKSPACE_MAX
-        t_ws_min, t_ws_max = ws_min, ws_max
-
+    half       = distance * T_WIDTH / 2.0
+    t_xy_0     = np.array([-half + T_MARGIN, -half + T_MARGIN])
+    t_angle_0  = rng.uniform(-np.pi, np.pi)
+    goal_xy    = np.array([ half - T_MARGIN,  half - T_MARGIN])
+    goal_angle = rng.uniform(-np.pi, np.pi)
+    n_obs      = max(0, int(distance) - 3) if n_obs_override is None else n_obs_override
+    if n_obs > 0:
+        obstacles = _random_obstacles_arena(rng, n_obs, half,
+                                            size_lo=T_WIDTH * 0.3, size_hi=T_WIDTH * 0.8,
+                                            clear_pts=(t_xy_0, goal_xy))
     else:
-        n_obs = 6 if n_obs_override is None else n_obs_override
-        obstacles  = _random_obstacles(rng, n_obs)
-        t_xy_0     = _sample_pose(rng, obstacles,
-                                  WORKSPACE_MIN + 0.08,
-                                  np.array([0.05, WORKSPACE_MAX[1] - 0.08]), T_MARGIN)
-        t_angle_0  = rng.uniform(-np.pi, np.pi)
-        goal_xy    = _sample_pose(rng, obstacles,
-                                  np.array([0.10, WORKSPACE_MIN[1] + 0.08]),
-                                  WORKSPACE_MAX - 0.08, T_MARGIN)
-        goal_angle = rng.uniform(-np.pi, np.pi)
-        ws_min, ws_max = WORKSPACE_MIN, WORKSPACE_MAX
-        t_ws_min, t_ws_max = ws_min, ws_max
+        obstacles = np.array([[1e6, 1e6, 0.001, 0.001]])  # inactive sentinel
+    ws_min   = np.array([-half - 0.05, -half - 0.05])  # robot outer
+    ws_max   = np.array([ half + 0.05,  half + 0.05])
+    t_ws_min = np.array([-half, -half])                # T inner (actual wall)
+    t_ws_max = np.array([ half,  half])
 
     r_xy_0 = np.clip(t_xy_0 - np.array([0.12, 0.0]),
                      ws_min + 0.05, ws_max - 0.05)
@@ -718,7 +551,7 @@ def _build_scenario(seed: int, distance: float | None, n_obs_override: int | Non
         t_ws_min=jnp.array(t_ws_min),
         t_ws_max=jnp.array(t_ws_max),
     )
-    n_replans = int(N_REPLANS * max(1.0, distance)) if distance is not None else N_REPLANS
+    n_replans = int(N_REPLANS * max(1.0, distance))
     return x0, theta, ws_min, ws_max, n_replans
 
 
@@ -728,217 +561,22 @@ def _is_success(final_state: np.ndarray, goal_xy, goal_angle: float) -> bool:
     return pos_err < SUCCESS_POS_THRESH and angle_err < SUCCESS_ANGLE_THRESH
 
 
-def _make_trace_figure(seeds, distance=None, n_obs=None, corridor=False, particles=PARTICLES):
-    """2×2 grid of scenarios; each panel overlays PS (red) and PFMP (green) traces."""
-    from matplotlib.patches import Polygon
-    import matplotlib.patches as mpatches
-
-    def draw_tee_trace(ax, states, color):
-        idxs = list(range(0, len(states), STEPS_PER_REPLAN))
-        n = len(idxs)
-        for j, i in enumerate(idxs):
-            alpha = 0.12 + 0.55 * (j / max(n - 1, 1))
-            s = np.array(states[i])
-            ax.add_patch(Polygon(_t_verts_world(s[0:2], s[2]), closed=True,
-                                 facecolor=color, alpha=alpha,
-                                 edgecolor='black', linewidth=0.8, zorder=5))
-        s_final = np.array(states[-1])
-        ax.plot(*s_final[6:8], 'o', color=color, markersize=6,
-                markeredgecolor='black', markeredgewidth=0.8, zorder=6)
-
-    fig, axes = plt.subplots(2, 2, figsize=(8, 8))
-    fig.patch.set_facecolor('white')
-
-    for ax, seed in zip(axes.flat, seeds):
-        x0, theta, ws_min, ws_max, n_replans = _build_scenario(seed, distance, n_obs, corridor)
-        goal_xy    = np.array(theta.goal_xy)
-        goal_angle = float(theta.goal_angle)
-        obstacles  = np.array(theta.obstacles)
-
-        ax.set_facecolor('#f5f5f5')
-        ax.set_xlim(ws_min[0], ws_max[0]); ax.set_ylim(ws_min[1], ws_max[1])
-        ax.set_aspect('equal'); ax.set_xticks([]); ax.set_yticks([])
-        for spine in ax.spines.values():
-            spine.set_edgecolor('black'); spine.set_linewidth(1.2)
-
-        for obs in obstacles:
-            cx, cy, hx, hy = obs
-            if hx > 0.01:
-                ax.add_patch(mpatches.Rectangle(
-                    (cx - hx, cy - hy), 2*hx, 2*hy,
-                    facecolor='dimgray', edgecolor='black', linewidth=1.2, zorder=3))
-
-        key_ps, key_pfmp = jax.random.split(jax.random.key(seed))
-        for method, color, key in [('ps', '#E74C3C', key_ps), ('pfmp', '#27AE60', key_pfmp)]:
-            states, _ = simulate(method, x0, theta, key, particles, n_replans)
-            draw_tee_trace(ax, states, color)
-
-        # Draw goal on top of traces
-        ax.add_patch(Polygon(_t_verts_world(goal_xy, goal_angle), closed=True,
-                             facecolor='darkorange', alpha=0.5,
-                             edgecolor='darkorange', linewidth=2.0, linestyle='--', zorder=7))
-        ax.plot(*goal_xy, '*', color='darkorange', markersize=12,
-                markeredgecolor='black', markeredgewidth=0.8, zorder=8)
-
-    fig.tight_layout()
-    return fig
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--save-gif', action='store_true')
     parser.add_argument('--seed', type=int, default=SEED)
     parser.add_argument('--particles', type=int, default=PARTICLES)
     parser.add_argument('--method', choices=['pfmp', 'mppi', 'biased_mppi', 'biased_cem', 'dial', 'ps', 'cem'], default='pfmp')
-    parser.add_argument('--corridor', action='store_true',
-                        help='Use fixed narrow-corridor obstacles (legacy default)')
     parser.add_argument('--n-obs', type=int, default=None,
-                        help='Number of random obstacles (ignored with --corridor/--distance)')
-    parser.add_argument('--out', type=str, default=None,
-                        help='Write batch results as JSON to this path.')
-    parser.add_argument('--distance', type=float, default=None,
-                        help='Arena size as multiple of T-width. T fixed bottom-left, goal top-right.')
-    parser.add_argument('--batch', type=int, default=None, metavar='N',
-                        help='Run N seeds with all methods; print success-rate table (requires --distance).')
-    parser.add_argument('--trace-figure', action='store_true',
-                        help='Generate translucent-trace comparison figure (DIAL vs PFMP).')
-    parser.add_argument('--tuned-params-dir', type=str, default=None,
-                        help='Directory containing pushT_optuna_{method}.json files; '
-                             'overrides default hyperparams per method in batch mode.')
+                        help='Obstacle count (default: int(distance) - 3)')
+    parser.add_argument('--distance', type=float, default=4.0,
+                        help='Arena size as a multiple of T-width; T starts bottom-left, goal top-right.')
     args = parser.parse_args()
 
-    # Load tuned params per method if requested
-    _tuned: dict = {}
-    if args.tuned_params_dir is not None:
-        import json as _json
-        from pathlib import Path as _Path
-        for _method in ('mppi', 'cem', 'dial', 'ps'):
-            _f = _Path(args.tuned_params_dir) / f"pushT_optuna_{_method}.json"
-            if _f.exists():
-                _tuned[_method] = _json.load(open(_f))['best_params']
 
-    # ── Trace figure mode ─────────────────────────────────────────
-    if args.trace_figure:
-        seeds = [args.seed + i for i in range(4)]
-        fig = _make_trace_figure(seeds, distance=args.distance, n_obs=args.n_obs,
-                                 corridor=args.corridor, particles=args.particles)
-        from pathlib import Path
-        out = Path(__file__).parent.parent / "figures" / "fig_pushT_traces"
-        fig.savefig(str(out) + ".pdf", dpi=300, bbox_inches='tight')
-        fig.savefig(str(out) + ".png", dpi=300, bbox_inches='tight')
-        print(f"Saved {out}.pdf / .png")
-        plt.show()
-        return
-
-    # ── Batch benchmark mode ─────────────────────────────────────
-    if args.batch is not None:
-        if args.distance is None:
-            raise ValueError("--batch requires --distance")
-
-        # Build all scenarios upfront — fixed n_obs means same theta shape across seeds
-        scenarios  = [_build_scenario(args.seed + i, args.distance, args.n_obs, args.corridor)
-                      for i in range(args.batch)]
-        x0_batch   = jnp.stack([s[0] for s in scenarios])
-        theta_batch = jax.tree.map(lambda *xs: jnp.stack(xs), *[s[1] for s in scenarios])
-        keys_batch  = jax.random.split(jax.random.key(args.seed), args.batch)
-        n_replans   = scenarios[0][4]
-
-        methods = [
-            ('pfmp_0',      False, 0.0 ),
-            ('pfmp_025',    False, 0.25),
-            ('pfmp_05',     False, 0.5 ),
-            ('biased_mppi', False, 0.0 ),
-            ('biased_cem',  False, 0.0 ),
-            ('ps',          True,  0.0 ),
-            ('mppi',        True,  0.0 ),
-            ('cem',         True,  0.0 ),
-            ('dial',        True,  0.0 ),
-        ]
-        results = {}
-
-        for method, is_baseline, ess_thresh in methods:
-            # Apply tuned params for this method if available. The proposal-axis
-            # ablations mirror their no-proposal base so only the proposal differs:
-            # biased_mppi <- mppi, biased_cem <- cem.
-            _base = {'biased_mppi': 'mppi', 'biased_cem': 'cem'}.get(
-                method, method.split('_')[0] if method.startswith('pfmp') else method)
-            p = _tuned.get(_base, {})
-            # The cost function is part of the task, not of the method: every
-            # method minimises the same J, so these are read from the module
-            # constants and NOT from the tuned file. Tuning them per method would
-            # have each algorithm solving a different problem, confounding the
-            # proposal/update/resampling axes with four different objectives.
-            # (`approach_weight` is the worst offender: it pulls the robot toward
-            # the block, which is the job the object-centric proposal is meant to
-            # do, so leaving it tunable blurs the very axis Push-T isolates.)
-            pos_weight_m    = POS_WEIGHT
-            angle_weight_m  = ANGLE_WEIGHT
-            approach_wt_m   = APPROACH_WEIGHT
-            # 'u_stdev' is the pre-2026-08 key for the same knob; accept it so a
-            # restored older tune file doesn't silently fall back to the untuned
-            # default and quietly produce wrong sweep numbers.
-            stdev_val       = p.get('stdev', p.get('u_stdev', U_STDEV))
-            mppi_temp_m     = p.get('mppi_temperature', MPPI_TEMPERATURE)
-            cem_elites_m    = int(p.get('cem_num_elites', CEM_NUM_ELITES))
-            cem_floor_m     = p.get('cem_stdev_floor', CEM_STDEV_FLOOR)
-            dial_beta1_m    = p.get('dial_beta1',      DIAL_BETA1)
-            dial_beta2_m    = p.get('dial_beta2',      DIAL_BETA2)
-            dial_temp_m     = p.get('dial_temp_sample', DIAL_TEMP_SAMPLE)
-
-            # CEM refits a per-knot covariance, so it needs stdev already widened
-            # to (K, 2) per batch element; every other method keeps the scalar
-            # (cem_update only adapts a stdev that is already per-knot).
-            stdev_m = (jnp.full((args.batch, NUM_KNOTS, 2), stdev_val)
-                       if method in ('cem', 'biased_cem')
-                       else jnp.full(args.batch, stdev_val))
-            theta_batch_m = jax.tree.map(
-                lambda x: x, theta_batch  # start from scenario defaults
-            )._replace(
-                pos_weight   =jnp.full(args.batch, pos_weight_m),
-                angle_weight =jnp.full(args.batch, angle_weight_m),
-                stdev        =stdev_m,
-                approach_weight=jnp.full(args.batch, approach_wt_m),
-                step_len     =jnp.full(args.batch, HORIZON / (NUM_KNOTS - 1)),
-            )
-
-            ctrl = PFMP(
-                dynamics, running_cost, terminal_cost,
-                perturbation_init     if is_baseline else init_control,
-                perturbation_proposal if is_baseline else proposal,
-                horizon=HORIZON, num_knots=NUM_KNOTS, particles=args.particles,
-                ess_resample_thresh=ess_thresh, dt=DT,
-            )
-            run_batch = make_batched_simulate(
-                method, ctrl, args.particles, n_replans,
-                mppi_temp=mppi_temp_m, cem_elites=cem_elites_m,
-                cem_stdev_floor=cem_floor_m,
-                dial_b1=dial_beta1_m, dial_b2=dial_beta2_m,
-                dial_temp_sample=dial_temp_m)
-            print(f"{method}  warm-up…", end=" ", flush=True)
-            run_batch(keys_batch, x0_batch, theta_batch_m)[0].block_until_ready()
-            print("running…", end=" ", flush=True)
-            final_states = np.array(run_batch(keys_batch, x0_batch, theta_batch_m))
-            goal_xys    = np.array(theta_batch.goal_xy)
-            goal_angles = np.array(theta_batch.goal_angle)
-            successes = [_is_success(final_states[i], goal_xys[i], goal_angles[i])
-                         for i in range(args.batch)]
-            results[method] = successes
-            print(f"{sum(successes)}/{args.batch}")
-
-        print(f"\n=== Success rates (distance={args.distance:.1f}x, N={args.batch}) ===")
-        print(f"{'Method':12s} {'Successes':>10s} {'Rate':>8s}")
-        print("-" * 34)
-        for m, *_ in methods:
-            s = sum(results[m])
-            print(f"{m:12s} {s:>6d}/{args.batch:<4d} {100*s/args.batch:>6.1f}%")
-        if args.out:
-            import json
-            with open(args.out, "w") as f:
-                json.dump({m: v for m, v in results.items()}, f)
-        return
-
+    # ── Interactive viewer ───────────────────────────────────────
     x0, theta, ws_min, ws_max, n_replans = _build_scenario(
-        args.seed, args.distance, args.n_obs, args.corridor)
+        args.seed, args.distance, args.n_obs)
 
     key = jax.random.key(args.seed)
     states, plans = simulate(args.method, x0, theta, key, args.particles, n_replans)
@@ -959,13 +597,8 @@ def main():
     ax.set_xticks([]); ax.set_yticks([])
     for spine in ax.spines.values():
         spine.set_edgecolor('black'); spine.set_linewidth(1.5)
-    if args.distance is not None:
-        mode = f"Distance {args.distance:.1f}x"
-    elif args.corridor:
-        mode = "Corridor"
-    else:
-        mode = "Random Obstacles"
-    ax.set_title(f"{args.method.upper()}: T-block Pushing ({mode})", fontsize=13)
+    ax.set_title(f"{args.method.upper()}: T-block Pushing "
+                 f"({args.distance:.1f}x T-width arena)", fontsize=13)
 
     # Outer robot margin (solid, subtle)
     ax.add_patch(mpatches.FancyBboxPatch(
@@ -1094,12 +727,7 @@ def main():
 
     if args.save_gif:
         from pathlib import Path
-        if args.distance is not None:
-            suffix = f"dist{args.distance:.0f}_s{args.seed}"
-        elif args.corridor:
-            suffix = "corridor"
-        else:
-            suffix = f"random_s{args.seed}"
+        suffix = f"dist{args.distance:.0f}_s{args.seed}"
         out = Path(__file__).parent.parent / "figures" / f"pushT_{args.method}_{suffix}.gif"
         out.parent.mkdir(parents=True, exist_ok=True)
         print(f"Saving gif to {out}…")

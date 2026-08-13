@@ -1,4 +1,4 @@
-"""Batched runner for the NamedTuple-defined tasks (geometric, push-T, MBM).
+"""Batched runner for the NamedTuple-defined tasks (drive, push-T, MBM).
 
 Mirrors `mjx_runner.py` (yaml config -> per-algorithm results in an outdir) but
 targets tasks that are plain JAX functions over a NamedTuple `theta`, rather
@@ -14,7 +14,7 @@ Usage:
 import os
 import sys
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import Callable, Literal, NamedTuple, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -24,55 +24,17 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from pfmp import PFMP
+from pfmp import (PFMP, METHOD_ALIASES, method_decomp,
+                  make_perturbation, sigma_at, knot_index)
 from pfmp.obstacle_grid import sdf_aabb, hinge_loss, generate_map_batch
 from pfmp.algorithm import ps_update, mppi_update, cem_update, sample_update
-from pfmp.update import dial_step
+from pfmp.update import dial_step, ess
 from pfmp.interpolate import hermite_spline
 
 
 # ---------------------------------------------------------------------------
 # Task protocol
 # ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# The shared perturbation proposal
-#
-# Every baseline (PS/MPPI/CEM/DIAL) samples the same way: Gaussian noise around
-# the nominal plan `theta.mean`, at a width read per-knot. That is one function,
-# not one per task, so it lives here. A task only supplies its action clip.
-#
-# The three `theta` types agree on exactly what this needs: `mean` (K, *action),
-# `stdev` (scalar, or (K, *action) once CEM refits it), and `step_len`.
-# ---------------------------------------------------------------------------
-
-def sigma_at(theta, idx):
-    """Sampling noise for knot `idx`.
-
-    Handles both conventions: a scalar `stdev` (PS/MPPI/SIS/SIR, and DIAL, which
-    overwrites it per annealing level) and a per-knot array (CEM, which refits it
-    from the elites each replan). `jnp.ndim` is static, so this is free under jit.
-    """
-    return theta.stdev if jnp.ndim(theta.stdev) == 0 else theta.stdev[idx]
-
-
-def knot_index(theta, t):
-    """Knot whose interval contains time `t`."""
-    return jnp.clip(jnp.round(t / theta.step_len).astype(jnp.int32) + 1,
-                    0, theta.mean.shape[0] - 1)
-
-
-def make_perturbation(clip=None):
-    """Build the (init, proposal) pair for a task, given its action clip."""
-    clip = clip or (lambda u, theta: u)
-
-    def at(key, theta, idx):
-        u = theta.mean[idx] + jax.random.normal(
-            key, theta.mean.shape[1:]) * sigma_at(theta, idx)
-        return clip(u, theta)
-
-    return (lambda key, x, theta: at(key, theta, 0),
-            lambda key, x, u, theta, t: at(key, theta, knot_index(theta, t)))
 
 class GeomTask(NamedTuple):
     """What a task must provide to be runnable here.
@@ -90,10 +52,9 @@ class GeomTask(NamedTuple):
     horizon: float
     num_knots: int
     dt: float
-    # The object-informed proposal, if the task has one. Optional: 2D geometric
+    # The object-informed proposal, if the task has one. Optional: drive
     # has no second proposal to contrast against, so its SMC methods fall back
-    # to the shared perturbation and differ from the baselines only in the
-    # update and the resampling.
+    # to the shared perturbation and differ from the baselines only in resampling
     custom_init: Callable = None      # (key, x, theta) -> u
     custom_proposal: Callable = None  # (key, x, u, theta, t) -> u
     clip_action: Callable = None      # (u, theta) -> u   bounds for the shared
@@ -102,6 +63,10 @@ class GeomTask(NamedTuple):
     execute: Callable = None      # (x, theta) -> x        None = world is static
     shift: Callable = None        # (theta) -> theta       None = no re-timing
     warm_start: Callable = None   # (x0, theta) -> theta   baselines' nominal plan
+    num_problems: int = None      # how many problems the task actually has.
+                                  #   MBM's follows from its datasets, so a
+                                  #   `num` in the config would only restate it
+                                  #   and could disagree with it.
     hp_defaults: dict = {}        # method knobs the task module already defines.
                                   #   Sourced from the module, never retyped
                                   #   here: a literal default in the runner is
@@ -113,38 +78,17 @@ class GeomTask(NamedTuple):
 
 # Which proposal / update / resampling each algorithm name selects. This IS the
 # decomposition: everything else in this file is plumbing.
-def parse_algorithm(name):
-    """Split a method name into (update, rho).
-
-    Resampling is an axis, not a method, and rho is a value on it, so it lives
-    in the name: `mppi+r0.25` is MPPI resampling at 0.25 and several thresholds
-    can appear in one sweep. A bare `+r` means "whatever ess_thresh resolves to"
-    (task default or tuned), returned as None so the caller fills it in. No
-    suffix is rho = 0, which is exactly `ess_resample_thresh=0` (never resample).
-
-    `sir` is kept as the legacy alias for `sis+r`.
-    """
-    if name == "sir":
-        return "sis", None
-    if "+r" in name:
-        base, _, val = name.partition("+r")
-        return base, (float(val) if val else None)
-    return name, 0.0
-
-
-CUSTOM_PROPOSAL = ("sis", "sir", "sis_sample", "biased_mppi", "biased_cem")
-ARGMIN_UPDATE   = ("sis", "sir", "ps")
-ALGORITHMS = ("sis", "sir", "sis_sample", "ps", "mppi", "cem",
-              "biased_mppi", "biased_cem", "dial")
-# ...each of which may take a "+r[rho]" suffix: "mppi+r", "cem+r0.25".
+ALGORITHMS = tuple(METHOD_ALIASES)   # each may take a "+r[rho]" suffix
 
 
 def build_controller(task: GeomTask, algorithm: str, particles: int,
                      ess_thresh: float = 0.0) -> PFMP:
-    base, rho = parse_algorithm(algorithm)
+    proposal, _, rho = method_decomp(algorithm)
     perturb = make_perturbation(task.clip_action)
+    # A task without its own q falls back to the perturbation, which is why
+    # `sis` and `ps` coincide on the drive task.
     init, prop = ((task.custom_init, task.custom_proposal)
-                  if base in CUSTOM_PROPOSAL and task.custom_proposal is not None
+                  if proposal == "informed" and task.custom_proposal is not None
                   else perturb)
     return PFMP(task.dynamics, task.running_cost, task.terminal_cost, init, prop,
                 horizon=task.horizon, num_knots=task.num_knots, particles=particles,
@@ -157,7 +101,8 @@ def build_controller(task: GeomTask, algorithm: str, particles: int,
 # fresh compile per trial: on push-T that was 5.8s of compile against 0.6s of
 # compute. The rest (elite count, ess_thresh, DIAL's schedule) are structural or
 # discrete and stay static.
-TRACED_HP = ("mppi_temperature", "cem_stdev_floor", "sample_temperature")
+TRACED_HP = ("mppi_temperature", "cem_stdev_floor", "sample_temperature",
+             "dial_temp_sample")
 
 
 def traced_hp(hp: dict):
@@ -170,21 +115,27 @@ def make_replan(ctrl: PFMP, algorithm: str, hp: dict, particles: int):
     DIAL is the one algorithm that owns its own sampling loop, so it replaces
     this whole function rather than plugging into the update slot.
     """
-    algorithm, rho = parse_algorithm(algorithm)
+    _, update_kind, rho = method_decomp(algorithm)
     sample = ctrl.run_sis if rho == 0.0 else ctrl.run_sir
 
-    if algorithm == "dial":
+    if update_kind == "diffuse":
         n = int(hp.get("dial_n_inner", 2))
-        return lambda key, x, theta, s: dial_step(
-            key, ctrl, x, theta, n=n,
-            beta1=hp.get("dial_beta1", 1.0), beta2=hp.get("dial_beta2", 1.0),
-            temp_sample=hp.get("dial_temp_sample", 1.0))
 
-    if algorithm in ARGMIN_UPDATE:
+        def dial_replan(key, x, theta, s):
+            # Costs from DIAL's final annealing level, so its ESS is the same
+            # per-knot quantity reported for the single-pass methods.
+            theta, costs = dial_step(
+                key, ctrl, x, theta, n=n,
+                beta1=hp.get("dial_beta1", 1.0), beta2=hp.get("dial_beta2", 1.0),
+                temp_sample=s["dial_temp_sample"], return_costs=True)
+            return theta, jax.vmap(ess, in_axes=1)(jnp.cumsum(costs, axis=1))
+
+        return dial_replan
+    if update_kind == "argmin":
         # The MAP update. On a task with no custom proposal this makes `sis`
         # and `ps` the same algorithm; `sis_sample` is what separates them.
         update = lambda th, tr, co, s: ps_update(th, tr, co)
-    elif algorithm == "sis_sample":
+    elif update_kind == "sample":
         # Posterior sampling (Piche et al.): draw one trajectory from the
         # weighted particle set rather than summarising it. Needs a key, so it
         # is the one update that consumes randomness of its own.
@@ -199,19 +150,25 @@ def make_replan(ctrl: PFMP, algorithm: str, hp: dict, particles: int):
         key_ = "sample_temperature" if "sample_temperature" in hp else "mppi_temperature"
         update = lambda th, tr, co, k, s: sample_update(
             th, tr, co, k, jnp.maximum(s[key_], 1e-6))
-    elif algorithm in ("mppi", "biased_mppi"):
+    elif update_kind == "mean":
         update = lambda th, tr, co, s: mppi_update(
             th, tr, co, jnp.maximum(s["mppi_temperature"], 1e-6))
-    elif algorithm in ("cem", "biased_cem"):
+    elif update_kind == "topk":
         # The elite count sets an array shape, so it must stay static.
         k = max(1, int(hp.get("cem_elite_frac", 0.1) * particles))
         update = lambda th, tr, co, s: cem_update(
             th, tr, co, k / particles, stdev_floor=s["cem_stdev_floor"])
     else:
-        raise ValueError(f"unknown algorithm: {algorithm}")
+        raise ValueError(f"no update implemented for {update_kind!r} "
+                         f"(method {algorithm!r})")
 
-    needs_key = algorithm == "sis_sample"
+    needs_key = update_kind == "sample"
 
+    # Effective sample size of the weights each update implies, reported per
+    # replan and never averaged here: in open-loop tasks the replans are
+    # iterations of one optimisation (concentration is convergence), while in
+    # closed-loop they are separate inference problems (concentration is
+    # degeneracy), so only the caller knows how to reduce it.
     def replan(key, x, theta, scalars):
         # Only split when the update itself needs randomness. Splitting
         # unconditionally would shift the sampling stream for every other
@@ -219,7 +176,16 @@ def make_replan(ctrl: PFMP, algorithm: str, hp: dict, particles: int):
         sub, rest = (jax.random.split(key) if needs_key else (key, None))
         trajs, costs = sample(sub, x, theta)
         args = (theta, trajs, costs) + ((rest,) if needs_key else ())
-        return update(*args, scalars)[0]
+        # ESS of the importance weights under the target exp(-cost), per knot:
+        # entry k is the ESS of the return accumulated through knot k, i.e. the
+        # sequential filtering ESS. The last entry is the total-return ESS and
+        # includes the terminal cost, so comparing [-1] against [-2] shows how
+        # much of the collapse the terminal term is responsible for.
+        # One definition for every method: it measures the particle cloud the
+        # proposal produced, not the update applied to it.
+        cum = jnp.cumsum(costs, axis=1)                    # (P, K)
+        ess_k = jax.vmap(ess, in_axes=1)(cum)              # (K,)
+        return update(*args, scalars)[0], ess_k
     return replan
 
 
@@ -245,43 +211,41 @@ def make_simulator(task: GeomTask, replan: Callable):
         def step(carry, _):
             key, x, theta = carry
             key, sub = jax.random.split(key)
-            theta = replan(sub, x, theta, scalars)
+            theta, ess = replan(sub, x, theta, scalars)
             x = execute(x, theta)
             theta = shift(theta)
-            return (key, x, theta), None
+            return (key, x, theta), ess
 
-        (_, x, theta), _ = jax.lax.scan(
+        (_, x, theta), ess = jax.lax.scan(
             step, (key, x0, theta), None, length=task.n_replans)
-        return task.measure(x, theta)
+        # (n_replans, num_knots) per problem, dense and unreduced.
+        return dict(task.measure(x, theta), ess=ess)
 
     # scalars are shared across the batch, not per problem
     return jax.jit(jax.vmap(one, in_axes=(0, 0, 0, None)))
 
 
-_SIM_CACHE = {}
+def build_simulator(task: GeomTask, algorithm: str, particles: int, hp: dict):
+    """Compile the simulator for one (task, method, static hyperparameters).
 
-
-def _simulator(task, algorithm, particles, hp):
-    """Compiled simulator, reused across calls that differ only in the traced
-    knobs. Keyed on everything that is baked in at trace time, so a tuner
-    sweeping a temperature compiles once instead of once per trial."""
-    static = tuple(sorted((k, v) for k, v in hp.items() if k not in TRACED_HP
-                          and isinstance(v, (int, float, bool))))
-    key = (id(task), algorithm, particles, static)
-    if key not in _SIM_CACHE:
-        ctrl = build_controller(task, algorithm, particles,
-                                ess_thresh=float(hp.get("ess_thresh", 0.0)))
-        _SIM_CACHE[key] = make_simulator(
-            task, make_replan(ctrl, algorithm, hp, particles))
-    return _SIM_CACHE[key]
+    Separate from `run_algorithm` so a caller that reuses the same method across
+    many evaluations (the tuner) can hold it and skip recompilation, without the
+    runner keeping global state. Only the traced knobs may change between runs
+    of a returned simulator; see `TRACED_HP`.
+    """
+    ctrl = build_controller(task, algorithm, particles,
+                            ess_thresh=float(hp.get("ess_thresh", 0.0)))
+    return make_simulator(task, make_replan(ctrl, algorithm, hp, particles))
 
 
 def run_algorithm(task: GeomTask, algorithm: str, num: int, particles: int,
-                  hp: dict, seed: int = 0, group_size: int = None):
+                  hp: dict, seed: int = 0, group_size: int = None, sim=None):
     """Run `num` problems. Batched in groups because some tasks (MBM) have
-    per-problem array shapes that only match within a dataset."""
+    per-problem array shapes that only match within a dataset.
+
+    `sim` reuses an already-built simulator (see `build_simulator`)."""
     group_size = group_size or num
-    sim = _simulator(task, algorithm, particles, hp)
+    sim = sim or build_simulator(task, algorithm, particles, hp)
     scalars = traced_hp(hp)
 
     out = []
@@ -309,11 +273,23 @@ def _mbm_task(config):
     
     robot = mbm.load_robot(config.get("urdf", "models/panda_spherized.urdf"))
     datasets = config["datasets"]
-    per_ds = config.get("problems_per_dataset", 100)
-    off = int(config.get("problem_offset", 0))
+    # How many problems there are is a property of the datasets, not something
+    # the config restates. `num` and `problem_offset` are totals across datasets
+    # and convert to per-dataset counts here: a held-out split at offset 350
+    # means problem 50 of each of 7 datasets, not problem 350 of one.
+    n_ds = len(datasets)
+    loaded = [mbm.load_mbm_dataset(ds) for ds in datasets]
+    avail = min(len(ps) for ps in loaded)
+    off_per = int(config.get("problem_offset", 0)) // n_ds
+    n_per = (max(1, int(config["num"]) // n_ds) if config.get("num")
+             else avail - off_per)
+    if off_per + n_per > avail:
+        raise ValueError(
+            f"MBM: {n_per} problems/dataset at offset {off_per} exceeds the "
+            f"{avail} available; lower `num`")
     problems, groups = [], []
-    for ds in datasets:
-        ps = mbm.load_mbm_dataset(ds, max_problems=off + per_ds)[off:]
+    for ps in loaded:
+        ps = ps[off_per:off_per + n_per]
         groups.append(len(ps))
         problems.extend(ps)
     # every group is the same size, so a single group_size batches without padding
@@ -356,6 +332,7 @@ def _mbm_task(config):
         terminal_cost=mbm.terminal_cost,
         custom_init=mbm.init, custom_proposal=mbm.proposal,
         clip_action=lambda u, th: jnp.clip(u, th.q_min, th.q_max),
+        num_problems=len(problems),
         sample_problem=sample_problem, measure=measure,
         horizon=mbm.HORIZON, num_knots=mbm.NUM_KNOTS, dt=dt,
         n_replans=1, execute=None, shift=None, warm_start=warm_start,
@@ -365,9 +342,17 @@ def _mbm_task(config):
         # the numbers reported here without the runner saying so. Tuned JSON
         # overrides all of them.
         hp_defaults={"stdev": 0.395, "mppi_temperature": 1.0,
-                     "cem_elite_frac": 0.1, "ess_thresh": 0.552,
+                     "cem_elite_frac": 0.1, "cem_stdev_floor": 0.0,
+                     "ess_thresh": 0.552,
                      "goal_frac": 0.339, "gauss_frac": 0.333,
-                     "gauss_std": 0.395},
+                     "gauss_std": 0.395,
+                     # DIAL runs `dial_n_inner` annealing passes per replan,
+                     # each a full batch of rollouts, so it costs n_inner times
+                     # the samples of a single-pass method. Fixed at 2 (never
+                     # tuned) so the extra cost is a stated property of the
+                     # method rather than something the search can buy.
+                     "dial_n_inner": 2, "dial_beta1": 1.0, "dial_beta2": 1.0,
+                     "dial_temp_sample": 0.06,},
     )
     return task, groups[0]      # batch per dataset: env shapes match only within
 
@@ -376,16 +361,14 @@ def _pushT_task(config):
     so `execute` runs the physics and `shift` re-times the plan onto the new
     clock, which is exactly what MBM leaves as None."""
     sys.path.insert(0, str(Path(__file__).parent.parent / "examples"))
-    import importlib
-    pt = importlib.import_module("pushT")
+    import push_tee_2d as pt
     
     off = int(config.get("problem_offset", 0))
     seeds = list(range(config.get("seed", 0) + off,
                        config.get("seed", 0) + off + config["num"]))
     distance = config.get("distance")
     n_obs = config.get("n_obs")
-    corridor = config.get("corridor", False)
-    built = [pt._build_scenario(sd, distance, n_obs, corridor) for sd in seeds]
+    built = [pt._build_scenario(sd, distance, n_obs) for sd in seeds]
     # Scenarios batch together only if their obstacle arrays agree in shape;
     # `_random_obstacles_arena` can place fewer than requested.
     shapes = {tuple(b[1].obstacles.shape) for b in built}
@@ -429,7 +412,7 @@ def _pushT_task(config):
         sample_problem=lambda i: (built[i][0], built[i][1]), measure=measure,
         horizon=pt.HORIZON, num_knots=pt.NUM_KNOTS, dt=pt.DT,
         n_replans=n_replans, execute=execute, shift=shift,
-        warm_start=warm_start, apply_hp=apply_hp,
+        warm_start=warm_start, apply_hp=apply_hp, num_problems=len(seeds),
         hp_defaults={"stdev": 0.05, "mppi_temperature": 0.5,
                      "cem_elite_frac": 10 / 2048, "cem_stdev_floor": 0.01,
                      "ess_thresh": 0.25,
@@ -549,10 +532,19 @@ def _drive_task(config):
         # SIS/SIR only one. Here every method gets the same budget.
         n_replans=int(config.get("n_replans", num_knots)),
         execute=None, shift=None, warm_start=None, apply_hp=apply_hp,
+        num_problems=n,
         hp_defaults={"stdev": DRIVE_U_STDEV,
                      "mppi_temperature": DRIVE_MPPI_TEMPERATURE,
                      "cem_elite_frac": DRIVE_CEM_ELITE_FRAC,
-                     "ess_thresh": DRIVE_ESS_THRESH},
+                     "cem_stdev_floor": 0.0,
+                     "ess_thresh": DRIVE_ESS_THRESH,
+                     # DIAL runs `dial_n_inner` annealing passes per replan,
+                     # each a full batch of rollouts, so it costs n_inner times
+                     # the samples of a single-pass method. Fixed at 2 (never
+                     # tuned) so the extra cost is a stated property of the
+                     # method rather than something the search can buy.
+                     "dial_n_inner": 2, "dial_beta1": 1.0, "dial_beta2": 1.0,
+                     "dial_temp_sample": 0.06,},
     )
     return task, n
 
@@ -618,7 +610,7 @@ def run_sweep(config, key, values, algorithms, cache_path):
     blob = json.loads(cache_path.read_text()) if cache_path.exists() else {}
     results = blob.get("results", {})
     axis = dict(config.get("sweep") or {}, key=key, values=values)
-    axis.setdefault("name", f"fig_{config['task']}_{key}")
+    axis.setdefault("name", f"{config['task']}_{key}_fig")
 
     # A cell is only reusable if it carries every metric the config now asks
     # for. Without this, adding a metric to `measure` would leave old cells in
@@ -655,21 +647,34 @@ def run_sweep(config, key, values, algorithms, cache_path):
             hp = dict(task.hp_defaults)
             hp.update(cfg.get("hyperparams", {}))
             hp.update(tuned.get(alg, {}))
-            res = run_algorithm(task, alg, num=cfg["num"],
+            res = run_algorithm(task, alg, num=task.num_problems,
                                 particles=cfg["num_samples"], hp=hp,
                                 seed=cfg.get("seed", 0), group_size=group_size)
             used_hp[alg] = {k: v for k, v in hp.items()
                             if isinstance(v, (int, float, bool))}
-            _, rho = parse_algorithm(alg)
+            *_, rho = method_decomp(alg)
             used_hp[alg]["ess_thresh"] = (hp.get("ess_thresh", 0.0)
                                           if rho is None else rho)
             results[vkey][alg] = {k: np.asarray(v).tolist() for k, v in res.items()}
-            print(f"  {key}={vkey} {alg:12s} " + "  ".join(
-                f"{k}={float(np.mean(v)):.4f}" for k, v in res.items()))
+            print(f"  {key}={vkey} {alg:12s} " + _summarise(res))
             flush()
 
     flush()
     return results
+
+
+def _summarise(res):
+    """One line per method. Non-finite entries are skipped rather than allowed
+    to poison the mean: ESS is legitimately undefined on a problem where every
+    particle collided, and a single such problem would otherwise NaN the whole
+    column. The count is reported so the omission is visible."""
+    parts = []
+    for k, v in sorted(res.items()):
+        a = np.asarray(v, dtype=float)
+        bad = int((~np.isfinite(a)).sum())
+        parts.append(f"{k}={np.nanmean(np.where(np.isfinite(a), a, np.nan)):.4f}"
+                     + (f"[{bad} n/a]" if bad else ""))
+    return "  ".join(parts)
 
 
 def run_point(config, algorithms, outdir):
@@ -682,13 +687,12 @@ def run_point(config, algorithms, outdir):
         hp = dict(task.hp_defaults)
         hp.update(config.get("hyperparams", {}))
         hp.update(tuned.get(algorithm, {}))
-        res = run_algorithm(task, algorithm, num=config["num"],
+        res = run_algorithm(task, algorithm, num=task.num_problems,
                             particles=config["num_samples"], hp=hp,
                             seed=config.get("seed", 0), group_size=group_size)
         np.savez(os.path.join(outdir, f"{algorithm}.npz"),
                  **{k: np.asarray(v) for k, v in res.items()})
-        print(f"  {algorithm:12s} " + "  ".join(
-            f"{k}={float(np.mean(v)):.4f}" for k, v in res.items()))
+        print(f"  {algorithm:12s} " + _summarise(res))
 
 
 def main():
@@ -710,7 +714,7 @@ def main():
     if args.sweep:                       # an override is a different axis
         config["sweep"] = dict(config.get("sweep") or {}, xticks=None,
                                xlabel=args.sweep,
-                               name=f"fig_{config['task']}_{args.sweep}")
+                               name=f"{config['task']}_{args.sweep}_fig")
     key, values = sweep_axis(config, args.sweep, values)
 
     # A config declaring a `sweep` block runs the whole axis; otherwise the

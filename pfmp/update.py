@@ -23,9 +23,16 @@ def ess(costs: jax.Array) -> jax.Array:
 
     1.0 = uniform weights (maximum diversity).
     1/N = fully degenerate (one particle dominates).
+
     """
     total = jnp.sum(costs, axis=1) if costs.ndim == 2 else costs
     n = total.shape[0]
+    # Deliberately NOT guarded against an all-non-finite cloud: the result is
+    # NaN, which is correct. Substituting uniform weights would report ESS = 1.0
+    # (maximum diversity) for a population carrying no information, and since
+    # that case coincides with total failure, the mean ESS would then track the
+    # failure rate rather than the concentration. `mppi_update` still guards, so
+    # the *plan* stays finite; only the diagnostic is allowed to be missing.
     ws = jnp.exp(-(total - jnp.min(total)))
     ps = ws / jnp.sum(ws)
     return (1.0 / jnp.sum(ps ** 2)) / n
@@ -72,6 +79,14 @@ def sample_update(theta: PyTree, trajs: PyTree, costs: jax.Array,
 def mppi_update(theta: PyTree, trajs: PyTree, costs: jax.Array, temperature: float):
     _check_update_shapes(trajs, costs)
     total = jnp.sum(costs, axis=1)                        # (P,) total return
+    # If EVERY particle is non-finite (all collided) the shift below is
+    # inf - inf = NaN, which poisons the mean, and the NaN plan then rolls out
+    # to a NaN path where `sdf < 0` is False -- so a total failure gets recorded
+    # as "did not collide". Fall back to uniform weights: no particle carries
+    # information, so every one counts equally and the new mean is the average
+    # of the sampled trajectories (approximately the current plan, since the
+    # proposal is centred on it).
+    total = jnp.where(jnp.any(jnp.isfinite(total)), total, 0.0)
     total = total - jnp.min(total)
     weights = jnp.exp(-total / temperature)
     weights = weights / jnp.sum(weights)                  # (P,) one weight per trajectory
@@ -137,13 +152,16 @@ def dial_update(theta: PyTree, trajs: PyTree, costs: jax.Array,
 # outer loop
 def dial_step(key: PRNGKeyArray, ctrl, x0: PyTree, theta: PyTree,
               n: int = 2, beta1: float = 1.0, beta2: float = 1.0,
-              temp_sample: float = 1.0) -> PyTree:
+              temp_sample: float = 1.0, return_costs: bool = False) -> PyTree:
     """One DIAL-MPC replan: `n` annealing levels, each re-sampling at a
     shrinking per-knot sigma (`dial_sigma`) and folding the batch in with
     `dial_update`.
 
     n: annealing levels. Callers pass dial-mpc's Ndiffuse_init on a cold start
         and Ndiffuse afterwards; this function is stateless between calls.
+    return_costs: also return the costs from the FINAL annealing level, so a
+        caller can report the same diagnostics (ESS) it computes for the
+        single-pass methods. Off by default to keep the return type unchanged.
 
     Verified against the reference in tests/test_dial_reference.py.
     """
@@ -158,4 +176,4 @@ def dial_step(key: PRNGKeyArray, ctrl, x0: PyTree, theta: PyTree,
         trajs, costs = ctrl.run_sis(sub, x0, theta._replace(stdev=sigma))
 
         theta, _ = dial_update(theta, trajs, costs, temp_sample)
-    return theta
+    return (theta, costs) if return_costs else theta

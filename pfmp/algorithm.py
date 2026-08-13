@@ -65,7 +65,50 @@ def mjx_hydrax_cost(task: Task):
     terminal_cost = lambda x, th: task.terminal_cost(x)
     return running_cost, terminal_cost
 
+# ---------------------------------------------------------------------------
+# The shared perturbation proposal
+#
+# Every baseline (PS/MPPI/CEM/DIAL) samples the same way: Gaussian noise around
+# the nominal plan `theta.mean`, at a width read per-knot. That is one function,
+# not one per task, so it lives here. A task only supplies its action clip.
+#
+# The three `theta` types agree on exactly what this needs: `mean` (K, *action),
+# `stdev` (scalar, or (K, *action) once CEM refits it), and `step_len`.
+# ---------------------------------------------------------------------------
+
+def sigma_at(theta, idx):
+    """Sampling noise for knot `idx`.
+
+    Handles both conventions: a scalar `stdev` (PS/MPPI/SIS/SIR, and DIAL, which
+    overwrites it per annealing level) and a per-knot array (CEM, which refits it
+    from the elites each replan). `jnp.ndim` is static, so this is free under jit.
+    """
+    return theta.stdev if jnp.ndim(theta.stdev) == 0 else theta.stdev[idx]
+
+
+def knot_index(theta, t):
+    """Knot whose interval contains time `t`."""
+    idx = jnp.floor(jnp.asarray(t) / theta.step_len).astype(jnp.int32) + 1
+    return jnp.clip(idx, 0, theta.mean.shape[0] - 1)
+
+
+def make_perturbation(clip=None):
+    """Build the (init, proposal) pair for a task, given its action clip."""
+    clip = clip or (lambda u, theta: u)
+
+    def at(key, theta, idx):
+        u = theta.mean[idx] + jax.random.normal(
+            key, theta.mean.shape[1:]) * sigma_at(theta, idx)
+        return clip(u, theta)
+
+    return (lambda key, x, theta: at(key, theta, 0),
+            lambda key, x, u, theta, t: at(key, theta, knot_index(theta, t)))
+
+
 def mjx_linear_gaussian_proposal(task: Task, horizon: float, num_knots: int):
+    """Legacy proposal, numerically identical to make_perturbation,
+       but closes the 
+    """
     def init(key, x, th):
         u = jax.random.normal(key, th.mjx_model.nu) * th.noise_level + th.mean[0]
         u = jnp.clip(u, task.u_min, task.u_max)

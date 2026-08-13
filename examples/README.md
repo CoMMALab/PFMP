@@ -8,12 +8,12 @@ Each script is runnable from the repo root.
 |--------|-------------|
 | `2d_simple.py` | Bicycle model navigating a regular obstacle grid |
 | `2d_complex.py` | Bicycle model through random obstacle fields; supports ablation vs SMC-MPC / MPPI / CEM baselines |
-| `2d_pushT.py` | T-block pushing in 2D (no MuJoCo) |
+| `pushT.py` | T-block pushing in 2D (no MuJoCo) |
 
 ```bash
 python examples/2d_simple.py
 python examples/2d_complex.py
-python examples/2d_pushT.py
+python examples/pushT.py
 ```
 
 ## MuJoCo

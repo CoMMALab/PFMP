@@ -3,7 +3,7 @@
 Counterpart to `geom_analyze.py`: that one draws the sweeps, this one draws the
 plans the paper puts beside them.
 
-    drive -> geometric_plan         pushT -> fig_pushT_traces     mbm -> planning1024
+    drive -> drive_plan_fig     pushT -> pushT_2d_plan_fig     mbm -> mbm_plan_fig
 
 Three branches, because they share no rendering path (2D matplotlib with
 task-specific geometry; a viser 3D scene for MBM). What they do share is the
@@ -322,13 +322,13 @@ def setup_smc_panel(ax, smc_frames, steps_per_knot, x0, theta, cost_fn, fns, xli
 
 def figure_drive(config, args, output_dir):
     """Two stacked panels, SMC over baselines: particle clouds on the cost
-    landscape. A still of `geometric.animate` at its converged frame."""
+    landscape. A still of the drive task's optimisation at its converged frame."""
     knots = int(config.get("num_knots", 20))
     arena, horizon = round(knots + 1.0, 1), knots * 0.5
     particles = int(config.get("num_samples", PARTICLES))
     n_outer = args.num_outer or NUM_OUTER
 
-    cfg = {"task": "geometric", "num": args.problem + 1, "num_knots": knots,
+    cfg = {"task": "drive", "num": args.problem + 1, "num_knots": knots,
            "num_samples": particles, "seed": config.get("seed", SEED)}
     task, _ = load_task("drive", cfg)
     fns = (task.dynamics, task.running_cost, task.terminal_cost)
@@ -373,34 +373,170 @@ def figure_drive(config, args, output_dir):
 
     update_bot(frames - 1)          # the still is the converged frame
     update_top(frames - 1)
-    _save(fig, args.out or "geometric_plan", output_dir)
+    _save(fig, args.out or "drive_plan_fig", output_dir)
 
 
 PUSHT_DISTANCE = 7.0
 
+def _make_trace_figure(seeds, distance, n_obs=None, particles=None):
+    """2×2 grid of scenarios; each panel overlays PS (red) and PFMP (green) traces."""
+    from matplotlib.patches import Polygon
+    import matplotlib.patches as mpatches
+    import push_tee_2d as pt
+    particles = particles or pt.PARTICLES
+
+    def draw_tee_trace(ax, states, color):
+        idxs = list(range(0, len(states), pt.STEPS_PER_REPLAN))
+        n = len(idxs)
+        for j, i in enumerate(idxs):
+            alpha = 0.12 + 0.55 * (j / max(n - 1, 1))
+            s = np.array(states[i])
+            ax.add_patch(Polygon(pt._t_verts_world(s[0:2], s[2]), closed=True,
+                                 facecolor=color, alpha=alpha,
+                                 edgecolor='black', linewidth=0.8, zorder=5))
+        s_final = np.array(states[-1])
+        ax.plot(*s_final[6:8], 'o', color=color, markersize=6,
+                markeredgecolor='black', markeredgewidth=0.8, zorder=6)
+
+    fig, axes = plt.subplots(2, 2, figsize=(8, 8))
+    fig.patch.set_facecolor('white')
+
+    for ax, seed in zip(axes.flat, seeds):
+        x0, theta, ws_min, ws_max, n_replans = pt._build_scenario(seed, distance, n_obs)
+        goal_xy    = np.array(theta.goal_xy)
+        goal_angle = float(theta.goal_angle)
+        obstacles  = np.array(theta.obstacles)
+
+        ax.set_facecolor('#f5f5f5')
+        ax.set_xlim(ws_min[0], ws_max[0]); ax.set_ylim(ws_min[1], ws_max[1])
+        ax.set_aspect('equal'); ax.set_xticks([]); ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_edgecolor('black'); spine.set_linewidth(1.2)
+
+        for obs in obstacles:
+            cx, cy, hx, hy = obs
+            if hx > 0.01:
+                ax.add_patch(mpatches.Rectangle(
+                    (cx - hx, cy - hy), 2*hx, 2*hy,
+                    facecolor='dimgray', edgecolor='black', linewidth=1.2, zorder=3))
+
+        key_ps, key_pfmp = jax.random.split(jax.random.key(seed))
+        for method, color, key in [('ps', '#E74C3C', key_ps), ('pfmp', '#27AE60', key_pfmp)]:
+            states, _ = pt.simulate(method, x0, theta, key, particles, n_replans)
+            draw_tee_trace(ax, states, color)
+
+        # Draw goal on top of traces
+        ax.add_patch(Polygon(pt._t_verts_world(goal_xy, goal_angle), closed=True,
+                             facecolor='darkorange', alpha=0.5,
+                             edgecolor='darkorange', linewidth=2.0, linestyle='--', zorder=7))
+        ax.plot(*goal_xy, '*', color='darkorange', markersize=12,
+                markeredgecolor='black', markeredgewidth=0.8, zorder=8)
+
+    fig.tight_layout()
+    return fig
+
+
 def figure_pushT(config, args, output_dir):
     """2x2 grid of scenarios; PS and SMC T-block traces overlaid per panel."""
-    import pushT as pt
-    from pushT_2d_sweep import PARTICLES, SEED
-    fig = pt._make_trace_figure(
-        args.seeds or list(range(config.get("seed", SEED),
-                                 config.get("seed", SEED) + 4)),
-        distance=PUSHT_DISTANCE, n_obs=None, corridor=False,
-        particles=PARTICLES)
-    _save(fig, args.out or "fig_pushT_traces", output_dir)
+    seed = config.get("seed", PUSHT_SEED)
+    fig = _make_trace_figure(
+        args.seeds or list(range(seed, seed + 4)),
+        distance=PUSHT_DISTANCE, n_obs=None, particles=PUSHT_PARTICLES)
+    _save(fig, args.out or "pushT_2d_plan_fig", output_dir)
 
 
 def figure_mbm(config, args, output_dir):
-    """Viser 3D scene. Interactive by nature, so it serves rather than saves:
-    the png comes from the client's own render, via its Save Screenshot button."""
-    out = args.out or "planning1024"
-    sys.argv = ["mbm_figure",
-                "--dataset", args.dataset or config["datasets"][0],
-                "--problem", str(args.problem),
-                "--seed", str(config.get("seed", 0)), "--out", out]
-    print(f"Serving viser; use 'Save Screenshot' to write figures/{out}.png")
-    import mbm_figure
-    mbm_figure.main()
+    """Viser 3D scene: the planned arm trajectory as start / waypoints / goal
+    overlays plus an end-effector spline.
+
+    Interactive by nature, so it serves rather than saves -- the PNG comes from
+    the client's own render via its "Save Screenshot" button. The plan is built
+    from the same `load_task` the numbers use, so the figure cannot show a
+    different cost or proposal than the table beside it.
+    """
+    import time
+    import numpy as np
+    import viser
+    import yourdfpy
+    from PIL import Image
+    from viser.extras import ViserUrdf
+    from mbm import add_environment_to_viser, forward_kinematics
+    from pfmp.interpolate import hermite_spline
+
+    NUM_WAYPOINTS, FINGER_OPEN = 3, 0.04
+    out = args.out or "mbm_plan_fig"
+    dataset = args.dataset or config["datasets"][0]
+    urdf_path = config.get("urdf", "models/panda_spherized.urdf")
+
+    cfg = dict(config, datasets=[dataset], num=args.problem + 1,
+               seed=config.get("seed", 0))
+    task, group = load_task("mbm", cfg)
+    ctrl = build_controller(task, "sir", int(config.get("num_samples", 1000)),
+                            ess_thresh=float(task.hp_defaults["ess_thresh"]))
+    x0, theta = task.sample_problem(args.problem)
+
+    trajs, costs = ctrl.run_sir(jax.random.key(cfg["seed"]), x0, theta)
+    knots = trajs[jnp.argmin(jnp.sum(costs, axis=-1))]
+    tq = jnp.linspace(0, ctrl.horizon, int(ctrl.horizon / ctrl.dt))
+    us = hermite_spline(tq, ctrl.tk(), knots)
+    _, path = jax.lax.scan(
+        lambda q, u: (task.dynamics(q, u, theta, 0.0)[0], q), x0, us)
+    path = np.array(path)
+    cfg_with_finger = lambda q: np.append(np.array(q), FINGER_OPEN)
+
+    server = viser.ViserServer()
+    add_environment_to_viser(server, theta.env, prefix="/env")
+    urdf = yourdfpy.URDF.load(urdf_path)
+
+    idxs = np.linspace(0, len(path) - 1, NUM_WAYPOINTS + 2).round().astype(int)
+    viridis = np.array([[68, 1, 84], [59, 82, 139], [33, 145, 140],
+                        [94, 201, 98], [253, 231, 37]])
+    cmap_idx = np.linspace(0, len(viridis) - 1, NUM_WAYPOINTS).round().astype(int)
+
+    ViserUrdf(server, urdf, root_node_name="/robot_start",
+              mesh_color_override=(140, 140, 140, 0.5)).update_cfg(cfg_with_finger(path[idxs[0]]))
+    for i, ci in enumerate(cmap_idx):
+        ViserUrdf(server, urdf, root_node_name=f"/robot_mid_{i}",
+                  mesh_color_override=(*viridis[ci].tolist(), 0.35)
+                  ).update_cfg(cfg_with_finger(path[idxs[1 + i]]))
+    ViserUrdf(server, urdf, root_node_name="/robot_goal",
+              mesh_color_override=(255, 193, 7, 0.8)).update_cfg(cfg_with_finger(path[idxs[-1]]))
+
+    live = ViserUrdf(server, urdf, root_node_name="/robot_live")
+    live.update_cfg(cfg_with_finger(path[0]))
+    ee = np.array([forward_kinematics(jnp.array(q), theta.robot)[-1, :3, 3] for q in path])
+    server.scene.add_spline_catmull_rom("/ee_trace", ee, color=(220, 20, 60), line_width=3.0)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / f"{out}.png"
+    frame = server.gui.add_slider("Frame", min=0, max=len(path) - 1, step=1, initial_value=0)
+    play = server.gui.add_button("Play")
+    playing = {"on": False}
+
+    @frame.on_update
+    def _(_):
+        live.update_cfg(cfg_with_finger(path[frame.value]))
+
+    @play.on_click
+    def _(_):
+        playing["on"] = not playing["on"]
+        play.label = "Pause" if playing["on"] else "Play"
+
+    @server.on_client_connect
+    def _(client):
+        @client.gui.add_button("Save Screenshot").on_click
+        def _(_):
+            Image.fromarray(client.get_render(height=1080, width=1920,
+                                              transport_format="png")).save(out_path)
+            print(f"Saved {out_path}")
+
+    print(f"Serving {dataset} problem {args.problem} on http://localhost:8080 -- "
+          f"position the camera, then 'Save Screenshot' to write {out_path}")
+    while True:
+        if playing["on"]:
+            frame.value = (frame.value + 1) % len(path)
+            live.update_cfg(cfg_with_finger(path[frame.value]))
+            time.sleep(0.02)
 
 
 BRANCHES = {"drive": figure_drive, "pushT": figure_pushT, "mbm": figure_mbm}
@@ -411,12 +547,12 @@ def main():
     ap.add_argument("task", help="task name (%s), or a path to a config yaml"
                     % "/".join(BRANCHES))
     ap.add_argument("--problem", type=int, default=0,
-                    help="map index (geometric) or problem index (mbm)")
+                    help="map index (drive) or problem index (mbm)")
     ap.add_argument("--seed", type=int,
                     help="override the config's seed (all branches)")
     ap.add_argument("--seeds", type=int, nargs="+", help="pushT: scenario seeds")
     ap.add_argument("--dataset", help="mbm: dataset dir")
-    ap.add_argument("--num-outer", type=int, help="geometric: outer iterations")
+    ap.add_argument("--num-outer", type=int, help="drive: outer iterations")
     ap.add_argument("--out", help="output stem (no extension)")
     ap.add_argument("--output-dir")
     args = ap.parse_args()

@@ -32,7 +32,9 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from geom_runner import load_task, run_algorithm, ALGORITHMS, CUSTOM_PROPOSAL
+from geom_runner import (load_task, run_algorithm, build_simulator,
+                         TRACED_HP, ALGORITHMS)
+from pfmp import method_decomp
 
 # Tuned params are inputs to a run, not figures: they live beside the
 # configs that reference them.
@@ -43,20 +45,12 @@ OUTPUT_DIR = Path(__file__).parent / "checkpoints"
 # meant tuning inherited the sweep's own settings.
 #
 #   objective: what the search maximises, and how it reduces across problems.
-#   tuning:    config overrides for the search only. push-T's `distance` is the
-#              swept axis, and at its first point every method succeeds, so the
-#              objective saturates and every trial ties.
+#   tuning:    config overrides for the search only.
 TASK_SETUP = {
-    # 256 particles, not the sweep's 2048: 8x cheaper per trial, matching the
-    # old tuner's FIXED_PARTICLES. Note this tunes at a different budget than
-    # the evaluation runs at, and MPPI's temperature in particular interacts
-    # with how many samples the softmax averages, so the transfer is an
-    # assumption rather than a guarantee.
     "pushT": dict(metric="success", minimise=False, agg="mean", ceiling=1.0,
                   overrides={"distance": 4.0, "num": 128, "num_samples": 256}),
     "mbm":   dict(metric="success", minimise=False, agg="mean", ceiling=1.0,
                   overrides={}),
-    # No ceiling: cost has no best attainable value to stop at.
     "drive": dict(metric="cost", minimise=True, agg="median", ceiling=None,
                   overrides={}),
 }
@@ -70,44 +64,70 @@ def suggest(trial, method, particles, task):
     dead parameter in the space wastes trials and makes the search look
     converged when it is not (DIAL used to search `mppi_temperature`, which it
     never touches)."""
+    proposal, update, rho = method_decomp(method)
     hp = {}
     # Every method reads `stdev`: the perturbation methods as their noise width,
     # the custom-proposal ones through their own `_sigma_at`. Omitting it for
     # SIS left that method with an empty search space, so every trial tied.
     hp["stdev"] = trial.suggest_float("stdev", 0.01, 0.6, log=True)
-    if task == "mbm" and method in CUSTOM_PROPOSAL:
+    if task == "mbm" and proposal == "informed":
         hp["goal_frac"] = trial.suggest_float("goal_frac", 0.05, 0.4)
         hp["gauss_frac"] = trial.suggest_float("gauss_frac", 0.3, 0.8)
         hp["gauss_std"] = trial.suggest_float("gauss_std", 0.05, 0.5)
-    if method in ("mppi", "biased_mppi"):
+    if update == "mean":
         hp["mppi_temperature"] = trial.suggest_float(
             "mppi_temperature", 0.01, 1e4, log=True)
-    if method in ("cem", "biased_cem"):
+    if update == "topk":
         hp["cem_elite_frac"] = trial.suggest_float(
             "cem_elite_frac", 1.0 / particles, 0.3, log=True)
         hp["cem_stdev_floor"] = trial.suggest_float(
             "cem_stdev_floor", 1e-3, 2e-1, log=True)
-    if method in ("sir",):
+    # rho is None exactly when the name asks for "the task's ess_thresh"
+    # (`sir`, or any `+r` with no number), which is when it is ours to tune.
+    # Keying on the literal name `sir` meant `sis+r` and `mppi+r` silently
+    # skipped it.
+    if rho is None:
         hp["ess_thresh"] = trial.suggest_float("ess_thresh", 0.1, 0.7)
-    if method == "sis_sample":
+    if update == "sample":
         # Shares MPPI's temperature semantics; searched on the same scale.
         hp["sample_temperature"] = trial.suggest_float(
             "sample_temperature", 0.01, 1e4, log=True)
-    if method == "dial":
+    if update == "diffuse":
         hp["dial_temp_sample"] = trial.suggest_float(
             "dial_temp_sample", 1e-2, 2.0, log=True)
-        hp["dial_n_inner"] = trial.suggest_int("dial_n_inner", 1, 4)
+        # `dial_n_inner` is deliberately NOT searched: it is the number of
+        # annealing passes, so each extra level is another full batch of rollouts.
+        # Tuning it would let DIAL buy accuracy with compute the other methods
+        # are not given, breaking the matched-budget comparison.
     return hp
 
 
 class Evaluator:
-    """Scores a method on a fixed problem slice. Caches the built task, since
-    loading MBM's datasets per trial dominates the search otherwise."""
+    """Scores a method on a fixed problem slice.
+
+    Holds the built task (loading MBM's datasets per trial would dominate the
+    search) and the compiled simulator for the current static hyperparameters.
+    A search that varies only traced knobs -- a temperature, a noise width --
+    compiles once for the whole study. One that varies a static knob (SIR's
+    ess_thresh, CEM's elite count, DIAL's n_inner) recompiles when it changes,
+    but only ever keeps one program alive.
+    """
 
     def __init__(self, config, num, offset, seed):
         self.cfg = dict(config, num=num, problem_offset=offset)
         self.seed = seed
         self.task, self.group_size = load_task(self.cfg["task"], self.cfg)
+        self._sim = self._sim_key = None
+
+    def _simulator(self, method, hp):
+        key = (method, tuple(sorted((k, v) for k, v in hp.items()
+                                    if k not in TRACED_HP
+                                    and isinstance(v, (int, float, bool)))))
+        if key != self._sim_key:
+            self._sim = build_simulator(self.task, method,
+                                        self.cfg["num_samples"], hp)
+            self._sim_key = key
+        return self._sim
 
     def __call__(self, method, hp):
         full = dict(self.task.hp_defaults)
@@ -115,7 +135,8 @@ class Evaluator:
         full.update(hp)
         return run_algorithm(self.task, method, num=self.cfg["num"],
                              particles=self.cfg["num_samples"], hp=full,
-                             seed=self.seed, group_size=self.group_size)
+                             seed=self.seed, group_size=self.group_size,
+                             sim=self._simulator(method, full))
 
 
 def score(res, setup):
@@ -237,7 +258,9 @@ def main():
     config.update(setup["overrides"])
     if args.num:
         config["num"] = args.num
-    n = config["num"]
+    # The task is the authority on how many problems exist; only ask the config
+    # when it wants fewer (push-T and drive generate on demand, MBM does not).
+    n = config.get("num") or load_task(config["task"], config)[0].num_problems
     n_tune = args.tune_num or n // 2
     n_val = n - n_tune
     if n_val < 1:

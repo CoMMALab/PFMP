@@ -1,4 +1,4 @@
-# 2D geometric: bicycle kinematics through a random box field. Arena length
+# Drive: bicycle kinematics through a random box field. Arena length
 # scales with the knot count, so difficulty and plan length grow together.
 task: drive
 num: 128           # maps
@@ -12,7 +12,7 @@ algorithms: [sis, sis+r0.1, sis+r0.2, mppi, mppi+r0.1, mppi+r0.2,
 
 # Knot count and arena length grow together, so this is a horizon sweep.
 sweep:
-  name: fig_geometric
+  name: drive_fig
   key: num_knots
   values:
   - 5

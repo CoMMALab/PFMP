@@ -11,8 +11,6 @@ datasets:
   - models/problems/bookshelf_thin_panda
   - models/problems/box_panda
   - models/problems/cage_panda
-problems_per_dataset: 100
-num: 700
 num_samples: 1000
 seed: 0
 tuned_params: experiments/checkpoints/mbm_tune.json
@@ -21,7 +19,7 @@ algorithms: [sis, sir, mppi, cem, biased_mppi, biased_cem, dial]
 # Categorical: one bar group per dataset, so the swept value is a 1-element
 # dataset list and `xticks` carries the label.
 sweep:
-  name: fig_mbm
+  name: mbm_fig
   key: datasets
   values:
     - [models/problems/table_pick_panda]

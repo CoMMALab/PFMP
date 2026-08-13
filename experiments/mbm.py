@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import NamedTuple
 from scipy.spatial.transform import Rotation
 
+from pfmp import sigma_at as _sigma_at, knot_index as _knot_index
+
 
 # ============================================================================
 # Environment representation
@@ -551,25 +553,13 @@ def proposal(key, x, u, theta, t):
 # Perturbation proposal for the PS/MPPI/CEM baselines: Gaussian noise around a
 # warm-start plan theta.mean (a straight line from q_start to q_goal). Mirrors
 # the Gaussian-perturbation proposal used by the MuJoCo and push-T baselines.
-def _sigma_at(theta, idx):
-    """Perturbation noise for knot `idx`.
-
-    Handles both conventions: a scalar `stdev` (PS/MPPI) and a per-knot array
-    (CEM, which refits it from the elites each replan). `jnp.ndim` is static, so
-    this is free under jit and the scalar path is identical to reading
-    `theta.stdev` directly.
-    """
-    return theta.stdev if jnp.ndim(theta.stdev) == 0 else theta.stdev[idx]
-
-
 def perturbation_init(key, x, theta):
     return jnp.clip(theta.mean[0] + jax.random.normal(key, x.shape) * _sigma_at(theta, 0),
                     theta.q_min, theta.q_max)
 
 
 def perturbation_proposal(key, x, u, theta, t):
-    idx = jnp.clip(jnp.round(t / theta.step_len).astype(jnp.int32) + 1,
-                   0, theta.mean.shape[0] - 1)
+    idx = _knot_index(theta, t)
     return jnp.clip(theta.mean[idx] + jax.random.normal(key, x.shape) * _sigma_at(theta, idx),
                     theta.q_min, theta.q_max)
 
@@ -582,7 +572,7 @@ def run_benchmark_fast(dataset_dir, urdf_path='models/panda_spherized.urdf', n_p
                        seed=0, tuned_path='figures/mbm_baseline_tune.json'):
     """Fast benchmark - SIS, SIS/R, and PS/MPPI/CEM + Biased-MPPI/CEM baselines."""
     import json as _json
-    from pfmp import PFMP
+    from pfmp import PFMP, sigma_at as _sigma_at, knot_index as _knot_index
     from pfmp.interpolate import hermite_spline
     from pfmp.algorithm import ps_update, mppi_update, cem_update
 
