@@ -1,0 +1,24 @@
+# Push-T particle-count ablation: how each method scales with the sample budget,
+# at a fixed difficulty. Distance 4.0 and N in {1, 16, 128, 512, 2048} match the
+# retired `push_tee_2d_sweep --plot-ablation` (figures/ablation_N*/), so the new
+# numbers are comparable to the old ones.
+#
+# N = 1 is the degenerate corner: with one particle every update returns that
+# particle, so all seven methods coincide with a random shooting baseline.
+task: push_tee
+distance: 4.0
+num: 128
+num_samples: 2048        # overridden per sweep point
+seed: 42
+tuned_params: experiments/checkpoints/push_tee_tune.json
+algorithms: [sis, sir, mppi, cem, biased_mppi, biased_cem, dial]
+
+sweep:
+  name: push_tee_2d_ablation_fig
+  key: num_samples
+  values: [1, 16, 128, 512, 2048]
+  xlabel: Particles
+  xscale: log
+  metric: success
+  kind: rate
+  ylabel: Success rate (%)

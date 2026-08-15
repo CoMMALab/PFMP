@@ -1,5 +1,7 @@
 task: "HalfCheetah"
-algorithms: ["ps", "mppi", "cem", "icem", "dial", "sis", "sir"]
+# The nine methods of Table 1. `learned` needs a trained actor; the runner
+# skips it with a warning if none is found, so the rest still run.
+algorithms: ["ps", "mppi", "cem", "icem", "dial", "sis", "sir", "learned", "biased_mppi"]
 num: 20
 max_step: 1000
 plan_horizon: 0.6
@@ -14,3 +16,5 @@ cem_sigma_min: 0.1
 dial_beta_opt_iter: 1.0
 dial_beta_horizon: 1.0
 dial_iterations: 5
+learned_checkpoint: null   # null = auto-resolve the latest mjlab checkpoint
+icem_beta: 2.5

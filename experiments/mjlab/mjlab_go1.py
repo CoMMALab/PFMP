@@ -2,10 +2,10 @@
 Train/eval Unitree Go1 flat-terrain velocity tracking via mjlab.
 
 Train:
-    WANDB_MODE=disabled python examples/mjlab_go1.py --train --num-envs 1024
+    WANDB_MODE=disabled python experiments/mjlab/mjlab_go1.py --train --num-envs 1024
 
 Play (after training):
-    python examples/mjlab_go1.py --checkpoint logs/rsl_rl/go1_velocity/<run>/model_*.pt
+    python experiments/mjlab/mjlab_go1.py --checkpoint logs/rsl_rl/go1_velocity/<run>/model_*.pt
 """
 
 import argparse

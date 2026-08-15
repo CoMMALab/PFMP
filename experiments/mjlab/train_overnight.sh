@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Train mjlab learned proposals overnight, sequentially (one GPU).
-# Usage:  nohup bash experiments/train_overnight.sh > logs/overnight/run.log 2>&1 &
+# Usage:  nohup bash experiments/mjlab/train_overnight.sh > logs/overnight/run.log 2>&1 &
 # In the morning, mjx_runner auto-resolves the newest checkpoint per task.
 
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."   # repo root
 export WANDB_MODE=disabled
 # pfmp (JAX) is imported at module load; stop JAX preallocating ~90% of the GPU
 # so the PyTorch PPO trainer has room (otherwise the box can OOM/crash).
@@ -22,11 +22,11 @@ run() {  # name  script  iters
     echo "==== [$(date +%H:%M:%S)] DONE  $name (exit $?) ===="
 }
 
-run cartpole        examples/mjlab_cartpole.py        2000
-run double_cartpole examples/mjlab_double_cartpole.py 2000
+run cartpole        experiments/mjlab/mjlab_cartpole.py        2000
+run double_cartpole experiments/mjlab/mjlab_double_cartpole.py 2000
 
 # Added once the task definitions exist + pass a validation run:
-# run halfcheetah    examples/mjlab_halfcheetah.py     3000
-# run walker         examples/mjlab_walker.py          3000
+# run halfcheetah    experiments/mjlab/mjlab_halfcheetah.py     3000
+# run walker         experiments/mjlab/mjlab_walker.py          3000
 
 echo "==== [$(date +%H:%M:%S)] ALL DONE ===="

@@ -7,10 +7,10 @@ policy is a proposal aligned with the benchmark objective rather than a
 max-speed runner.
 
 Train:
-    WANDB_MODE=disabled python examples/mjlab_half_cheetah.py --train --num-envs 4096
+    WANDB_MODE=disabled python experiments/mjlab/mjlab_half_cheetah.py --train --num-envs 4096
 
 Play (after training):
-    python examples/mjlab_half_cheetah.py --checkpoint logs/rsl_rl/half_cheetah/<run>/model_*.pt
+    python experiments/mjlab/mjlab_half_cheetah.py --checkpoint logs/rsl_rl/half_cheetah/<run>/model_*.pt
 """
 
 import argparse

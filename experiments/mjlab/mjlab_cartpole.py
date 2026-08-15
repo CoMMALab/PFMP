@@ -2,11 +2,11 @@
 Train CartPole swingup via mjlab (MuJoCo-Warp + RSL-RL PPO) using hydrax's XML.
 
 Train:
-    WANDB_MODE=disabled python examples/mjlab_cartpole.py --train \
+    WANDB_MODE=disabled python experiments/mjlab/mjlab_cartpole.py --train \
         --num-envs 1024
 
 Play (after training):
-    python examples/mjlab_cartpole.py --checkpoint logs/rsl_rl/cartpole/<run>/model_*.pt
+    python experiments/mjlab/mjlab_cartpole.py --checkpoint logs/rsl_rl/cartpole/<run>/model_*.pt
 """
 
 import argparse

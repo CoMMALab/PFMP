@@ -1,19 +1,21 @@
 # Push-T: closed-loop planar pushing. `distance` is the arena size in T-widths
 # and sets both the obstacle count (int(distance) - 3) and the replan budget;
 # geom_analyze overrides it per point when it sweeps that axis.
-task: pushT
-distance: 2.0
-num: 32
+task: push_tee
+distance: 4.0        # base value; the sweep overrides it per point
+num: 128             # arenas per point, as reported in the paper
 num_samples: 2048
-seed: 0
-tuned_params: experiments/checkpoints/pushT_tune.json
-algorithms: [sis, sir, mppi, cem, biased_mppi, biased_cem, dial]
+seed: 42
+tuned_params: experiments/checkpoints/push_tee_tune.json
+# `ps` is included so this one sweep also supports the proposal-axis view
+# (ps/sis, mppi/biased_mppi, cem/biased_cem are matched-update pairs).
+algorithms: [sis, sir, ps, mppi, biased_mppi, cem, biased_cem, dial]
 
 # Sweep axis for geom_runner / geom_analyze. `xticks` is the plotted coordinate
 # for each value: several arena sizes share an obstacle count, and the plot
 # dedupes on it.
 sweep:
-  name: pushT_2d_fig
+  name: push_tee_2d_fig
   key: distance
   values: [2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 7.5, 10.0]
   xticks: [0, 0, 0, 0, 1, 1, 2, 4, 7]
