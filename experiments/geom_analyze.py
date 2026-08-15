@@ -1,22 +1,11 @@
-"""Sweeps and figures for the tasks in `geom_runner.py`.
+"""Figures for the sweeps in `geom_runner.py`.
 
-Two roles, both of which used to live in a separate script per task
-(`pushT_2d_sweep.make_plots`, `drive.make_plots`, `mbm_figure`):
+Takes a results path and nothing else: the runner stores the axis, the method
+list and the hyperparameters beside the raw values, so a figure can never be
+labelled by a config that changed after the run.
 
-Turns a sweep's results into the paper figure. The axis itself is defined in
-the task's config (`sweep:` block) and run by `geom_runner`.
-
-Per-problem values are cached raw, never pre-aggregated: a success rate needs
-its numerator and denominator to get a Wilson interval, and a cost needs the
-whole sample to get a median and IQR. Re-plotting never re-runs.
-
-Takes a results path and nothing else: `geom_runner` writes the axis and the
-method list into the cache beside the raw values, so a figure never depends on
-a yaml that may have moved on since the run.
-
-Usage:
-    python experiments/geom_runner.py  experiments/configs/pushT.yaml out/pushT
-    python experiments/geom_analyze.py out/pushT
+    python experiments/geom_runner.py  experiments/configs/push_tee.yaml out/push_tee
+    python experiments/geom_analyze.py out/push_tee
 """
 
 import argparse
@@ -38,7 +27,7 @@ from pfmp import method_decomp
 
 OUTPUT_DIR = Path(__file__).parent.parent / "figures"
 
-# Shared with pushT_2d_sweep so figures stay comparable across the paper. Solid
+# Shared with push_tee_2d_sweep so figures stay comparable across the paper. Solid
 # + heavy = has an object-informed proposal; dashed + light = does not.
 LABELS = {
     # SIS/SIR are the same update (argmin) at two resampling thresholds, so
@@ -58,24 +47,42 @@ COLORS = {
     "sis_sample": "#52BE80", "dial": "#9B59B6",
 }
 def label_for(alg, hyperparams, style="rho"):
-    """Method label carrying the resampling threshold it actually ran at.
-
-    Resampling is one of the three axes, so every method states its rho rather
-    than hiding it in a name: `sis` and `sir` become PS at rho 0 and rho 0.5,
-    and `mppi+r` is MPPI at the same rho as SIR.
-    """
+    """Method label stating the rho it actually ran at."""
     proposal, update, rho = method_decomp(alg)
     if style == "proposal":
         return f"{UPDATE_LABEL.get(update, update)}, {PROPOSAL_LABEL[proposal]}"
-    if rho is None:      # bare "+r": the run recorded what it resolved to
-        rho = (hyperparams or {}).get(alg, {}).get("ess_thresh", 0.0)
-    return rf"{UPDATE_LABEL.get(update, update)} ($\rho$ = {rho:g})"
+    name = AXIS_LABEL.get((proposal, update), f"{proposal}/{update}")
+    if rho is None:
+        # A bare "+r" only knows its rho from what the run recorded. Caches
+        # written before that was logged cannot say, and printing 0 there would
+        # label a resampling method as if it never resampled -- the same label
+        # its rho=0 sibling gets.
+        rho = (hyperparams or {}).get(alg, {}).get("ess_thresh")
+        if rho is None:
+            return rf"{name} ($\rho$ = ?)"
+    return rf"{name} ($\rho$ = {rho:.3g})"
 
 
 # Line style carries rho, hue carries the update. Assigned in sorted rho order,
 # so more resampling reads as a more solid line: dotted (none) -> dashed -> solid.
 STYLE_CYCLE = (":", "--", "-", (0, (3, 1, 1, 1)), (0, (5, 1)), (0, (1, 1)))
 
+
+# Display name per (proposal, update) cell -- the inverse of METHOD_ALIASES, so
+# two methods can only share a label if they are the same point on the axes.
+# Without this, `sis`/`ps` and `mppi`/`biased_mppi` both collapsed to one name.
+AXIS_LABEL = {
+    ("gaussian", "argmin"):  "PS",
+    ("informed", "argmin"):  "SIS",
+    ("learned",  "argmin"):  "learned",
+    ("gaussian", "mean"):    "MPPI",
+    ("informed", "mean"):    "Biased-MPPI",
+    ("gaussian", "topk"):    "CEM",
+    ("informed", "topk"):    "Biased-CEM",
+    ("gaussian", "diffuse"): "DIAL-MPC",
+    ("informed", "sample"):  "SIS-sample",
+    ("learned",  "sample"):  "Piche",
+}
 
 # `pfmp.method_decomp` is the single decoder; these only name the levels.
 UPDATE_LABEL = {"argmin": "argmin (PS)", "sample": "sample", "mean": "MPPI",
@@ -91,11 +98,14 @@ def proposal_of(alg):
 
 
 def rho_of(alg, hyperparams):
-    """(update, rho), with a bare `+r` resolved from what the run recorded."""
-    _, update, rho = method_decomp(alg)
+    """((proposal, update), rho), with a bare `+r` resolved from the run.
+
+    Hue keys on the whole cell so `mppi` and `biased_mppi` do not collide.
+    """
+    proposal, update, rho = method_decomp(alg)
     if rho is None:
         rho = (hyperparams or {}).get(alg, {}).get("ess_thresh", 0.0)
-    return update, float(rho)
+    return (proposal, update), float(rho)
 
 
 def encodings(algorithms, hyperparams, style="rho"):
@@ -114,6 +124,14 @@ def encodings(algorithms, hyperparams, style="rho"):
                     for i, k in enumerate(order)}
 
 
+def _group_label(g):
+    """Legend/facet name for a hue group: a (proposal, update) cell, or a bare
+    update when the proposal view has already split them into columns."""
+    if isinstance(g, tuple):
+        return AXIS_LABEL.get(g, "/".join(g))
+    return UPDATE_LABEL.get(g, LABELS.get(g, g))
+
+
 def _axes_of(alg, hyperparams, style):
     """(hue group, line-style key) for one method under the chosen encoding."""
     if style == "proposal":
@@ -123,17 +141,41 @@ def _axes_of(alg, hyperparams, style):
 
 # Hue follows the update; the other two axes are carried by line style and by
 # faceting, so a resampling variant or a different proposal keeps its colour.
-UPDATE_COLORS = {"argmin": "#E74C3C", "sample": "#52BE80", "mean": "#85C1E9",
-                 "topk": "#F8C471", "diffuse": "#9B59B6"}
+# Hue identifies the (proposal, update) cell, not the update alone: within a
+# family the informed proposal is the darker shade. Colouring by update only
+# drew `mppi` and `biased_mppi` as two identical lines, since rho is carried by
+# the line style and the proposal then had no channel left.
+AXIS_COLORS = {
+    ("gaussian", "argmin"):  "#E74C3C",   # PS           light red
+    ("informed", "argmin"):  "#1E8449",   # SIS          green (ours)
+    ("gaussian", "mean"):    "#85C1E9",   # MPPI         light blue
+    ("informed", "mean"):    "#21618C",   # Biased-MPPI  deep blue
+    ("gaussian", "topk"):    "#F8C471",   # CEM          light amber
+    ("informed", "topk"):    "#B9770E",   # Biased-CEM   deep amber
+    ("gaussian", "diffuse"): "#9B59B6",   # DIAL-MPC     purple
+    ("informed", "sample"):  "#52BE80",   # SIS-sample   light green
+    ("learned",  "sample"):  "#7F8C8D",   # Piche        grey
+    ("learned",  "argmin"):  "#95A5A6",
+}
+
+
+# Hatch carries the proposal in the bar charts, where hue is already spent on
+# the update and two methods sharing an update sit side by side.
+PROPOSAL_HATCH = {"gaussian": "", "informed": "///", "learned": "..."}
+
+
+def _hatch(alg):
+    return PROPOSAL_HATCH.get(method_decomp(alg)[0], "")
 
 
 def _colour(key):
-    if key in UPDATE_COLORS:
-        return UPDATE_COLORS[key]
+    if isinstance(key, tuple):
+        return AXIS_COLORS.get(key, "gray")
     try:
-        return UPDATE_COLORS.get(method_decomp(key)[1], "gray")
+        proposal, update, _ = method_decomp(key)
     except ValueError:
         return "gray"
+    return AXIS_COLORS.get((proposal, update), "gray")
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +193,8 @@ class Sweep(NamedTuple):
     xlabel: str
     panels: list                   # [{metric, kind, ylabel}] one row each;
                                    # kind "rate" -> Wilson CI, else median+IQR
+    xscale: str                    # "linear" | "log"; log for particle counts,
+                                   #   where the values are geometric
     facet: str                     # "update" -> one column per update rule
     style: str                     # what the line style encodes: "rho"/"proposal"
     name: str
@@ -170,6 +214,7 @@ def load_sweep(blk):
                                     "ylabel": blk.get("ylabel", "")}]
     return Sweep(key=blk["key"], values=blk["values"], xticks=blk.get("xticks"),
                  xlabel=blk.get("xlabel", blk["key"]), panels=panels,
+                 xscale=blk.get("xscale", "linear"),
                  facet=blk.get("facet"), style=blk.get("style", "rho"),
                  name=blk.get("name", f"{blk['key']}_fig"))
 
@@ -244,9 +289,14 @@ def _draw_panel(ax, data, algorithms, sweep, panel, categorical, legend, hp):
         width = 0.8 / len(algorithms)
         for i, alg in enumerate(algorithms):
             _, c, lo, hi = data[alg]
+            # Clamp at zero: Wilson's bound at k == n is exactly the point
+            # estimate in exact arithmetic but ~1e-14 below it in floating
+            # point, and matplotlib rejects a negative yerr outright.
             ax.bar(idx + i * width - 0.4 + width / 2, c, width * 0.92,
                    color=_colour(alg), label=label_for(alg, hp),
-                   yerr=[c - lo, hi - c], capsize=2,
+                   hatch=_hatch(alg), edgecolor="white", linewidth=0.0,
+                   yerr=[np.maximum(c - lo, 0.0), np.maximum(hi - c, 0.0)],
+                   capsize=2,
                    error_kw=dict(lw=0.8, ecolor="0.3"))
         ax.set_xticks(idx)
         ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
@@ -260,7 +310,16 @@ def _draw_panel(ax, data, algorithms, sweep, panel, categorical, legend, hp):
             ax.plot(x, c, color=colours[grp], linestyle=styles[skey],
                     linewidth=2.0, marker="o", markersize=4, zorder=4,
                     label="_nolegend_")
-        ax.set_xticks(data[algorithms[0]][0])
+        xs = data[algorithms[0]][0]
+        if sweep.xscale == "log":
+            # Geometric sweeps (particle counts) squash against the origin on a
+            # linear axis; tick only at the values actually run.
+            ax.set_xscale("log")
+            ax.set_xticks(xs)
+            ax.set_xticklabels([f"{x:g}" for x in xs])
+            ax.minorticks_off()
+        else:
+            ax.set_xticks(xs)
         if panel["kind"] == "rate":
             ax.set_ylim(-5, 105)
             ax.axhline(100, color="gray", linestyle=":", linewidth=0.8, alpha=0.5)
@@ -273,26 +332,35 @@ def _draw_panel(ax, data, algorithms, sweep, panel, categorical, legend, hp):
 
 
 def _split_legend(fig, algorithms, hp, faceted, style="rho"):
-    """One legend strip above the grid: hue = update rule, line style = rho.
+    """Legend strip above the grid: hue = update, line style = rho.
 
-    Figure-level and outside the axes, because `loc="best"` has no good answer
-    on a faceted grid: every panel is full of data and matplotlib will drop the
-    box on top of a curve. When faceted, the column titles already name the
-    update, so only the rho key is shown.
+    Outside the axes because `loc="best"` lands on a curve in a full panel.
+    Faceted plots drop the hue key -- the column titles already carry it.
     """
     from matplotlib.lines import Line2D
 
     colours, styles = encodings(algorithms, hp, style)
     fmt = ((lambda k: PROPOSAL_LABEL[k]) if style == "proposal"
-           else (lambda k: rf"$\rho$ = {k:g}"))
+           else (lambda k: rf"$\rho$ = {k:.3g}"))
     handles = [Line2D([], [], color="0.35", lw=2.0, linestyle=st, label=fmt(k))
                for k, st in styles.items()]
     if not faceted and len(colours) > 1:
-        handles = [Line2D([], [], color=c, lw=2.2,
-                          label=UPDATE_LABEL.get(g, LABELS.get(g, g)))
+        handles = [Line2D([], [], color=c, lw=2.2, label=_group_label(g))
                    for g, c in colours.items()] + handles
     fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, 1.0),
                ncol=len(handles), fontsize=10, framealpha=0.95,
+               edgecolor="black", fancybox=False)
+
+
+def _bar_legend(fig, algorithms, hp):
+    """One entry per method: hue is the update, hatch the proposal, so neither
+    channel identifies a bar on its own."""
+    from matplotlib.patches import Patch
+
+    handles = [Patch(facecolor=_colour(a), hatch=_hatch(a), edgecolor="white",
+                     label=label_for(a, hp)) for a in algorithms]
+    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, 1.0),
+               ncol=min(4, len(handles)), fontsize=9, framealpha=0.95,
                edgecolor="black", fancybox=False)
 
 
@@ -307,8 +375,7 @@ def make_figure(results, sweep, algorithms, output_dir=OUTPUT_DIR, hp=None):
         seen = {}
         for alg in algorithms:
             seen.setdefault(_axes_of(alg, hp, sweep.style)[0], []).append(alg)
-        groups = [(UPDATE_LABEL.get(g, LABELS.get(g, g)), algs)
-                  for g, algs in seen.items()]
+        groups = [(_group_label(g), algs) for g, algs in seen.items()]
     else:
         groups = [(None, list(algorithms))]
 
@@ -336,7 +403,9 @@ def make_figure(results, sweep, algorithms, output_dir=OUTPUT_DIR, hp=None):
             if r < nrow - 1:
                 ax.set_xlabel("")
     fig.tight_layout()
-    if not categorical:
+    if categorical:
+        _bar_legend(fig, algorithms, hp)
+    else:
         _split_legend(fig, algorithms, hp, faceted=(sweep.facet is not None),
                       style=sweep.style)
 
@@ -365,6 +434,13 @@ def main():
     ap.add_argument("--output-dir", default=None)
     ap.add_argument("--algorithms", nargs="+", default=None,
                     help="subset/order to plot (default: what the sweep ran)")
+    # Encoding is a plotting choice, not a data choice: one sweep can yield both
+    # the rho view and the proposal view, so these override what the cache says.
+    ap.add_argument("--style", choices=("rho", "proposal"), default=None,
+                    help="what the line style encodes (default: as run)")
+    ap.add_argument("--facet", choices=("update", "none"), default=None,
+                    help="one column per update rule, or a single axes")
+    ap.add_argument("--name", default=None, help="output figure stem")
     args = ap.parse_args()
 
     path = Path(args.results)
@@ -375,7 +451,15 @@ def main():
         path = found[0]
     blob = json.load(open(path))
 
-    sweep = load_sweep(blob["sweep"])
+    from geom_runner import code_hash
+    if blob.get("code") and blob["code"] != code_hash():
+        print(f"  ! these results were produced by different code "
+              f"({blob['code']} vs {code_hash()} now)")
+    blk = dict(blob["sweep"])
+    if args.style:  blk["style"] = args.style
+    if args.facet:  blk["facet"] = None if args.facet == "none" else args.facet
+    if args.name:   blk["name"] = args.name
+    sweep = load_sweep(blk)
     algorithms = args.algorithms or blob["algorithms"]
     results = blob["results"]
 

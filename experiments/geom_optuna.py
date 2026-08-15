@@ -1,24 +1,11 @@
 """Hyperparameter search for the tasks in `geom_runner.py`.
 
-One tuner for all three tasks, replacing `pushT_2d_optuna.py` and
-`mbm_optuna.py`. It evaluates through `geom_runner.run_algorithm`, so a tuned
-parameter means the same thing here as in the run that reports the number, which
-is the failure the per-task tuners kept hitting (push-T's tuner and its sweep
-disagreed for months over whether MPPI's temperature was a fixed lambda or a
-scale on the cost std).
+Evaluates through `run_algorithm`, so a tuned parameter means the same thing
+here as in the run that reports the number. Tuning and validation draw from
+disjoint problems (`problem_offset`) and disjoint rollout keys, so the reported
+gap is generalisation. Writes `experiments/checkpoints/<task>_tune.json`.
 
-Held-out validation is mandatory, not optional. Tuning and validation draw from
-disjoint problems (`problem_offset`) AND disjoint rollout keys (`seed`), so a
-reported gap is generalisation and not the same rollouts scored twice.
-
-Output is `experiments/checkpoints/<task>_tune.json`, keyed by method, in the layout
-`geom_runner.load_tuned` reads:
-
-    {"mppi": {"best_params": {...}, "best_value": ..., "validation_value": ...}}
-
-Usage:
-    python experiments/geom_optuna.py experiments/configs/drive.yaml \
-        --methods mppi cem --trials 40
+    python experiments/geom_optuna.py experiments/configs/drive.yaml --methods mppi cem
 """
 
 import argparse
@@ -47,7 +34,7 @@ OUTPUT_DIR = Path(__file__).parent / "checkpoints"
 #   objective: what the search maximises, and how it reduces across problems.
 #   tuning:    config overrides for the search only.
 TASK_SETUP = {
-    "pushT": dict(metric="success", minimise=False, agg="mean", ceiling=1.0,
+    "push_tee": dict(metric="success", minimise=False, agg="mean", ceiling=1.0,
                   overrides={"distance": 4.0, "num": 128, "num_samples": 256}),
     "mbm":   dict(metric="success", minimise=False, agg="mean", ceiling=1.0,
                   overrides={}),
@@ -60,10 +47,11 @@ MBM_PROPOSAL = ("goal_frac", "gauss_frac", "gauss_std")
 
 
 def suggest(trial, method, particles, task):
-    """The search space, per method. Only knobs the method actually reads: a
-    dead parameter in the space wastes trials and makes the search look
-    converged when it is not (DIAL used to search `mppi_temperature`, which it
-    never touches)."""
+    """The search space, per method -- only knobs the method actually reads.
+
+    A dead parameter wastes trials and makes a search look converged when it is
+    not (DIAL used to search `mppi_temperature`, which it never touches).
+    """
     proposal, update, rho = method_decomp(method)
     hp = {}
     # Every method reads `stdev`: the perturbation methods as their noise width,
@@ -78,8 +66,12 @@ def suggest(trial, method, particles, task):
         hp["mppi_temperature"] = trial.suggest_float(
             "mppi_temperature", 0.01, 1e4, log=True)
     if update == "topk":
-        hp["cem_elite_frac"] = trial.suggest_float(
-            "cem_elite_frac", 1.0 / particles, 0.3, log=True)
+        # Absolute count, not a fraction: `int(frac * N)` is a step function of
+        # the particle budget, so a tuned fraction does not transfer across a
+        # particle-count sweep (it silently changed k from 1 to 2 between
+        # N=256 and N=512 on push-T, taking success from 100% to 12.5%).
+        hp["cem_num_elites"] = trial.suggest_int(
+            "cem_num_elites", 1, max(2, particles // 4), log=True)
         hp["cem_stdev_floor"] = trial.suggest_float(
             "cem_stdev_floor", 1e-3, 2e-1, log=True)
     # rho is None exactly when the name asks for "the task's ess_thresh"
@@ -105,12 +97,9 @@ def suggest(trial, method, particles, task):
 class Evaluator:
     """Scores a method on a fixed problem slice.
 
-    Holds the built task (loading MBM's datasets per trial would dominate the
-    search) and the compiled simulator for the current static hyperparameters.
-    A search that varies only traced knobs -- a temperature, a noise width --
-    compiles once for the whole study. One that varies a static knob (SIR's
-    ess_thresh, CEM's elite count, DIAL's n_inner) recompiles when it changes,
-    but only ever keeps one program alive.
+    Holds the built task and one compiled simulator. Searching only traced
+    knobs compiles once; a static knob (ess_thresh, elite count) recompiles on
+    change, but never keeps more than one program alive.
     """
 
     def __init__(self, config, num, offset, seed):

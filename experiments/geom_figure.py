@@ -1,19 +1,12 @@
-"""Qualitative figures for the tasks in `geom_runner.py`.
+"""Qualitative figures: the plans the paper puts beside the sweeps.
 
-Counterpart to `geom_analyze.py`: that one draws the sweeps, this one draws the
-plans the paper puts beside them.
-
-    drive -> drive_plan_fig     pushT -> pushT_2d_plan_fig     mbm -> mbm_plan_fig
+    drive -> drive_plan_fig     push_tee -> push_tee_2d_plan_fig     mbm -> mbm_plan_fig
 
 Three branches, because they share no rendering path (2D matplotlib with
-task-specific geometry; a viser 3D scene for MBM). What they do share is the
-task definition, so a figure cannot be drawn from a different cost or proposal
-than the numbers next to it. Single-problem and unbatched: these keep whole
-particle trajectories, which is what the runner's `measure` discards.
+task-specific geometry; a viser scene for MBM). They do share the task, taken
+from `load_task`, so a figure cannot use a different cost than the numbers.
 
     python experiments/geom_figure.py drive
-    python experiments/geom_figure.py experiments/configs/pushT.yaml --seeds 0 1 2 3
-    python experiments/geom_figure.py experiments/configs/mbm.yaml --problem 0
 """
 
 import argparse
@@ -376,7 +369,7 @@ def figure_drive(config, args, output_dir):
     _save(fig, args.out or "drive_plan_fig", output_dir)
 
 
-PUSHT_DISTANCE = 7.0
+PUSH_TEE_DISTANCE = 7.0
 
 def _make_trace_figure(seeds, distance, n_obs=None, particles=None):
     """2×2 grid of scenarios; each panel overlays PS (red) and PFMP (green) traces."""
@@ -436,23 +429,20 @@ def _make_trace_figure(seeds, distance, n_obs=None, particles=None):
     return fig
 
 
-def figure_pushT(config, args, output_dir):
+def figure_push_tee(config, args, output_dir):
     """2x2 grid of scenarios; PS and SMC T-block traces overlaid per panel."""
-    seed = config.get("seed", PUSHT_SEED)
+    seed = config.get("seed", PUSH_TEE_SEED)
     fig = _make_trace_figure(
         args.seeds or list(range(seed, seed + 4)),
-        distance=PUSHT_DISTANCE, n_obs=None, particles=PUSHT_PARTICLES)
-    _save(fig, args.out or "pushT_2d_plan_fig", output_dir)
+        distance=PUSH_TEE_DISTANCE, n_obs=None, particles=PUSH_TEE_PARTICLES)
+    _save(fig, args.out or "push_tee_2d_plan_fig", output_dir)
 
 
 def figure_mbm(config, args, output_dir):
-    """Viser 3D scene: the planned arm trajectory as start / waypoints / goal
-    overlays plus an end-effector spline.
+    """Viser scene: start / waypoint / goal arm overlays plus an EE spline.
 
-    Interactive by nature, so it serves rather than saves -- the PNG comes from
-    the client's own render via its "Save Screenshot" button. The plan is built
-    from the same `load_task` the numbers use, so the figure cannot show a
-    different cost or proposal than the table beside it.
+    Serves rather than saves -- the PNG comes from the client's "Save
+    Screenshot" button.
     """
     import time
     import numpy as np
@@ -539,7 +529,7 @@ def figure_mbm(config, args, output_dir):
             time.sleep(0.02)
 
 
-BRANCHES = {"drive": figure_drive, "pushT": figure_pushT, "mbm": figure_mbm}
+BRANCHES = {"drive": figure_drive, "push_tee": figure_push_tee, "mbm": figure_mbm}
 
 
 def main():
@@ -550,7 +540,7 @@ def main():
                     help="map index (drive) or problem index (mbm)")
     ap.add_argument("--seed", type=int,
                     help="override the config's seed (all branches)")
-    ap.add_argument("--seeds", type=int, nargs="+", help="pushT: scenario seeds")
+    ap.add_argument("--seeds", type=int, nargs="+", help="push_tee: scenario seeds")
     ap.add_argument("--dataset", help="mbm: dataset dir")
     ap.add_argument("--num-outer", type=int, help="drive: outer iterations")
     ap.add_argument("--out", help="output stem (no extension)")

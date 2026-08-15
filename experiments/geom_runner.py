@@ -1,13 +1,10 @@
 """Batched runner for the NamedTuple-defined tasks (drive, push-T, MBM).
 
-Mirrors `mjx_runner.py` (yaml config -> per-algorithm results in an outdir) but
-targets tasks that are plain JAX functions over a NamedTuple `theta`, rather
-than MuJoCo. That avoids materialising an `mjx.Data` per particle, which is the
-dominant memory cost in `run_batch` and buys nothing for these tasks.
+Mirrors `mjx_runner.py` (yaml config -> per-algorithm results in an outdir) for
+tasks that are plain JAX functions over a NamedTuple `theta`, avoiding an
+`mjx.Data` per particle. One task is selected by a flag; everything else is
+shared, so the tuner, the sweep, and the reported table cannot drift apart.
 
-One task is selected by a flag; everything else is shared.
-
-Usage:
     python experiments/geom_runner.py experiments/configs/mbm.yaml out/mbm
 """
 
@@ -109,11 +106,18 @@ def traced_hp(hp: dict):
     return {k: jnp.asarray(float(hp.get(k, 0.0))) for k in TRACED_HP}
 
 
-def make_replan(ctrl: PFMP, algorithm: str, hp: dict, particles: int):
-    """One planning iteration: (key, x, theta) -> theta.
+def _elite_count(hp: dict, particles: int) -> int:
+    """CEM's elite count. `cem_num_elites` is authoritative; `cem_elite_frac` is
+    the legacy form, kept so older tuned JSON still loads."""
+    if "cem_num_elites" in hp:
+        return max(1, min(int(hp["cem_num_elites"]), particles))
+    return max(1, int(hp.get("cem_elite_frac", 0.1) * particles))
 
-    DIAL is the one algorithm that owns its own sampling loop, so it replaces
-    this whole function rather than plugging into the update slot.
+
+def make_replan(ctrl: PFMP, algorithm: str, hp: dict, particles: int):
+    """One planning iteration: (key, x, theta) -> (theta, per-knot ESS).
+
+    DIAL replaces this wholesale: it owns its own sampling loop.
     """
     _, update_kind, rho = method_decomp(algorithm)
     sample = ctrl.run_sis if rho == 0.0 else ctrl.run_sir
@@ -155,7 +159,14 @@ def make_replan(ctrl: PFMP, algorithm: str, hp: dict, particles: int):
             th, tr, co, jnp.maximum(s["mppi_temperature"], 1e-6))
     elif update_kind == "topk":
         # The elite count sets an array shape, so it must stay static.
-        k = max(1, int(hp.get("cem_elite_frac", 0.1) * particles))
+        #
+        # Parameterised as an absolute count, not a fraction: k = int(frac * N)
+        # is a step function of the particle count, so a fraction tuned at one
+        # budget silently changes the method at another. Measured on push-T at
+        # N=512, k=1 -> 100% success and k=2 -> 12.5%; a fraction tuned at N=256
+        # (where it floored to k=1) crossed to k=2 at N=512 and produced a
+        # non-monotone particle-count curve.
+        k = _elite_count(hp, particles)
         update = lambda th, tr, co, s: cem_update(
             th, tr, co, k / particles, stdev_floor=s["cem_stdev_floor"])
     else:
@@ -190,13 +201,9 @@ def make_replan(ctrl: PFMP, algorithm: str, hp: dict, particles: int):
 
 
 def make_simulator(task: GeomTask, replan: Callable):
-    """jit(vmap(...)) of the outer MPC loop over a batch of problems.
+    """jit(vmap(...)) of the outer loop: replan -> execute -> shift, then measure.
 
-        for _ in range(n_replans):
-            theta = replan(key, x, theta)
-            x     = execute(x, theta)     # world advances (closed-loop only)
-            theta = shift(theta)          # plan re-times for the next replan
-        return measure(x, theta)
+    `execute`/`shift` are None for open-loop tasks, where the world never moves.
     """
     execute = task.execute or (lambda x, theta: x)
     shift = task.shift or (lambda theta: theta)
@@ -228,10 +235,8 @@ def make_simulator(task: GeomTask, replan: Callable):
 def build_simulator(task: GeomTask, algorithm: str, particles: int, hp: dict):
     """Compile the simulator for one (task, method, static hyperparameters).
 
-    Separate from `run_algorithm` so a caller that reuses the same method across
-    many evaluations (the tuner) can hold it and skip recompilation, without the
-    runner keeping global state. Only the traced knobs may change between runs
-    of a returned simulator; see `TRACED_HP`.
+    Split out so the tuner can hold one and skip recompiling; only `TRACED_HP`
+    may differ between runs of the returned simulator.
     """
     ctrl = build_controller(task, algorithm, particles,
                             ess_thresh=float(hp.get("ess_thresh", 0.0)))
@@ -356,7 +361,7 @@ def _mbm_task(config):
     )
     return task, groups[0]      # batch per dataset: env shapes match only within
 
-def _pushT_task(config):
+def _push_tee_task(config):
     """Push-T: closed-loop planar pushing. The world advances between replans,
     so `execute` runs the physics and `shift` re-times the plan onto the new
     clock, which is exactly what MBM leaves as None."""
@@ -549,7 +554,7 @@ def _drive_task(config):
     return task, n
 
 
-_TASKS = {"mbm": _mbm_task, "pushT": _pushT_task, "drive": _drive_task}
+_TASKS = {"mbm": _mbm_task, "push_tee": _push_tee_task, "drive": _drive_task}
 
 
 def load_task(name, config):
@@ -561,10 +566,8 @@ def load_task(name, config):
 def load_tuned(spec, algorithms):
     """Resolve `tuned_params` to {algorithm: {param: value}}.
 
-    Two layouts exist in figures/: one file per method, named by an
-    `{algorithm}` placeholder in the path (push-T), and a single file keyed by
-    method (MBM). A missing file warns rather than raising, so a partially
-    tuned sweep still runs with module defaults for the rest, but it says so.
+    Accepts one file keyed by method, or a path with an `{algorithm}`
+    placeholder. Missing entries warn and fall back to defaults.
     """
     import json
     if not spec:
@@ -593,15 +596,31 @@ def sweep_axis(config, key=None, values=None):
     return blk.get("key"), blk.get("values")
 
 
-def run_sweep(config, key, values, algorithms, cache_path):
-    """Run every (swept value, algorithm) pair, caching raw per-problem values.
+def code_hash():
+    """Hash of the sources that determine a result.
 
-    The sweep axis is just a yaml key overridden across a list, so nothing here
-    knows what is being swept. Resumable per cell: a pair already in the cache
-    is skipped, so a sweep that dies partway (or gains a method later) does not
-    re-run what it has. Values are cached raw, never aggregated, because a
-    success rate needs its numerator and denominator and a cost needs the whole
-    sample; `geom_analyze` decides how to reduce them.
+    A running sweep holds the code as of process start, so a mid-run edit leaves
+    a stale cache with a fresh mtime. This makes that detectable.
+    """
+    import hashlib
+    h = hashlib.sha256()
+    root = Path(__file__).resolve().parent.parent
+    for rel in sorted(["pfmp/algorithm.py", "pfmp/update.py", "pfmp/interpolate.py",
+                       "experiments/geom_runner.py", "experiments/mbm.py",
+                       "examples/push_tee_2d.py"]):
+        p = root / rel
+        if p.exists():
+            h.update(p.read_bytes())
+    return h.hexdigest()[:12]
+
+
+def run_sweep(config, key, values, algorithms, cache_path):
+    """Run every (swept value, algorithm) pair into a resumable cache.
+
+    The axis is a yaml key overridden across a list. Values are cached raw, not
+    aggregated -- a rate needs its numerator and denominator, a cost needs the
+    whole sample. The cache also stores the axis, the resolved hyperparameters,
+    and `code_hash`, so plotting needs nothing but the file.
     """
     import json
     cache_path = Path(cache_path)
@@ -626,10 +645,16 @@ def run_sweep(config, key, values, algorithms, cache_path):
     # retyped in the plotting code.
     used_hp = {}
 
+    code = code_hash()
+    if blob.get("code") not in (None, code):
+        print(f"  ! cache was written by different code ({blob['code']} vs "
+              f"{code}); cached cells will NOT be recomputed. Delete "
+              f"{cache_path} if the change affects results.")
+
     def flush():
         cache_path.write_text(json.dumps(
             {"task": config["task"], "sweep": axis, "algorithms": algorithms,
-             "hyperparams": used_hp, "results": results}))
+             "code": code, "hyperparams": used_hp, "results": results}))
 
     for value in values:
         vkey = str(value)

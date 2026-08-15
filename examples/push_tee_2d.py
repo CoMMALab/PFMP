@@ -1,13 +1,13 @@
 """
-pushT.py — T-block pushing with PFMP in 2D (no MuJoCo).
+push_tee_2d.py — T-block pushing with PFMP in 2D (no MuJoCo).
 
 A circular robot (green) pushes an orange T-shaped block toward a goal
 pose (x, y, angle). Robot motion is governed by impedance-style PD control
 toward waypoints produced by the PFMP planner.
 
 Usage:
-    python examples/pushT.py
-    python examples/pushT.py --save-gif
+    python examples/push_tee_2d.py
+    python examples/push_tee_2d.py --save-gif
 """
 
 import os
@@ -44,7 +44,7 @@ ESS_THRESH = 0.25
 N_REPLANS = 12      # closed-loop replan steps to precompute
 STEPS_PER_REPLAN = 100  # sim steps between replans
 
-# 2D workspace — same as pushT_bench
+# 2D workspace — same as push_tee_bench
 WORKSPACE_MIN = np.array([-0.5, -0.6])
 WORKSPACE_MAX = np.array([ 0.7,  0.6])
 T_BLOCK_MIN   = np.array([-0.3, -0.4])
@@ -110,7 +110,7 @@ DIAL_BETA2       = 1.0     # action-level annealing temperature
 # dial-mpc's `temp_sample`: divides the std-normalised returns before the
 # softmax. Their default is 0.06 (configs use 0.04-0.1); pfmp.dial_step
 # defaults to 1.0 to preserve already-collected FR3 trials, so Push-T passes
-# it explicitly. Tuned by pushT_2d_optuna.
+# it explicitly. Tuned by push_tee_2d_optuna.
 DIAL_TEMP_SAMPLE = 0.06
 
 # CEM
@@ -119,7 +119,7 @@ CEM_NUM_ELITES   = 10
 # which the reference implementation takes as a required argument. Without it
 # the elite std collapses (measured: 0.152 -> 0.0006 over 18 replans at 5
 # elites), the proposal freezes, and CEM stops exploring for most of the
-# episode. Tuned per-method by pushT_2d_optuna.
+# episode. Tuned per-method by push_tee_2d_optuna.
 CEM_STDEV_FLOOR  = 0.01
 
 # Success thresholds, read by geom_runner's push-T `measure`
@@ -728,7 +728,7 @@ def main():
     if args.save_gif:
         from pathlib import Path
         suffix = f"dist{args.distance:.0f}_s{args.seed}"
-        out = Path(__file__).parent.parent / "figures" / f"pushT_{args.method}_{suffix}.gif"
+        out = Path(__file__).parent.parent / "figures" / f"push_tee_{args.method}_{suffix}.gif"
         out.parent.mkdir(parents=True, exist_ok=True)
         print(f"Saving gif to {out}…")
         anim.save(str(out), writer='pillow', fps=30, dpi=120)

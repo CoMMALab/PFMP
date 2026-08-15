@@ -1,4 +1,4 @@
-"""sim_pushT.py — headless batched MuJoCo push-T sim for calibration (and later, tuning).
+"""sim_push_tee_2d.py — headless batched MuJoCo push-T sim for calibration (and later, tuning).
 
 Reuses push_tee_planner's exact dynamics / cost / proposal / IK so the sim and the
 hardware pipeline share one definition and cannot drift. The first and only job of
@@ -6,8 +6,8 @@ this cut is calibration: does sim-SIR reproduce the real-world SIR success rate 
 the same (seed, trial) problems? Everything else (the method matrix, tuning, the
 run_batch refactor) waits until that number is trustworthy.
 
-    python fr3/sim_pushT.py --num 20 --replans 60            # full sir calibration
-    python fr3/sim_pushT.py --num 2 --replans 3 --particles 64   # smoke test
+    python fr3/sim_push_tee_2d.py --num 20 --replans 60            # full sir calibration
+    python fr3/sim_push_tee_2d.py --num 2 --replans 3 --particles 64   # smoke test
 """
 import argparse
 import os
