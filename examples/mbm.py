@@ -473,13 +473,10 @@ HORIZON              = 2.264
 # METHOD-SPECIFIC defaults, overridden per method by the tuned JSON. These are
 # the proposal / resampling / update axes the benchmark actually compares, so
 # each method tunes its own and nothing here is shared between them.
-GOAL_FRAC            = 0.339   # SMC proposal: mixture weight toward the goal
-GAUSS_FRAC           = 0.333   # SMC proposal: mixture weight on the local Gaussian
-GAUSS_STD            = 0.395   # SMC proposal: local Gaussian width
+GOAL_FRAC            = 1 / 3   # informed q: uniform three-way mixture over
+GAUSS_FRAC           = 1 / 3   #   (goal, local Gaussian, uniform). Frozen.
 ESS_THRESH           = 0.552   # SMC resampling threshold (0 = never, i.e. SIS)
-BASE_U_STDEV         = 0.395   # baselines: perturbation width around the warm start
-MPPI_TEMPERATURE     = 1.0
-CEM_ELITE_FRAC       = 0.1
+BASE_U_STDEV         = 0.395   # proposal width, shared by both q's
 STEP_LEN             = HORIZON / (NUM_KNOTS - 1)
 
 
@@ -491,16 +488,13 @@ class Params(NamedTuple):
     robot: dict
     step_size: float = STEP_SIZE
     mean: jax.Array = None        # (num_knots, dof) warm-start for baselines
-    # Perturbation noise for the baselines. Scalar for the fixed-noise methods
-    # (PS/MPPI); CEM refits it per knot, giving shape (num_knots, dof). Always
-    # read through `_sigma_at`, never directly.
+    # Proposal width, read by both q's through `_sigma_at`: scalar for the
+    # fixed-noise methods, (num_knots, dof) once CEM refits it.
     stdev: jax.Array = BASE_U_STDEV
     step_len: float = STEP_LEN     # knot time spacing for baseline proposal
-    # SMC's object-informed proposal mixture. On theta rather than module
-    # globals so the tuner can search them per method; `init` reads them here.
+    # Informed q's mixture weights. Frozen, not tuned.
     goal_frac: float = GOAL_FRAC
     gauss_frac: float = GAUSS_FRAC
-    gauss_std: float = GAUSS_STD
 
 
 def cost_fn(x, u, theta, t):
@@ -532,22 +526,26 @@ def dynamics(x, u, theta, t):
     return (x_next, x_next)
 
 
-def init(key, x, theta):
+def init(key, x, theta, idx=0):
+    """One draw from the three-way mixture: goal / local Gaussian / uniform."""
     k1, k2, k3 = jax.random.split(key, 3)
     r = jax.random.uniform(k1)
-    
+
     branch = jnp.where(r < theta.goal_frac, 0,
                        jnp.where(r < theta.goal_frac + theta.gauss_frac, 1, 2))
     return jax.lax.switch(branch, [
         lambda _: theta.goal,
-        lambda _: jnp.clip(x + jax.random.normal(k2, x.shape) * theta.gauss_std,
+        lambda _: jnp.clip(x + jax.random.normal(k2, x.shape) * _sigma_at(theta, idx),
                            theta.q_min, theta.q_max),
         lambda _: jax.random.uniform(k3, x.shape, minval=theta.q_min, maxval=theta.q_max),
     ], None)
 
 
 def proposal(key, x, u, theta, t):
-    return init(key, x, theta)
+    # `idx` only selects a per-knot sigma, so a scalar stdev does not need it --
+    # and `knot_index` reads theta.mean, which the standalone CLI never sets.
+    idx = 0 if jnp.ndim(theta.stdev) == 0 else _knot_index(theta, t)
+    return init(key, x, theta, idx)
 
 
 # Perturbation proposal for the PS/MPPI/CEM baselines: Gaussian noise around a
@@ -567,218 +565,6 @@ def perturbation_proposal(key, x, u, theta, t):
 # ============================================================================
 # Benchmark Runners
 # ============================================================================
-
-def run_benchmark_fast(dataset_dir, urdf_path='models/panda_spherized.urdf', n_problems=None,
-                       seed=0, tuned_path='figures/mbm_baseline_tune.json'):
-    """Fast benchmark - SIS, SIS/R, and PS/MPPI/CEM + Biased-MPPI/CEM baselines."""
-    import json as _json
-    from pfmp import PFMP, sigma_at as _sigma_at, knot_index as _knot_index
-    from pfmp.interpolate import hermite_spline
-    from pfmp.algorithm import ps_update, mppi_update, cem_update
-
-    robot = load_robot(urdf_path)
-    problems = load_mbm_dataset(dataset_dir, max_problems=n_problems)
-    n = len(problems)
-    print(f"Loaded {n} problems from {dataset_dir}")
-
-    if not problems:
-        return None
-
-    # Per-method tuned baseline knobs (fall back to module defaults if absent).
-    _tuned = {}
-    if tuned_path and Path(tuned_path).exists():
-        _tuned = {m: v.get('best_params', {}) for m, v in _json.load(open(tuned_path)).items()}
-        print(f"Loaded tuned baseline params for: {sorted(_tuned)}")
-    # 'u_stdev' is the pre-2026-08 key for the same knob; accept it so tuned
-    # JSON written before the rename still loads.
-    _ustdev = lambda m: float(_tuned.get(m, {}).get(
-        'stdev', _tuned.get(m, {}).get('u_stdev', BASE_U_STDEV)))
-    _temp   = lambda m: float(_tuned.get(m, {}).get('mppi_temperature', MPPI_TEMPERATURE))
-    _elite  = lambda m: float(_tuned.get(m, {}).get('cem_elite_frac', CEM_ELITE_FRAC))
-    PS_USTDEV, MPPI_USTDEV, CEM_USTDEV = _ustdev('ps'), _ustdev('mppi'), _ustdev('cem')
-    MPPI_TEMP, BMPPI_TEMP = _temp('mppi'), _temp('biased_mppi')
-    CEM_EF, BCEM_EF = _elite('cem'), _elite('biased_cem')
-
-    pfmp = PFMP(
-        dynamics, cost_fn, terminal_cost, init, proposal,
-        horizon=HORIZON, num_knots=NUM_KNOTS, particles=1000,
-        ess_resample_thresh=ESS_THRESH
-    )
-    
-    @jax.jit
-    def run_sis(key, q_start, theta):
-        traj, scores = pfmp.run_sis(key, q_start, theta)
-        best = jnp.argmin(jnp.sum(scores, axis=-1))
-        return traj[best]
-    
-    @jax.jit
-    def run_sir(key, q_start, theta):
-        traj, scores = pfmp.run_sir(key, q_start, theta)
-        best = jnp.argmin(jnp.sum(scores, axis=-1))
-        return traj[best]
-
-    # ---- Baselines: PS / MPPI / CEM ----
-    # Single pass of 1000 perturbation samples around a straight-line warm-start
-    # (no resampling), then the respective update. Equal budget to SIS.
-    pfmp_base = PFMP(
-        dynamics, cost_fn, terminal_cost, perturbation_init, perturbation_proposal,
-        horizon=HORIZON, num_knots=NUM_KNOTS, particles=1000, ess_resample_thresh=0.0,
-    )
-
-    @jax.jit
-    def run_ps(key, q_start, theta):
-        trajs, costs = pfmp_base.run_sis(key, q_start, theta)
-        th, _ = ps_update(theta, trajs, costs)
-        return th.mean
-
-    @jax.jit
-    def run_mppi(key, q_start, theta):
-        trajs, costs = pfmp_base.run_sis(key, q_start, theta)
-        th, _ = mppi_update(theta, trajs, costs, MPPI_TEMP)
-        return th.mean
-
-    @jax.jit
-    def run_cem(key, q_start, theta):
-        trajs, costs = pfmp_base.run_sis(key, q_start, theta)
-        th, _ = cem_update(theta, trajs, costs, CEM_EF)
-        return th.mean
-
-    # Biased-MPPI / Biased-CEM: the custom (goal-informed) proposal with the
-    # mean / elite update and no resampling. Isolates the proposal axis against
-    # MPPI / CEM (matched update, perturbation proposal).
-    @jax.jit
-    def run_biased_mppi(key, q_start, theta):
-        trajs, costs = pfmp.run_sis(key, q_start, theta)
-        th, _ = mppi_update(theta, trajs, costs, BMPPI_TEMP)
-        return th.mean
-
-    @jax.jit
-    def run_biased_cem(key, q_start, theta):
-        trajs, costs = pfmp.run_sis(key, q_start, theta)
-        th, _ = cem_update(theta, trajs, costs, BCEM_EF)
-        return th.mean
-
-    # method -> (run_fn, perturbation stdev)
-    PERTURB_BASELINES = {'ps': (run_ps, PS_USTDEV), 'mppi': (run_mppi, MPPI_USTDEV),
-                         'cem': (run_cem, CEM_USTDEV)}
-    BIASED_BASELINES  = {'biased_mppi': run_biased_mppi, 'biased_cem': run_biased_cem}
-
-    def warm_start_theta(problem, stdev):
-        # Scalar stdev throughout: MBM plans open-loop (one sample + one update
-        # per problem), so CEM has no second iteration in which a refit
-        # covariance could be used. Unlike push-T/FR3, there is nothing to widen.
-        a = jnp.linspace(0.0, 1.0, NUM_KNOTS)[:, None]
-        mean0 = (1 - a) * problem['q_start'] + a * problem['q_goal']
-        return Params(goal=problem['q_goal'], env=problem['env'],
-                      q_min=Q_MIN, q_max=Q_MAX, robot=robot, mean=mean0, stdev=stdev)
-
-    @jax.jit
-    def extract_path(traj_knots, q_start, theta):
-        tq = jnp.linspace(0, pfmp.horizon, int(pfmp.horizon / pfmp.dt))
-        us = hermite_spline(tq, pfmp.tk(), traj_knots)
-        _, path = jax.lax.scan(lambda x, u: (dynamics(x, u, theta, 0.0)[0], x), q_start, us)
-        return path
-    
-    @jax.jit
-    def evaluate_path(path, theta):
-        col = jax.vmap(lambda q: robot_sdf(q, theta.env, theta.robot) < 0)(path)
-        return col.any(), col.mean(), jnp.linalg.norm(path[-1] - theta.goal)
-    
-    keys = jax.random.split(jax.random.key(seed), n)
-
-    # Warm-up to exclude JIT from timing
-    p0 = problems[0]
-    th0 = Params(goal=p0['q_goal'], env=p0['env'], q_min=Q_MIN, q_max=Q_MAX, robot=robot)
-    _ = extract_path(run_sis(keys[0], p0['q_start'], th0), p0['q_start'], th0)
-    _ = extract_path(run_sir(keys[0], p0['q_start'], th0), p0['q_start'], th0)
-    for fn, ust in PERTURB_BASELINES.values():
-        thb = warm_start_theta(p0, ust)
-        _ = extract_path(fn(keys[0], p0['q_start'], thb), p0['q_start'], thb)
-    for fn in BIASED_BASELINES.values():
-        _ = extract_path(fn(keys[0], p0['q_start'], th0), p0['q_start'], th0)
-    jax.effects_barrier()
-
-    METHODS = ['sis', 'sir', 'ps', 'mppi', 'cem', 'biased_mppi', 'biased_cem']
-    results = {f'{m}_{k}': [] for m in METHODS for k in ['success', 'collision', 'dist', 'time']}
-
-    print("\nRunning benchmark (SIS + SIR + PS/MPPI/CEM)...")
-    t_total = time.time()
-    
-    for i, problem in enumerate(problems):
-        theta = Params(goal=problem['q_goal'], env=problem['env'],
-                       q_min=Q_MIN, q_max=Q_MAX, robot=robot)
-        
-        # SIS
-        t0 = time.time()
-        traj_sis = run_sis(keys[i], problem['q_start'], theta)
-        path_sis = extract_path(traj_sis, problem['q_start'], theta)
-        sis_time = time.time() - t0
-        
-        # SIR
-        t0 = time.time()
-        traj_sir = run_sir(keys[i], problem['q_start'], theta)
-        path_sir = extract_path(traj_sir, problem['q_start'], theta)
-        sir_time = time.time() - t0
-        
-        # Evaluate
-        sis_any_col, sis_col_frac, sis_dist = evaluate_path(path_sis, theta)
-        sir_any_col, sir_col_frac, sir_dist = evaluate_path(path_sir, theta)
-        
-        results['sis_success'].append(bool((not sis_any_col) and (sis_dist < 0.5)))
-        results['sir_success'].append(bool((not sir_any_col) and (sir_dist < 0.5)))
-        results['sis_collision'].append(float(sis_col_frac))
-        results['sir_collision'].append(float(sir_col_frac))
-        results['sis_dist'].append(float(sis_dist))
-        results['sir_dist'].append(float(sir_dist))
-        results['sis_time'].append(sis_time)
-        results['sir_time'].append(sir_time)
-
-        # Perturbation baselines (Gaussian proposal around warm-start)
-        for name, (fn, ust) in PERTURB_BASELINES.items():
-            theta_b = warm_start_theta(problem, ust)
-            t0 = time.time()
-            plan = fn(keys[i], problem['q_start'], theta_b)
-            path = extract_path(plan, problem['q_start'], theta_b)
-            b_time = time.time() - t0
-            any_col, col_frac, dist = evaluate_path(path, theta_b)
-            results[f'{name}_success'].append(bool((not any_col) and (dist < 0.5)))
-            results[f'{name}_collision'].append(float(col_frac))
-            results[f'{name}_dist'].append(float(dist))
-            results[f'{name}_time'].append(b_time)
-
-        # Biased baselines (custom proposal + mean/elite update, no resampling)
-        for name, fn in BIASED_BASELINES.items():
-            t0 = time.time()
-            plan = fn(keys[i], problem['q_start'], theta)
-            path = extract_path(plan, problem['q_start'], theta)
-            b_time = time.time() - t0
-            any_col, col_frac, dist = evaluate_path(path, theta)
-            results[f'{name}_success'].append(bool((not any_col) and (dist < 0.5)))
-            results[f'{name}_collision'].append(float(col_frac))
-            results[f'{name}_dist'].append(float(dist))
-            results[f'{name}_time'].append(b_time)
-
-        if (i + 1) % 10 == 0 or i == n - 1:
-            print(f"  [{i+1}/{n}] " + ", ".join(
-                f"{lab}: {np.mean(results[f'{m}_success'])*100:.0f}%"
-                for m, lab in [('sis','SIS'),('sir','SIS/R'),('ps','PS'),('mppi','MPPI'),
-                               ('cem','CEM'),('biased_mppi','bMPPI'),('biased_cem','bCEM')]))
-    
-    t_total = time.time() - t_total
-    
-    print(f"\n{'='*60}")
-    print(f"RESULTS: {Path(dataset_dir).name} ({n} problems, {t_total:.1f}s total)")
-    print(f"{'='*60}")
-    print(f"  {'Method':<8} {'Success':>10} {'Collision':>12} {'Dist':>10} {'Time (ms)':>12}")
-    print(f"  {'-'*8} {'-'*10} {'-'*12} {'-'*10} {'-'*12}")
-    for m in METHODS:
-        label = {'sis': 'SIS', 'sir': 'SIS/R', 'ps': 'PS', 'mppi': 'MPPI', 'cem': 'CEM',
-                 'biased_mppi': 'B-MPPI', 'biased_cem': 'B-CEM'}[m]
-        print(f"  {label:<8} {np.mean(results[f'{m}_success'])*100:>9.1f}% "
-              f"{np.mean(results[f'{m}_collision'])*100:>11.1f}% "
-              f"{np.mean(results[f'{m}_dist']):>10.3f} {np.mean(results[f'{m}_time'])*1000:>11.1f}")
-    
-    return results
 
 
 def add_environment_to_viser(server, env, offset=np.array([0, 0, 0]), prefix="/env"):
@@ -1014,7 +800,6 @@ def run_benchmark_viser(dataset_dir, urdf_path='models/panda_spherized.urdf', n_
         time.sleep(1)
 
 
-run_benchmark = run_benchmark_fast
 
 
 # ============================================================================
@@ -1097,19 +882,10 @@ if __name__ == "__main__":
         urdf = args[2] if len(args) > 2 else 'models/panda_spherized.urdf'
         n = int(args[3]) if len(args) > 3 else None
         run_benchmark_viser(dataset, urdf, n, mode=mode)
-    elif args[0] == "fast":
-        datasets = args[1:] if len(args) > 1 else sorted(Path('models/problems').glob('*_panda'))
-        urdf = 'models/panda_spherized.urdf'
-        for ds in datasets:
-            run_benchmark_fast(str(ds), urdf)
     else:
-        dataset = args[0]
-        urdf = args[1] if len(args) > 1 else 'models/panda_spherized.urdf'
-        n = int(args[2]) if len(args) > 2 else None
-        run_benchmark_fast(dataset, urdf, n)
+        print(f"unknown command {args[0]!r}; benchmark numbers come from "
+              f"experiments/geom_runner.py experiments/configs/mbm.yaml")
     
     print("\nUsage:")
-    print("  python benchmark_mbm_simple.py test [urdf]")
-    print("  python benchmark_mbm_simple.py fast <dataset> [urdf] [n]")
-    print("  python benchmark_mbm_simple.py viser <dataset> [urdf] [n] [--sis|--sir|--both]")
-    print("  python benchmark_mbm_simple.py <dataset> [urdf] [n]")
+    print("  python examples/mbm.py test [urdf]")
+    print("  python examples/mbm.py viser <dataset> [urdf] [n] [--sis|--sir|--both]")

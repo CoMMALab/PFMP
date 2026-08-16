@@ -18,11 +18,7 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
-import matplotlib.patches as mpatches
-import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.animation import FuncAnimation
-from matplotlib.patches import Circle, FancyArrowPatch, Polygon
 
 from pfmp import (PFMP, method_decomp, make_perturbation,
                   sigma_at as _sigma_at, knot_index as _knot_index)
@@ -104,9 +100,6 @@ MPPI_TEMPERATURE = 0.5
 # Canonical dial-mpc's steady-state Ndiffuse (their config default; FR3 uses
 # the same). Was 5, which matched neither the reference nor our own hardware
 # path and cost 2.5x the rollouts per replan.
-DIAL_N_INNER     = 2
-DIAL_BETA1       = 1.0     # trajectory-level annealing temperature
-DIAL_BETA2       = 1.0     # action-level annealing temperature
 # dial-mpc's `temp_sample`: divides the std-normalised returns before the
 # softmax. Their default is 0.06 (configs use 0.04-0.1); pfmp.dial_step
 # defaults to 1.0 to preserve already-collected FR3 trials, so Push-T passes
@@ -125,6 +118,12 @@ CEM_STDEV_FLOOR  = 0.01
 # Success thresholds, read by geom_runner's push-T `measure`
 SUCCESS_POS_THRESH   = 0.05   # metres
 SUCCESS_ANGLE_THRESH = 0.2    # radians
+
+# Informed proposal's mixture weights, matching the FR3 planner's: the rest of
+# the mass goes to the random walk. On theta as `mix_frac` / `orbital_frac` so
+# the tuner reaches them; these are only the defaults.
+PROPOSAL_MIX  = 0.4   # directed toward the tee
+ORBITAL_MIX   = 0.2   # orbit the tee at push radius
 
 
 # ============================================================
@@ -151,6 +150,10 @@ class PushParams(NamedTuple):
     # APPROACH_WEIGHT explicitly; this default exists only so old constructions
     # keep working, and does NOT reflect the configured task cost.
     approach_weight: float    = 0.0
+    # Informed proposal's mixture weights, alongside `stdev` as its noise level.
+    # All three are on theta so the tuner reaches them the way MBM's are.
+    mix_frac:        float    = PROPOSAL_MIX     # directed branch
+    orbital_frac:    float    = ORBITAL_MIX      # orbital branch; rest is random
 
 
 # ============================================================
@@ -319,37 +322,79 @@ def terminal_cost(x: jax.Array, theta: PushParams) -> jax.Array:
     return 10.0 * (theta.pos_weight * err_pos**2 + aw * err_angle**2)
 
 
-PROPOSAL_MIX  = 0.5   # probability of sampling directed (vs random local)
 STEP_LEN_VEL  = 0.05  # step size toward T per knot (m)
-PUSH_OVERSHOOT = 1.0  # step to T centroid (no overshoot)
+# Orbital-branch geometry, as multiples of this task's tee so the two tees stay
+# consistent: the FR3's is larger (cap half-width 0.1 vs 0.0675), and its planner
+# passes 1.6 * 0.1 = 0.16 m and 0.4 * 0.1 = 0.04 m for these.
+PUSH_RADIUS      = 1.6 * float(T_CAP_HALF[0])   # just outside the cap
+ORBITAL_Y_OFFSET = 0.4 * float(T_CAP_CTR[1])    # up the stem, toward the cap
+
+
+def sample_mixture(key: jax.Array, u: jax.Array, t_xy: jax.Array, t_yaw: jax.Array,
+                   sigma: jax.Array, *, directed_frac: float, orbital_frac: float,
+                   step_len: float,
+                   push_radius: float, orbital_y_offset: float) -> jax.Array:
+    """One draw from the three-way mixture: directed / orbital / random walk.
+
+    Anchored on `u`, the previous knot's waypoint, so this is a proper
+    q(u_k | u_{k-1}, x). The orbital branch anchors on the tee instead, which
+    keeps a particle useful when the mean has drifted somewhere it cannot push
+    from.
+
+    The tee pose is passed rather than read off the state, because this is
+    shared: fr3/push_tee_planner.py imports it, supplies its own geometry, and
+    projects the result onto its reachable set. Keep the four key splits in this
+    order -- FR3 trials already on disk were generated with it.
+    """
+    key_mix, key_a, key_b, key_ang = jax.random.split(key, 4)
+    r = jax.random.uniform(key_mix)
+
+    # Branch 1: step toward the tee centroid.
+    direction = t_xy - u
+    dist      = jnp.linalg.norm(direction) + 1e-7
+    directed  = u + (direction / dist) * jnp.minimum(dist, step_len)
+    directed  = directed + jax.random.normal(key_a, (2,)) * sigma
+
+    # Branch 2: orbit a point shifted up the tee stem (body-frame +y).
+    stem_up     = jnp.array([-jnp.sin(t_yaw), jnp.cos(t_yaw)])
+    orbital_ctr = t_xy + orbital_y_offset * stem_up
+    angle       = jax.random.uniform(key_ang, minval=0.0, maxval=2.0 * jnp.pi)
+    orbital     = orbital_ctr + push_radius * jnp.array([jnp.cos(angle), jnp.sin(angle)])
+
+    # Branch 3: random walk.
+    random_loc = u + jax.random.normal(key_b, (2,)) * sigma * 2.0
+
+    return jnp.where(r < directed_frac, directed,
+           jnp.where(r < directed_frac + orbital_frac, orbital, random_loc))
+
+
+def mean_from_state(x: jax.Array) -> jax.Array:
+    """Nominal plan: linear interp from the robot to the tee. Shared with
+    geom_runner's `warm_start` so sim and benchmark start from one plan."""
+    a = jnp.linspace(0.0, 1.0, NUM_KNOTS)[:, None]
+    return (1.0 - a) * x[6:8] + a * x[0:2]
 
 
 def init_control(key: jax.Array, x: jax.Array, theta: PushParams) -> jax.Array:
-    key_mix, key_a, key_b = jax.random.split(key, 3)
-    sigma = _sigma_at(theta, 0)
-    r_xy = x[6:8]
-    t_xy = x[0:2]
-    direction = t_xy - r_xy
-    dist      = jnp.linalg.norm(direction) + 1e-7
-    directed  = r_xy + (direction / dist) * (jnp.minimum(dist, STEP_LEN_VEL) * PUSH_OVERSHOOT)
-    directed  = directed + jax.random.normal(key_a, (2,)) * sigma
-    random_loc = r_xy + jax.random.normal(key_b, (2,)) * sigma * 2.0
-    return jnp.where(jax.random.uniform(key_mix) < PROPOSAL_MIX, directed, random_loc)
+    """`proposal` at the first knot, seeded from the warm-started mean."""
+    return proposal(key, x, theta.mean[0], theta, 0.0, idx=0)
 
 
-def proposal(key: jax.Array, x: jax.Array, _u: jax.Array,
-             theta: PushParams, t: float) -> jax.Array:
-    """Mixture: push through T centroid (50%) or random walk (50%)."""
-    key_mix, key_a, key_b = jax.random.split(key, 3)
-    sigma = _sigma_at(theta, _knot_index(theta, t))
-    r_xy = x[6:8]
-    t_xy = x[0:2]
-    direction = t_xy - r_xy
-    dist      = jnp.linalg.norm(direction) + 1e-7
-    directed  = r_xy + (direction / dist) * (jnp.minimum(dist, STEP_LEN_VEL) * PUSH_OVERSHOOT)
-    directed  = directed + jax.random.normal(key_a, (2,)) * sigma
-    random_loc = r_xy + jax.random.normal(key_b, (2,)) * sigma * 2.0
-    return jnp.where(jax.random.uniform(key_mix) < PROPOSAL_MIX, directed, random_loc)
+def proposal(key: jax.Array, x: jax.Array, u: jax.Array,
+             theta: PushParams, t: float, idx=None) -> jax.Array:
+    """One draw from `sample_mixture`, bound to this task's state and geometry.
+
+    `idx` overrides which knot's noise width to use. `init_control` passes 0,
+    which `knot_index` never returns for t >= 0; it only matters under CEM,
+    whose stdev is per-knot.
+    """
+    idx = _knot_index(theta, t) if idx is None else idx
+    return sample_mixture(key, u, x[0:2], x[2], _sigma_at(theta, idx),
+                          directed_frac=theta.mix_frac,
+                          orbital_frac=theta.orbital_frac,
+                          step_len=STEP_LEN_VEL,
+                          push_radius=PUSH_RADIUS,
+                          orbital_y_offset=ORBITAL_Y_OFFSET)
 
 
 # ============================================================
@@ -388,16 +433,9 @@ def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REP
         dt=DT,
     )
 
-    def mean_from_state(x):
-        """Linear interp from current robot pos to T-block pos."""
-        r_xy   = x[6:8]
-        t_xy   = x[0:2]
-        alphas = jnp.linspace(0.0, 1.0, NUM_KNOTS)
-        return (1.0 - alphas[:, None]) * r_xy + alphas[:, None] * t_xy
-
-    # Only the non-resampling methods need a nominal plan to perturb around.
-    if rho == 0.0:
-        theta = theta._replace(mean=mean_from_state(x0))
+    # Every method reads theta.mean: the perturbation at every knot, the
+    # informed q at knot 0 for its init anchor.
+    theta = theta._replace(mean=mean_from_state(x0))
 
     # CEM refits a per-knot covariance, so widen the scalar stdev to (K, 2)
     # first: cem_update only adapts when stdev is already per-knot, which is
@@ -426,8 +464,8 @@ def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REP
         if update_kind == "diffuse":
             # DIAL owns its re-sampling: one fresh batch per annealing level,
             # via the shared pfmp.dial_step (see pfmp/update.py).
-            theta = dial_step(subkey, ctrl, x, theta, n=DIAL_N_INNER,
-                              beta1=DIAL_BETA1, beta2=DIAL_BETA2,
+            # n / beta1 / beta2 come from dial_step's own defaults.
+            theta = dial_step(subkey, ctrl, x, theta,
                               temp_sample=DIAL_TEMP_SAMPLE)
         else:
             trajs, costs = ctrl.run_sis(subkey, x, theta)
@@ -562,6 +600,11 @@ def _is_success(final_state: np.ndarray, goal_xy, goal_angle: float) -> bool:
 
 
 def main():
+    import matplotlib.patches as mpatches
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation
+    from matplotlib.patches import Circle, FancyArrowPatch, Polygon
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--save-gif', action='store_true')
     parser.add_argument('--seed', type=int, default=SEED)

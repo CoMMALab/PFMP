@@ -25,7 +25,7 @@ import pfmp
 import push_tee_planner as _P   # module handle so --no-orbital can zero ORBITAL_MIX
 from push_tee_planner import (
     dynamics, running_cost, terminal_cost, init_control, proposal, mppi_proposal,
-    _project_reachable, PushParams, load_scene, SCENE_XML_PATH, T_QPOS_OFFSET,
+    project_reachable, PushParams, load_scene, SCENE_XML_PATH, T_QPOS_OFFSET,
     HORIZON, NUM_KNOTS, PARTICLES, RUN_INTERACTIVE_FREQUENCY,
     SUCCESS_POS_RADIUS, SUCCESS_ANGLE_TOL,
 )
@@ -186,7 +186,7 @@ def main():
         # emit reachable waypoints (no-op for them); mean-update methods emit
         # unreachable averages that would otherwise NaN the IK — this makes them
         # fail cleanly (snapped to reachable) exactly as they would on hardware.
-        u = _project_reachable(u, theta)
+        u = project_reachable(u, theta)
         return ik_from_cache(u, theta.ik_cache)
 
     base_d, base_th = sample_problem(0)

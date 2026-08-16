@@ -20,6 +20,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent / "examples"))
 
 from pfmp import (PFMP, METHOD_ALIASES, method_decomp,
                   make_perturbation, sigma_at, knot_index)
@@ -64,26 +65,24 @@ class GeomTask(NamedTuple):
                                   #   MBM's follows from its datasets, so a
                                   #   `num` in the config would only restate it
                                   #   and could disagree with it.
-    hp_defaults: dict = {}        # method knobs the task module already defines.
-                                  #   Sourced from the module, never retyped
-                                  #   here: a literal default in the runner is
-                                  #   how a tuned value silently stops applying.
-    apply_hp: Callable = None     # (theta, hp) -> theta   tuned knobs that live
-                                  #   on theta (proposal widths, noise scale)
-                                  #   rather than in the update rule
 
 
 # Which proposal / update / resampling each algorithm name selects. This IS the
 # decomposition: everything else in this file is plumbing.
 ALGORITHMS = tuple(METHOD_ALIASES)   # each may take a "+r[rho]" suffix
 
+def apply_hp(theta, hp: dict):
+    """Route the tuned values that name a theta field onto theta."""
+    return theta._replace(**{k: float(v) for k, v in hp.items()
+                             if k in theta._fields})
+
 
 def build_controller(task: GeomTask, algorithm: str, particles: int,
-                     ess_thresh: float = 0.0) -> PFMP:
+                     ess_thresh: float = 0.5) -> PFMP:
     proposal, _, rho = method_decomp(algorithm)
     perturb = make_perturbation(task.clip_action)
-    # A task without its own q falls back to the perturbation, which is why
-    # `sis` and `ps` coincide on the drive task.
+    # A task with no q of its own collapses the proposal axis to gaussian, so on
+    # drive every `informed` name resolves to its gaussian counterpart.
     init, prop = ((task.custom_init, task.custom_proposal)
                   if proposal == "informed" and task.custom_proposal is not None
                   else perturb)
@@ -91,19 +90,6 @@ def build_controller(task: GeomTask, algorithm: str, particles: int,
                 horizon=task.horizon, num_knots=task.num_knots, particles=particles,
                 ess_resample_thresh=ess_thresh if rho is None else rho,
                 dt=task.dt)
-
-
-# Continuous knobs passed as traced arguments rather than baked in as Python
-# constants. A tuner varies these every trial, and closing over them means a
-# fresh compile per trial: on push-T that was 5.8s of compile against 0.6s of
-# compute. The rest (elite count, ess_thresh, DIAL's schedule) are structural or
-# discrete and stay static.
-TRACED_HP = ("mppi_temperature", "cem_stdev_floor", "sample_temperature",
-             "dial_temp_sample")
-
-
-def traced_hp(hp: dict):
-    return {k: jnp.asarray(float(hp.get(k, 0.0))) for k in TRACED_HP}
 
 
 def _elite_count(hp: dict, particles: int) -> int:
@@ -123,22 +109,23 @@ def make_replan(ctrl: PFMP, algorithm: str, hp: dict, particles: int):
     sample = ctrl.run_sis if rho == 0.0 else ctrl.run_sir
 
     if update_kind == "diffuse":
-        n = int(hp.get("dial_n_inner", 2))
+        kw = {a: hp[k] for k, a in (("dial_n_inner", "n"), ("dial_beta1", "beta1"),
+                                    ("dial_beta2", "beta2"),
+                                    ("dial_temp_sample", "temp_sample")) if k in hp}
+        kw["n"] = int(kw.get("n", 2))
 
-        def dial_replan(key, x, theta, s):
+        def dial_replan(key, x, theta):
             # Costs from DIAL's final annealing level, so its ESS is the same
             # per-knot quantity reported for the single-pass methods.
-            theta, costs = dial_step(
-                key, ctrl, x, theta, n=n,
-                beta1=hp.get("dial_beta1", 1.0), beta2=hp.get("dial_beta2", 1.0),
-                temp_sample=s["dial_temp_sample"], return_costs=True)
+            theta, costs = dial_step(key, ctrl, x, theta,
+                                     return_costs=True, **kw)
             return theta, jax.vmap(ess, in_axes=1)(jnp.cumsum(costs, axis=1))
 
         return dial_replan
     if update_kind == "argmin":
         # The MAP update. On a task with no custom proposal this makes `sis`
         # and `ps` the same algorithm; `sis_sample` is what separates them.
-        update = lambda th, tr, co, s: ps_update(th, tr, co)
+        update = lambda th, tr, co: ps_update(th, tr, co)
     elif update_kind == "sample":
         # Posterior sampling (Piche et al.): draw one trajectory from the
         # weighted particle set rather than summarising it. Needs a key, so it
@@ -151,12 +138,13 @@ def make_replan(ctrl: PFMP, algorithm: str, hp: dict, particles: int):
         # makes them a controlled comparison on the update axis. The loop is
         # open here, so the cost scale does not move between iterations and
         # there is nothing a per-iteration rescale would be tracking.
-        key_ = "sample_temperature" if "sample_temperature" in hp else "mppi_temperature"
-        update = lambda th, tr, co, k, s: sample_update(
-            th, tr, co, k, jnp.maximum(s[key_], 1e-6))
+        temp = hp.get("sample_temperature", hp.get("mppi_temperature"))
+        kw = {} if temp is None else {"temperature": max(float(temp), 1e-6)}
+        update = lambda th, tr, co, k: sample_update(th, tr, co, k, **kw)
     elif update_kind == "mean":
-        update = lambda th, tr, co, s: mppi_update(
-            th, tr, co, jnp.maximum(s["mppi_temperature"], 1e-6))
+        kw = ({"temperature": max(float(hp["mppi_temperature"]), 1e-6)}
+              if "mppi_temperature" in hp else {})
+        update = lambda th, tr, co: mppi_update(th, tr, co, **kw)
     elif update_kind == "topk":
         # The elite count sets an array shape, so it must stay static.
         #
@@ -166,9 +154,12 @@ def make_replan(ctrl: PFMP, algorithm: str, hp: dict, particles: int):
         # N=512, k=1 -> 100% success and k=2 -> 12.5%; a fraction tuned at N=256
         # (where it floored to k=1) crossed to k=2 at N=512 and produced a
         # non-monotone particle-count curve.
-        k = _elite_count(hp, particles)
-        update = lambda th, tr, co, s: cem_update(
-            th, tr, co, k / particles, stdev_floor=s["cem_stdev_floor"])
+        kw = {}
+        if "cem_num_elites" in hp or "cem_elite_frac" in hp:
+            kw["elite_frac"] = _elite_count(hp, particles) / particles
+        if "cem_stdev_floor" in hp:
+            kw["stdev_floor"] = float(hp["cem_stdev_floor"])
+        update = lambda th, tr, co: cem_update(th, tr, co, **kw)
     else:
         raise ValueError(f"no update implemented for {update_kind!r} "
                          f"(method {algorithm!r})")
@@ -180,7 +171,7 @@ def make_replan(ctrl: PFMP, algorithm: str, hp: dict, particles: int):
     # iterations of one optimisation (concentration is convergence), while in
     # closed-loop they are separate inference problems (concentration is
     # degeneracy), so only the caller knows how to reduce it.
-    def replan(key, x, theta, scalars):
+    def replan(key, x, theta):
         # Only split when the update itself needs randomness. Splitting
         # unconditionally would shift the sampling stream for every other
         # method, silently changing results that are meant to be comparable.
@@ -194,13 +185,13 @@ def make_replan(ctrl: PFMP, algorithm: str, hp: dict, particles: int):
         # much of the collapse the terminal term is responsible for.
         # One definition for every method: it measures the particle cloud the
         # proposal produced, not the update applied to it.
-        cum = jnp.cumsum(costs, axis=1)                    # (P, K)
-        ess_k = jax.vmap(ess, in_axes=1)(cum)              # (K,)
-        return update(*args, scalars)[0], ess_k
+        total = jnp.cumsum(costs, axis=1)                    # (P, K)
+        ess_k = jax.vmap(ess, in_axes=1)(total)              # (K,)
+        return update(*args)[0], ess_k
     return replan
 
 
-def make_simulator(task: GeomTask, replan: Callable):
+def _make_simulator(task: GeomTask, replan: Callable):
     """jit(vmap(...)) of the outer loop: replan -> execute -> shift, then measure.
 
     `execute`/`shift` are None for open-loop tasks, where the world never moves.
@@ -208,7 +199,7 @@ def make_simulator(task: GeomTask, replan: Callable):
     execute = task.execute or (lambda x, theta: x)
     shift = task.shift or (lambda theta: theta)
 
-    def one(key, x0, theta, scalars):
+    def one(key, x0, theta):
         # Warm-start unconditionally, including for the methods whose proposal
         # ignores `theta.mean`: it is what gives `mean` its shape, and the scan
         # carry's pytree structure has to survive the first update writing it.
@@ -218,7 +209,7 @@ def make_simulator(task: GeomTask, replan: Callable):
         def step(carry, _):
             key, x, theta = carry
             key, sub = jax.random.split(key)
-            theta, ess = replan(sub, x, theta, scalars)
+            theta, ess = replan(sub, x, theta)
             x = execute(x, theta)
             theta = shift(theta)
             return (key, x, theta), ess
@@ -228,30 +219,19 @@ def make_simulator(task: GeomTask, replan: Callable):
         # (n_replans, num_knots) per problem, dense and unreduced.
         return dict(task.measure(x, theta), ess=ess)
 
-    # scalars are shared across the batch, not per problem
-    return jax.jit(jax.vmap(one, in_axes=(0, 0, 0, None)))
-
-
-def build_simulator(task: GeomTask, algorithm: str, particles: int, hp: dict):
-    """Compile the simulator for one (task, method, static hyperparameters).
-
-    Split out so the tuner can hold one and skip recompiling; only `TRACED_HP`
-    may differ between runs of the returned simulator.
-    """
-    ctrl = build_controller(task, algorithm, particles,
-                            ess_thresh=float(hp.get("ess_thresh", 0.0)))
-    return make_simulator(task, make_replan(ctrl, algorithm, hp, particles))
+    return jax.jit(jax.vmap(one))
 
 
 def run_algorithm(task: GeomTask, algorithm: str, num: int, particles: int,
-                  hp: dict, seed: int = 0, group_size: int = None, sim=None):
-    """Run `num` problems. Batched in groups because some tasks (MBM) have
-    per-problem array shapes that only match within a dataset.
-
-    `sim` reuses an already-built simulator (see `build_simulator`)."""
+                  hp: dict, seed: int = 0, group_size: int = None):
+    """Run `num` problems of `task` under one method. Batched in groups because
+    some tasks (MBM) have per-problem array shapes that match only within a
+    dataset. Every hyperparameter is closed into the compiled program, so each
+    distinct `hp` costs one compile.
+    """
     group_size = group_size or num
-    sim = sim or build_simulator(task, algorithm, particles, hp)
-    scalars = traced_hp(hp)
+    ctrl = build_controller(task, algorithm, particles)
+    sim = _make_simulator(task, make_replan(ctrl, algorithm, hp, particles))
 
     out = []
     for lo in range(0, num, group_size):
@@ -259,12 +239,37 @@ def run_algorithm(task: GeomTask, algorithm: str, num: int, particles: int,
         probs = [task.sample_problem(i) for i in idx]
         x0 = jnp.stack([p[0] for p in probs])
         thetas = [p[1] for p in probs]
-        if task.apply_hp is not None:
-            thetas = [task.apply_hp(th, hp) for th in thetas]
+        thetas = [apply_hp(th, hp) for th in thetas]
         theta = jax.tree.map(lambda *xs: jnp.stack(xs), *thetas)
         keys = jnp.stack([jax.random.key(seed + i) for i in idx])
-        out.append(jax.tree.map(np.asarray, sim(keys, x0, theta, scalars)))
+        out.append(jax.tree.map(np.asarray, sim(keys, x0, theta)))
     return jax.tree.map(lambda *xs: np.concatenate(xs), *out) if len(out) > 1 else out[0]
+
+
+class Evaluator:
+    """A loaded task over a fixed slice of its problems: (method, hp) -> metrics.
+
+    Holds the loaded task because `load_task` is expensive -- MBM reads its
+    datasets, drive generates its maps -- and both the tuner and the sweep call
+    this many times against the same slice. `num`/`offset` carve out the slice,
+    which is how tuning and validation stay disjoint.
+    """
+
+    def __init__(self, config: dict, num: int = None, offset: int = 0,
+                 seed: int = None):
+        self.cfg = dict(config, problem_offset=offset)
+        if num is not None:
+            self.cfg["num"] = num
+        self.seed = self.cfg.get("seed", 0) if seed is None else seed
+        self.task, self.group_size = load_task(self.cfg["task"], self.cfg)
+        self.num = num or self.task.num_problems
+
+    def __call__(self, method: str, hp: dict = None) -> dict:
+        full = dict(self.cfg.get("hyperparams", {}))
+        full.update(hp or {})
+        return run_algorithm(self.task, method, num=self.num,
+                             particles=self.cfg["num_samples"], hp=full,
+                             seed=self.seed, group_size=self.group_size)
 
 
 # ---------------------------------------------------------------------------
@@ -310,14 +315,6 @@ def _mbm_task(config):
             goal=prob["q_goal"], env=prob["env"],
             q_min=mbm.Q_MIN, q_max=mbm.Q_MAX, robot=robot)
 
-    def apply_hp(theta, hp):
-        # The baselines' one knob is the perturbation width; SMC's are the
-        # proposal mixture. Both live on theta, so the tuner and the runner set
-        # them the same way. Absent keys keep the module default.
-        return theta._replace(**{k: float(hp[k]) for k in
-                                 ("goal_frac", "gauss_frac", "gauss_std") if k in hp},
-                              **({"stdev": float(hp["stdev"])} if "stdev" in hp else {}))
-
     def warm_start(x0, theta):
         a = jnp.linspace(0.0, 1.0, mbm.NUM_KNOTS)[:, None]
         return theta._replace(mean=(1 - a) * x0 + a * theta.goal)
@@ -341,31 +338,13 @@ def _mbm_task(config):
         sample_problem=sample_problem, measure=measure,
         horizon=mbm.HORIZON, num_knots=mbm.NUM_KNOTS, dt=dt,
         n_replans=1, execute=None, shift=None, warm_start=warm_start,
-        apply_hp=apply_hp,
-        # Inlined rather than read off mbm's module constants: these are this
-        # runner's defaults, and importing them would let a value change under
-        # the numbers reported here without the runner saying so. Tuned JSON
-        # overrides all of them.
-        hp_defaults={"stdev": 0.395, "mppi_temperature": 1.0,
-                     "cem_elite_frac": 0.1, "cem_stdev_floor": 0.0,
-                     "ess_thresh": 0.552,
-                     "goal_frac": 0.339, "gauss_frac": 0.333,
-                     "gauss_std": 0.395,
-                     # DIAL runs `dial_n_inner` annealing passes per replan,
-                     # each a full batch of rollouts, so it costs n_inner times
-                     # the samples of a single-pass method. Fixed at 2 (never
-                     # tuned) so the extra cost is a stated property of the
-                     # method rather than something the search can buy.
-                     "dial_n_inner": 2, "dial_beta1": 1.0, "dial_beta2": 1.0,
-                     "dial_temp_sample": 0.06,},
-    )
+)
     return task, groups[0]      # batch per dataset: env shapes match only within
 
 def _push_tee_task(config):
     """Push-T: closed-loop planar pushing. The world advances between replans,
     so `execute` runs the physics and `shift` re-times the plan onto the new
     clock, which is exactly what MBM leaves as None."""
-    sys.path.insert(0, str(Path(__file__).parent.parent / "examples"))
     import push_tee_2d as pt
     
     off = int(config.get("problem_offset", 0))
@@ -396,8 +375,7 @@ def _push_tee_task(config):
             mean=hermite_spline(tk0 + pt.STEPS_PER_REPLAN * pt.DT, tk0, theta.mean))
 
     def warm_start(x0, theta):
-        a = jnp.linspace(0.0, 1.0, pt.NUM_KNOTS)[:, None]
-        return theta._replace(mean=(1 - a) * x0[6:8] + a * x0[0:2])
+        return theta._replace(mean=pt.mean_from_state(x0))
 
     def measure(x, theta):
         pos_err = jnp.linalg.norm(x[0:2] - theta.goal_xy)
@@ -405,9 +383,6 @@ def _push_tee_task(config):
         return {"pos_err": pos_err, "angle_err": angle_err,
                 "success": (pos_err < pt.SUCCESS_POS_THRESH)
                            & (angle_err < pt.SUCCESS_ANGLE_THRESH)}
-
-    def apply_hp(theta, hp):
-        return theta._replace(stdev=float(hp["stdev"])) if "stdev" in hp else theta
 
     task = GeomTask(
         dynamics=pt.dynamics, running_cost=pt.running_cost,
@@ -417,30 +392,12 @@ def _push_tee_task(config):
         sample_problem=lambda i: (built[i][0], built[i][1]), measure=measure,
         horizon=pt.HORIZON, num_knots=pt.NUM_KNOTS, dt=pt.DT,
         n_replans=n_replans, execute=execute, shift=shift,
-        warm_start=warm_start, apply_hp=apply_hp, num_problems=len(seeds),
-        hp_defaults={"stdev": 0.05, "mppi_temperature": 0.5,
-                     "cem_elite_frac": 10 / 2048, "cem_stdev_floor": 0.01,
-                     "ess_thresh": 0.25,
-                     "dial_n_inner": 2, "dial_beta1": 1.0, "dial_beta2": 1.0,
-                     "dial_temp_sample": 0.06},
-    )
+        warm_start=warm_start, num_problems=len(seeds),
+        # Mixture weights frozen at the FR3 planner's, so sim and robot share q.
+)
     return task, len(seeds)
 
 
-DRIVE_SEED = 127
-DRIVE_PARTICLES = 1024
-DRIVE_ESS_THRESH = 0.5
-DRIVE_DT = 0.01
-DRIVE_ARENA_WIDTH = 6.0
-DRIVE_OBSTACLE_DENSITY = 0.3
-DRIVE_BOX_SIZE_RANGE = (0.4, 1.2)
-DRIVE_MIN_MARGIN = 0.3
-DRIVE_WHEELBASE = 0.3
-DRIVE_SPEED = 2.0
-DRIVE_U_STDEV = 0.2
-DRIVE_MPPI_TEMPERATURE = 1.0
-DRIVE_CEM_ELITE_FRAC = 0.1
-DRIVE_STEER_LIMIT = 0.8            # steering angle clip (rad)
 
 def _drive_task(config):
     """Open-loop like MBM (no `execute`/`shift`), but iterated: the plan is
@@ -448,40 +405,8 @@ def _drive_task(config):
     proposal exists here, so `custom_*` stay None and the SMC methods run the
     shared perturbation, differing from the baselines only in update and
     resampling."""
-    class DriveParams(NamedTuple):
-        goal: jax.Array       # desired position
-        obstacles: jax.Array  # (N, 4) AABB array
-        L: float              # wheelbase (m)
-        v: float              # forward speed (m/s)
-        mean: jax.Array       # (num_knots,) proposal mean
-        # Sampling noise. Scalar for the fixed-noise methods; CEM refits it per knot,
-        # giving shape (num_knots,). Always read through `_sigma_at`.
-        stdev: jax.Array
-        step_len: float       # horizon / (num_knots - 1)
+    import drive_2d as d2
 
-
-    def drive_cost(x: jax.Array, u: jax.Array, th: DriveParams, t: float) -> float:
-        loc = x[:2]
-        sdf_val = jnp.min(jax.vmap(lambda bounds: sdf_aabb(loc, bounds))(th.obstacles))
-        obstacle_loss = jnp.nan_to_num(100. * hinge_loss(sdf_val, 0.25),
-                                       nan=0.0, posinf=1e6, neginf=0.0)
-        goal_loss = jnp.linalg.norm(loc - th.goal) / 10.
-        return obstacle_loss**2 + goal_loss**2
-
-
-    def drive_terminal(x, th) -> float:
-        return 10 * jnp.linalg.norm(x[:2] - th.goal) ** 2
-
-
-    def drive_dynamics(x: jax.Array, u: jax.Array, theta: DriveParams, t):
-        """Bicycle kinematics: x = [px, py, heading], u = steering angle."""
-        px, py, th = x
-        L, v = theta.L, theta.v
-        px_next = px + v * jnp.cos(th) * 0.01
-        py_next = py + v * jnp.sin(th) * 0.01
-        th_next = jnp.mod(th + (v / L) * jnp.tan(u) * 0.01 + jnp.pi, 2 * jnp.pi) - jnp.pi
-        x_next = jnp.array([px_next, py_next, th_next])
-        return (x_next, x_next)
     num_knots = int(config.get("num_knots", 20))
     arena_length = float(config.get("arena_length", 1.0 * num_knots + 1.0))
     horizon = num_knots * 0.5
@@ -489,18 +414,18 @@ def _drive_task(config):
 
     off = int(config.get("problem_offset", 0))
     obs, x0s, goals, rejected = generate_map_batch(
-        config.get("seed", DRIVE_SEED) + num_knots * 10000, off + n, arena_length,
-        DRIVE_ARENA_WIDTH, DRIVE_OBSTACLE_DENSITY, DRIVE_BOX_SIZE_RANGE, DRIVE_MIN_MARGIN)
+        config.get("seed", d2.SEED) + num_knots * 10000, off + n, arena_length,
+        d2.ARENA_WIDTH, d2.OBSTACLE_DENSITY, d2.BOX_SIZE_RANGE, d2.MIN_MARGIN)
     obs, x0s, goals = obs[off:], x0s[off:], goals[off:]
     print(f"  generated {n} maps (rejected {rejected})")
 
     tk0 = jnp.linspace(0.0, horizon, num_knots)
-    tq = jnp.arange(int(horizon / DRIVE_DT)) * DRIVE_DT
+    tq = jnp.arange(int(horizon / d2.DT)) * d2.DT
 
     def sample_problem(i):
-        return x0s[i], DriveParams(
-            goal=goals[i], obstacles=obs[i], L=DRIVE_WHEELBASE, v=DRIVE_SPEED,
-            mean=jnp.zeros(num_knots), stdev=DRIVE_U_STDEV,
+        return x0s[i], d2.Params(
+            goal=goals[i], obstacles=obs[i], L=d2.WHEELBASE, v=d2.SPEED,
+            mean=jnp.zeros(num_knots), stdev=d2.U_STDEV,
             step_len=horizon / (num_knots - 1))
 
     def measure(x, theta):
@@ -514,43 +439,28 @@ def _drive_task(config):
 
         def step(x, inp):
             u, t = inp
-            xn, _ = drive_dynamics(x, u, theta, t)
-            return xn, (drive_cost(xn, u, theta, t), xn)
+            xn, _ = d2.dynamics(x, u, theta, t)
+            return xn, (d2.cost_fn(xn, u, theta, t), xn)
 
         x_final, (running, path) = jax.lax.scan(step, x, (us, tq))
         sdf = jax.vmap(lambda p: jnp.min(jax.vmap(
             lambda b: sdf_aabb(p[:2], b))(theta.obstacles)))(path)
-        return {"cost": jnp.sum(running) + drive_terminal(x_final, theta),
+        return {"cost": jnp.sum(running) + d2.terminal_cost(x_final, theta),
                 "goal_dist": jnp.linalg.norm(x_final[:2] - theta.goal),
                 "collided": jnp.any(sdf < 0.0),
                 "collision_frac": jnp.mean(sdf < 0.0)}
 
-    def apply_hp(theta, hp):
-        return theta._replace(stdev=float(hp["stdev"])) if "stdev" in hp else theta
-
     task = GeomTask(
-        dynamics=drive_dynamics, running_cost=drive_cost, terminal_cost=drive_terminal,
-        clip_action=lambda u, th: jnp.clip(u, -DRIVE_STEER_LIMIT, DRIVE_STEER_LIMIT),
+        dynamics=d2.dynamics, running_cost=d2.cost_fn, terminal_cost=d2.terminal_cost,
+        clip_action=d2.clip_action,
         sample_problem=sample_problem, measure=measure,
-        horizon=horizon, num_knots=num_knots, dt=DRIVE_DT,
+        horizon=horizon, num_knots=num_knots, dt=d2.DT,
         # The legacy runner gave the baselines `num_knots` refinement passes but
         # SIS/SIR only one. Here every method gets the same budget.
         n_replans=int(config.get("n_replans", num_knots)),
-        execute=None, shift=None, warm_start=None, apply_hp=apply_hp,
+        execute=None, shift=None, warm_start=None,
         num_problems=n,
-        hp_defaults={"stdev": DRIVE_U_STDEV,
-                     "mppi_temperature": DRIVE_MPPI_TEMPERATURE,
-                     "cem_elite_frac": DRIVE_CEM_ELITE_FRAC,
-                     "cem_stdev_floor": 0.0,
-                     "ess_thresh": DRIVE_ESS_THRESH,
-                     # DIAL runs `dial_n_inner` annealing passes per replan,
-                     # each a full batch of rollouts, so it costs n_inner times
-                     # the samples of a single-pass method. Fixed at 2 (never
-                     # tuned) so the extra cost is a stated property of the
-                     # method rather than something the search can buy.
-                     "dial_n_inner": 2, "dial_beta1": 1.0, "dial_beta2": 1.0,
-                     "dial_temp_sample": 0.06,},
-    )
+)
     return task, n
 
 
@@ -606,7 +516,7 @@ def code_hash():
     h = hashlib.sha256()
     root = Path(__file__).resolve().parent.parent
     for rel in sorted(["pfmp/algorithm.py", "pfmp/update.py", "pfmp/interpolate.py",
-                       "experiments/geom_runner.py", "experiments/mbm.py",
+                       "experiments/geom_runner.py", "examples/mbm.py",
                        "examples/push_tee_2d.py"]):
         p = root / rel
         if p.exists():
@@ -660,26 +570,22 @@ def run_sweep(config, key, values, algorithms, cache_path):
         vkey = str(value)
         results.setdefault(vkey, {})
         cfg = dict(config, **{key: value})
-        task = group_size = tuned = None
+        ev = tuned = None
 
         for alg in algorithms:
             if alg in results[vkey] and fresh(results[vkey][alg]):
                 print(f"  {key}={vkey} {alg:12s} cached")
                 continue
-            if task is None:                     # build lazily, once per value
-                task, group_size = load_task(cfg["task"], cfg)
+            if ev is None:                       # build lazily, once per value
+                ev = Evaluator(cfg)
                 tuned = load_tuned(cfg.get("tuned_params"), algorithms)
-            hp = dict(task.hp_defaults)
-            hp.update(cfg.get("hyperparams", {}))
+            hp = dict(cfg.get("hyperparams", {}))
             hp.update(tuned.get(alg, {}))
-            res = run_algorithm(task, alg, num=task.num_problems,
-                                particles=cfg["num_samples"], hp=hp,
-                                seed=cfg.get("seed", 0), group_size=group_size)
+            res = ev(alg, tuned.get(alg, {}))
             used_hp[alg] = {k: v for k, v in hp.items()
                             if isinstance(v, (int, float, bool))}
             *_, rho = method_decomp(alg)
-            used_hp[alg]["ess_thresh"] = (hp.get("ess_thresh", 0.0)
-                                          if rho is None else rho)
+            used_hp[alg]["ess_thresh"] = 0.5 if rho is None else rho
             results[vkey][alg] = {k: np.asarray(v).tolist() for k, v in res.items()}
             print(f"  {key}={vkey} {alg:12s} " + _summarise(res))
             flush()
@@ -704,17 +610,12 @@ def _summarise(res):
 
 def run_point(config, algorithms, outdir):
     """One config, no sweep: `<algorithm>.npz` per method in `outdir`."""
-    task, group_size = load_task(config["task"], config)
+    ev = Evaluator(config)
     tuned = load_tuned(config.get("tuned_params"), algorithms)
 
     for algorithm in algorithms:
-        # task module defaults < yaml overrides < tuned params
-        hp = dict(task.hp_defaults)
-        hp.update(config.get("hyperparams", {}))
-        hp.update(tuned.get(algorithm, {}))
-        res = run_algorithm(task, algorithm, num=task.num_problems,
-                            particles=config["num_samples"], hp=hp,
-                            seed=config.get("seed", 0), group_size=group_size)
+        # yaml overrides < tuned params
+        res = ev(algorithm, tuned.get(algorithm, {}))
         np.savez(os.path.join(outdir, f"{algorithm}.npz"),
                  **{k: np.asarray(v) for k, v in res.items()})
         print(f"  {algorithm:12s} " + _summarise(res))

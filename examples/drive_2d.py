@@ -5,7 +5,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 from typing import NamedTuple
-from pfmp import PFMP
+from pfmp import PFMP, make_perturbation
 import matplotlib.pyplot as plt
 
 from pfmp.obstacle_grid import (
@@ -24,21 +24,24 @@ class Params(NamedTuple):
     obstacles: jax.Array  # (N, 4) AABB array
     L: float              # wheelbase (m)
     v: float              # forward speed (m/s)
-    du_stdev: float       # tangent noise
-    u_stdev: float        # point noise
+    mean: jax.Array       # (num_knots,) nominal plan the proposal perturbs
+    # Sampling noise. Scalar for the fixed-noise methods; CEM refits it per
+    # knot, giving shape (num_knots,). Always read through `sigma_at`.
+    stdev: jax.Array
+    step_len: float       # horizon / (num_knots - 1)
 
 
 def cost_fn(x: jax.Array, u: jax.Array, th: Params, t: float) -> float:
     loc = x[:2]
     sdf_val = jnp.min(jax.vmap(lambda bounds: sdf_aabb(loc, bounds))(th.obstacles))
     obstacle_loss = jnp.nan_to_num(100. * hinge_loss(sdf_val, 0.25),
-                                   nan=0.0, posinf=jnp.inf, neginf=0.0)
+                                   nan=0.0, posinf=1e6, neginf=0.0)
     goal_loss = jnp.linalg.norm(loc - th.goal) / 10.
     return obstacle_loss**2 + goal_loss**2
 
 
 def terminal_cost(x, th) -> float:
-    return 1000 * jnp.linalg.norm(x[:2] - th.goal) ** 2
+    return 10 * jnp.linalg.norm(x[:2] - th.goal) ** 2
 
 
 def dynamics(x: jax.Array, u: jax.Array, theta: Params, t):
@@ -52,27 +55,36 @@ def dynamics(x: jax.Array, u: jax.Array, theta: Params, t):
     return (x_next, x_next)
 
 
-def init(key, x, theta):
-    return jnp.clip(jax.random.normal(key) * theta.u_stdev, -0.8, 0.8)
+STEER_LIMIT = 0.8      # steering angle clip (rad)
+U_STDEV     = 0.2      # perturbation width around theta.mean
+WHEELBASE   = 0.3
+SPEED       = 2.0
+DT          = 0.01     # integration step, matching `dynamics`
 
+# Random-map generation, used by the batched runner.
+SEED               = 127
+PARTICLES          = 1024
+ESS_THRESH         = 0.5
+ARENA_WIDTH        = 6.0
+OBSTACLE_DENSITY   = 0.3
+BOX_SIZE_RANGE     = (0.4, 1.2)
+MIN_MARGIN         = 0.3
 
-def proposal(key, _x, _u, theta: Params, t):
-    return jnp.clip(jax.random.normal(key) * theta.u_stdev, -0.8, 0.8)
+clip_action = lambda u, th: jnp.clip(u, -STEER_LIMIT, STEER_LIMIT)
 
 
 # =============================================================================
 # Environment
 # =============================================================================
 
-def make_theta() -> tuple[jax.Array, Params]:
+def make_theta(num_knots: int, horizon: float) -> tuple[jax.Array, Params]:
     x0 = jnp.array([0.0, 0.0, jnp.pi / 4])
     theta = Params(
         goal=jnp.array([12.0, 12.0]),
         obstacles=generate_obstacle_grid(5, 5, 1.0, 1.0) + 1.0,
-        L=0.3,
-        v=2.0,
-        du_stdev=0.1,
-        u_stdev=0.2,
+        L=WHEELBASE, v=SPEED,
+        mean=jnp.zeros(num_knots), stdev=U_STDEV,
+        step_len=horizon / (num_knots - 1),
     )
     return x0, theta
 
@@ -84,9 +96,10 @@ def make_theta() -> tuple[jax.Array, Params]:
 def animate(num_knots: int = 20, particles: int = 32768, save_gif: bool = False,
             smooth: bool = False, stride: int = 3):
     horizon = num_knots * 0.5
+    init, proposal = make_perturbation(clip_action)
     pfmp = PFMP(dynamics, cost_fn, terminal_cost, init, proposal,
                 horizon, num_knots, particles, ess_resample_thresh=0.5)
-    x0, theta = make_theta()
+    x0, theta = make_theta(num_knots, horizon)
 
     plt.style.use('default')
     fig, ax = plt.subplots(figsize=(10, 10))

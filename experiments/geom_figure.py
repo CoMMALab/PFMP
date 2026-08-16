@@ -28,21 +28,11 @@ import yaml
 from pfmp import PFMP
 from pfmp.interpolate import hermite_spline
 from pfmp.obstacle_grid import generate_map_batch, plot_obstacles
-# The task itself lives in geom_runner, so the figure and the numbers cannot be
-# drawn from different dynamics or costs. Its functions are closed over inside
-# the adapter, so they arrive on the GeomTask and are threaded through the
-# helpers below rather than imported.
-from geom_runner import (DRIVE_ARENA_WIDTH as ARENA_WIDTH,
-                         DRIVE_BOX_SIZE_RANGE as BOX_SIZE_RANGE, DRIVE_DT as DT,
-                         DRIVE_ESS_THRESH as ESS_THRESH,
-                         DRIVE_MIN_MARGIN as MIN_MARGIN,
-                         DRIVE_OBSTACLE_DENSITY as OBSTACLE_DENSITY,
-                         DRIVE_PARTICLES as PARTICLES, DRIVE_SEED as SEED,
-                         DRIVE_U_STDEV as U_STDEV,
-                         DRIVE_CEM_ELITE_FRAC as CEM_ELITE_FRAC,
-                         DRIVE_MPPI_TEMPERATURE as MPPI_TEMPERATURE,
-                         DRIVE_STEER_LIMIT, build_controller, load_task,
-                         make_perturbation)
+# The tasks are imported from geom_runner
+from geom_runner import build_controller, load_task, make_perturbation
+from drive_2d import (ARENA_WIDTH, BOX_SIZE_RANGE, DT, ESS_THRESH, MIN_MARGIN,
+                      OBSTACLE_DENSITY, PARTICLES, SEED, U_STDEV,
+                      STEER_LIMIT as DRIVE_STEER_LIMIT)
 
 
 
@@ -170,7 +160,7 @@ def precompute_baselines(names, pfmp, x0, theta, num_outer, fns):
                 weights = jax.nn.softmax(-costs / temperature)
                 nominal = jnp.sum(trajs * weights[:, None], axis=0)
             elif name == 'cem':
-                num_elite = max(1, int(CEM_ELITE_FRAC * pfmp.particles))
+                num_elite = max(1, int(0.1 * pfmp.particles))   # cem_update's default
                 nominal = jnp.mean(trajs[jnp.argsort(costs)[:num_elite]], axis=0)
 
             sample_idx = np.random.RandomState(i).choice(
@@ -370,6 +360,8 @@ def figure_drive(config, args, output_dir):
 
 
 PUSH_TEE_DISTANCE = 7.0
+PUSH_TEE_SEED = 42            # push_tee_2d.SEED
+PUSH_TEE_PARTICLES = 2048     # push_tee_2d.PARTICLES
 
 def _make_trace_figure(seeds, distance, n_obs=None, particles=None):
     """2×2 grid of scenarios; each panel overlays PS (red) and PFMP (green) traces."""
@@ -462,8 +454,9 @@ def figure_mbm(config, args, output_dir):
                seed=config.get("seed", 0))
     task, group = load_task("mbm", cfg)
     ctrl = build_controller(task, "sir", int(config.get("num_samples", 1000)),
-                            ess_thresh=float(task.hp_defaults["ess_thresh"]))
+                            ess_thresh=0.5)
     x0, theta = task.sample_problem(args.problem)
+    theta = task.warm_start(x0, theta)   # as geom_runner does, so mean has a shape
 
     trajs, costs = ctrl.run_sir(jax.random.key(cfg["seed"]), x0, theta)
     knots = trajs[jnp.argmin(jnp.sum(costs, axis=-1))]

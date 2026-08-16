@@ -44,17 +44,11 @@ METHOD_ALIASES: dict[str, Tuple[ProposalType, UpdateType]] = {
 def method_decomp(method: str) -> Tuple[ProposalType, UpdateType, Optional[float]]:
     """Decompose a method name into (proposal, update, rho).
 
-    Accepts the legacy names, optionally with a resampling suffix:
+        "sis" -> ("informed", "argmin", 0.0)    "mppi+r0.25" -> (..., 0.25)
+        "cem+r" -> (..., None)                  "sir", "pfmp" -> "sis+r"
 
-        "sis"          -> ("informed", "argmin", 0.0)
-        "mppi+r0.25"   -> ("gaussian", "mean",   0.25)
-        "cem+r"        -> ("gaussian", "topk",   None)   # task's ess_thresh
-        "sir"          -> ("informed", "argmin", None)   # == "sis+r"
-        "pfmp"         -> ("informed", "argmin", None)   # the viewer's name for it
-
-    A bare `+r` (no number) means "whatever ess_thresh resolves to" and is
-    returned as None for the caller to fill in; no suffix is rho = 0, which is
-    exactly `ess_resample_thresh=0` (never resample).
+    A bare `+r` means "whatever ess_thresh resolves to", returned as None for
+    the caller; no suffix is rho = 0 (never resample).
     """
     base, sep, val = method.partition("+r")
     if base in ("sir", "pfmp"):            # legacy aliases for sis + resampling

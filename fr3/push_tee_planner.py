@@ -21,8 +21,10 @@ from mujoco import mjx
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "examples"))
 from geom_tee import STEM_HALF, CAP_HALF, CAP_CTR
 from env import load_env
+from push_tee_2d import sample_mixture
 
 import pfmp
 
@@ -105,7 +107,6 @@ TRACK_STALE_MISSES = 2    # consecutive missed detections before warning
 PROPOSAL_MIX    = 0.4   # directed toward tee
 ORBITAL_MIX     = 0.2   # orbit around tee at push radius
 STEP_LEN_VEL    = 0.05
-PUSH_OVERSHOOT  = 1.0
 PUSH_RADIUS     = 0.16  # just outside tee cap half-extent
 ORBITAL_Y_OFFSET = 0.04  # metres up the tee stem for the orbital centre
 
@@ -180,13 +181,12 @@ def _knot_index(t: float) -> jax.Array:
 
 
 def init_control(key: jax.Array, x: mjx.Data, th: PushParams) -> jax.Array:
-    """Same mixture as `proposal`, seeded from the warm-started mean.
+    """`proposal` at the first knot, seeded from the warm-started mean.
 
     The orbital branch is anchored to the tee rather than the mean, so particles
     stay feasible even if the mean has drifted outside the reachable set.
     """
-    return project_reachable(
-        sample_mixture(key, x, th.mean[0], th, _sigma_at(th, 0)), th)
+    return proposal(key, x, th.mean[0], th, 0.0, idx=0)
 
 
 def mppi_proposal(key: jax.Array, _x: mjx.Data, _u: jax.Array, th: PushParams, t: float) -> jax.Array:
@@ -209,37 +209,28 @@ def project_reachable(u: jax.Array, th: PushParams) -> jax.Array:
     return jnp.array([X.reshape(-1)[flat], Y.reshape(-1)[flat]])
 
 
-def sample_mixture(key: jax.Array, x: mjx.Data, u: jax.Array, th: PushParams,
-                    sigma: jax.Array) -> jax.Array:
-    """ One draw from the three-way mixture: directed / orbital / random walk. """
-    key_mix, key_a, key_b, key_ang = jax.random.split(key, 4)
-    t_xy  = x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 2]
-    t_yaw = x.qpos[T_QPOS_OFFSET + 2]
-    r     = jax.random.uniform(key_mix)
+def proposal(key: jax.Array, x: mjx.Data, u: jax.Array, th: PushParams, t: float,
+             idx=None) -> jax.Array:
+    """One draw from the three-way mixture, snapped to the reachable set.
 
-    # Branch 1: step toward tee centroid
-    direction = t_xy - u
-    dist      = jnp.linalg.norm(direction) + 1e-7
-    directed  = u + (direction / dist) * (jnp.minimum(dist, STEP_LEN_VEL) * PUSH_OVERSHOOT)
-    directed  = directed + jax.random.normal(key_a, (2,)) * sigma
+    The mixture itself lives in examples/push_tee_2d.py so the simulated and
+    hardware push-T share one proposal and the paper describes it once. Here it
+    is bound to the FR3's state layout, tee geometry, and reachable set. The
+    constants are unchanged, so the draw is identical to the local copy of the
+    mixture this replaced.
 
-    # Branch 2: orbit around a point shifted up the tee stem (body-frame +y).
-    stem_up     = jnp.array([-jnp.sin(t_yaw), jnp.cos(t_yaw)])
-    orbital_ctr = t_xy + ORBITAL_Y_OFFSET * stem_up
-    angle       = jax.random.uniform(key_ang, minval=0.0, maxval=2.0 * jnp.pi)
-    orbital     = orbital_ctr + PUSH_RADIUS * jnp.array([jnp.cos(angle), jnp.sin(angle)])
-
-    # Branch 3: random walk
-    random_loc = u + jax.random.normal(key_b, (2,)) * sigma * 2.0
-
-    return jnp.where(r < PROPOSAL_MIX, directed,
-           jnp.where(r < PROPOSAL_MIX + ORBITAL_MIX, orbital, random_loc))
-
-
-def proposal(key: jax.Array, x: mjx.Data, u: jax.Array, th: PushParams, t: float) -> jax.Array:
-    """ Three-way mixture """
-    return project_reachable(
-        sample_mixture(key, x, u, th, _sigma_at(th, _knot_index(t))), th)
+    `idx` overrides which knot's noise width to use. `init_control` passes 0,
+    which `_knot_index` never returns for t >= 0; it only matters under CEM,
+    whose stdev is per-knot.
+    """
+    idx = _knot_index(t) if idx is None else idx
+    return project_reachable(sample_mixture(
+        key, u,
+        x.qpos[T_QPOS_OFFSET:T_QPOS_OFFSET + 2], x.qpos[T_QPOS_OFFSET + 2],
+        _sigma_at(th, idx),
+        directed_frac=PROPOSAL_MIX, orbital_frac=ORBITAL_MIX,
+        step_len=STEP_LEN_VEL,
+        push_radius=PUSH_RADIUS, orbital_y_offset=ORBITAL_Y_OFFSET), th)
 
 
 # ===============================
@@ -531,7 +522,8 @@ def build_method_config(method: str, ctrl, temperature: float | None) -> MethodC
         # Thin binding of the shared pfmp.dial_step to this ctrl/beta config, so
         # the call site reads the same as every other method's dispatch.
         dial_step_fn = lambda key, data, th, n: _dial_step(
-            key, ctrl, data, th, n=n, beta1=DIAL_B1, beta2=DIAL_B2)
+            key, ctrl, data, th, n=n, beta1=DIAL_B1, beta2=DIAL_B2,
+            temp_sample=1.0)   # not dial-mpc's 0.06; preserves logged trials
     else:  # sir
         replan = lambda key, data, th: ctrl.run_sir(key, data, th)
         update = ps_update

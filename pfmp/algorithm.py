@@ -8,12 +8,6 @@ from dataclasses import is_dataclass, fields
 from hydrax.task_base import Task
 from mujoco import mjx
 from .interpolate import hermite_interp1d, Jet1, Jet2, Jet3
-# Re-exported so existing `from pfmp.algorithm import ps_update` (etc.) call
-# sites keep working — the update rules (U) live in update.py. Four of them
-# (ps/sample/mppi/cem) are pure readouts over a completed rollout batch and
-# never call back into the PFMP sampler defined below; dial_step is the
-# exception (it drives its own re-sampling loop, taking the sampler as an
-# argument), included here too for a uniform import surface.
 from .update import (
     ess, dial_sigma, _check_update_shapes,
     ps_update, sample_update, mppi_update, cem_update, dial_step, dial_update,
@@ -58,25 +52,21 @@ def get_field_info(x):
 
     raise TypeError(f"Unsupported state type: {type(x)}")
 
-
-# Mujoco XLA helper functions
-def mjx_hydrax_cost(task: Task):
-    running_cost = lambda x, j, th, _t: task.running_cost(x, j) * 0.01
-    terminal_cost = lambda x, th: task.terminal_cost(x)
-    return running_cost, terminal_cost
-
 # ---------------------------------------------------------------------------
 # The shared perturbation proposal
 #
 # Every baseline (PS/MPPI/CEM/DIAL) samples the same way: Gaussian noise around
-# the nominal plan `theta.mean`, at a width read per-knot. That is one function,
-# not one per task, so it lives here. A task only supplies its action clip.
+# the nominal plan `theta.mean`, at a width read per-knot.
+# 
+# The perturbation accepts action clips (joint limits).
 #
-# The three `theta` types agree on exactly what this needs: `mean` (K, *action),
-# `stdev` (scalar, or (K, *action) once CEM refits it), and `step_len`.
+# `theta` types using the shared perturbation require:
+# (1) `mean` (K, *action),
+# (2) `stdev` (scalar, or (K, *action)), and
+# (3) `step_len` (scalar)
 # ---------------------------------------------------------------------------
 
-def sigma_at(theta, idx):
+def sigma_at(theta: PyTree, idx: int) -> float:
     """Sampling noise for knot `idx`.
 
     Handles both conventions: a scalar `stdev` (PS/MPPI/SIS/SIR, and DIAL, which
@@ -86,7 +76,7 @@ def sigma_at(theta, idx):
     return theta.stdev if jnp.ndim(theta.stdev) == 0 else theta.stdev[idx]
 
 
-def knot_index(theta, t):
+def knot_index(theta: PyTree, t: float) -> int:
     """Knot whose interval contains time `t`."""
     idx = jnp.floor(jnp.asarray(t) / theta.step_len).astype(jnp.int32) + 1
     return jnp.clip(idx, 0, theta.mean.shape[0] - 1)
@@ -104,6 +94,12 @@ def make_perturbation(clip=None):
     return (lambda key, x, theta: at(key, theta, 0),
             lambda key, x, u, theta, t: at(key, theta, knot_index(theta, t)))
 
+# Mujoco XLA helper functions
+
+def mjx_hydrax_cost(task: Task):
+    running_cost = lambda x, j, th, _t: task.running_cost(x, j) * 0.01
+    terminal_cost = lambda x, th: task.terminal_cost(x)
+    return running_cost, terminal_cost
 
 def mjx_linear_gaussian_proposal(task: Task, horizon: float, num_knots: int):
     """Legacy proposal, numerically identical to make_perturbation,
@@ -151,11 +147,7 @@ class PFMP(NamedTuple):
     particles: int
     ess_resample_thresh: float = 0.5
     dt: float = 0.01
-    # How `u` varies within a knot interval. "hermite" splines u0 -> u1; "zoh"
-    # holds u1 for the whole interval. Use "zoh" when the executor tracks
-    # waypoints itself (e.g. franky moving to each knot), so the rollout scores
-    # the trajectory that is actually run rather than an interpolant that isn't.
-    interp: str = "hermite"
+    interp: str = "hermite"  # "zoh" | "linear" | "hermite"
 
     def tk(self, endpoint: bool = True):
         if endpoint:
@@ -169,8 +161,7 @@ class PFMP(NamedTuple):
         the control spline-interpolated from u0 to u1. Returns (x_end, cost), or
         (x_end, cost, xs) with the per-substep states when `return_traj`. Shared
         by `transition_model` (one proposed interval, endpoint only) and `predict`
-        (a fixed sequence, dense). `return_traj` is off in the rollout so the
-        planner's scans never carry the extra states."""
+        (a fixed sequence, dense)."""
         step_len = self.horizon / (self.num_knots - 1)
         steps_per_knot = int(step_len / self.dt)
         t1 = t0 + step_len
@@ -297,7 +288,7 @@ class PFMP(NamedTuple):
             (new_xs, new_us), (_, costs) = jax.vmap(
                 lambda k, x, u: self.transition_model(k, x, u, theta, t))(step_keys, xs, us)
 
-            # Reweight, and resample only when the effective sample size collapses.
+            # Reweight, and resample only when the effective sample size falls below the threshold.
             log_ws = log_ws - costs
             w = jnp.exp(log_ws - jnp.max(log_ws))
             ps = w / jnp.sum(w)
@@ -359,7 +350,7 @@ class PFMP(NamedTuple):
         indices: jax.Array          # (N,) where self.particles >= N
     ) -> PyTree[jax.Array]:         # (N,horizon,...)
         """
-        Trace back the trajectories for N self.particles among self.particles, for finite horizon horizon.
+        Trace back the trajectories for N self.particles among self.particles, over a finite horizon.
 
         Args:
             states: PyTree with leaves of shape (horizon, self.particles, ...) representing the full simulation state at each time step.

@@ -53,24 +53,14 @@ def label_for(alg, hyperparams, style="rho"):
         return f"{UPDATE_LABEL.get(update, update)}, {PROPOSAL_LABEL[proposal]}"
     name = AXIS_LABEL.get((proposal, update), f"{proposal}/{update}")
     if rho is None:
-        # A bare "+r" only knows its rho from what the run recorded. Caches
-        # written before that was logged cannot say, and printing 0 there would
-        # label a resampling method as if it never resampled -- the same label
-        # its rho=0 sibling gets.
         rho = (hyperparams or {}).get(alg, {}).get("ess_thresh")
         if rho is None:
             return rf"{name} ($\rho$ = ?)"
     return rf"{name} ($\rho$ = {rho:.3g})"
 
 
-# Line style carries rho, hue carries the update. Assigned in sorted rho order,
-# so more resampling reads as a more solid line: dotted (none) -> dashed -> solid.
 STYLE_CYCLE = (":", "--", "-", (0, (3, 1, 1, 1)), (0, (5, 1)), (0, (1, 1)))
 
-
-# Display name per (proposal, update) cell -- the inverse of METHOD_ALIASES, so
-# two methods can only share a label if they are the same point on the axes.
-# Without this, `sis`/`ps` and `mppi`/`biased_mppi` both collapsed to one name.
 AXIS_LABEL = {
     ("gaussian", "argmin"):  "PS",
     ("informed", "argmin"):  "SIS",
@@ -139,12 +129,6 @@ def _axes_of(alg, hyperparams, style):
     return rho_of(alg, hyperparams)
 
 
-# Hue follows the update; the other two axes are carried by line style and by
-# faceting, so a resampling variant or a different proposal keeps its colour.
-# Hue identifies the (proposal, update) cell, not the update alone: within a
-# family the informed proposal is the darker shade. Colouring by update only
-# drew `mppi` and `biased_mppi` as two identical lines, since rho is carried by
-# the line style and the proposal then had no channel left.
 AXIS_COLORS = {
     ("gaussian", "argmin"):  "#E74C3C",   # PS           light red
     ("informed", "argmin"):  "#1E8449",   # SIS          green (ours)
@@ -158,9 +142,6 @@ AXIS_COLORS = {
     ("learned",  "argmin"):  "#95A5A6",
 }
 
-
-# Hatch carries the proposal in the bar charts, where hue is already spent on
-# the update and two methods sharing an update sit side by side.
 PROPOSAL_HATCH = {"gaussian": "", "informed": "///", "learned": "..."}
 
 
@@ -224,8 +205,7 @@ def load_sweep(blk):
 # ---------------------------------------------------------------------------
 
 def wilson_ci(k, n, z=1.96):
-    """Wilson score interval, in percent. Beats the normal approximation at the
-    0% and 100% ends, which is exactly where these success rates sit."""
+    """Wilson score interval, in percent for success rate."""
     if n == 0:
         return float("nan"), float("nan")
     p = k / n
@@ -434,8 +414,6 @@ def main():
     ap.add_argument("--output-dir", default=None)
     ap.add_argument("--algorithms", nargs="+", default=None,
                     help="subset/order to plot (default: what the sweep ran)")
-    # Encoding is a plotting choice, not a data choice: one sweep can yield both
-    # the rho view and the proposal view, so these override what the cache says.
     ap.add_argument("--style", choices=("rho", "proposal"), default=None,
                     help="what the line style encodes (default: as run)")
     ap.add_argument("--facet", choices=("update", "none"), default=None,

@@ -76,7 +76,8 @@ def sample_update(theta: PyTree, trajs: PyTree, costs: jax.Array,
 # Model Predictive Path Integral: softmax over trajectories by TOTAL return, one
 # weight per trajectory applied to every knot. Stable softmax (shift by the min
 # total) so exp() cannot underflow to all-zeros -> 0/0 = NaN.
-def mppi_update(theta: PyTree, trajs: PyTree, costs: jax.Array, temperature: float):
+def mppi_update(theta: PyTree, trajs: PyTree, costs: jax.Array,
+                temperature: float = 1.0):
     _check_update_shapes(trajs, costs)
     total = jnp.sum(costs, axis=1)                        # (P,) total return
     # If EVERY particle is non-finite (all collided) the shift below is
@@ -98,8 +99,8 @@ def mppi_update(theta: PyTree, trajs: PyTree, costs: jax.Array, temperature: flo
 
 
 # Cross-Entropy Method: mean (and std) of the lowest-total-cost elite fraction.
-def cem_update(theta: PyTree, trajs: PyTree, costs: jax.Array, elite_frac: float,
-               stdev_floor: float = 0.0):
+def cem_update(theta: PyTree, trajs: PyTree, costs: jax.Array,
+               elite_frac: float = 0.1, stdev_floor: float = 0.0):
     _check_update_shapes(trajs, costs)
     total = jnp.sum(costs, axis=1)                        # (P,) total return
     num_elite = max(1, int(elite_frac * total.shape[0]))
@@ -128,7 +129,7 @@ def dial_sigma(i: int, h: int, sigma_max: float, N: int, H: int,
     H−h) is what lets the terminal knot sample at the full σ_max, exp(0)."""
     return sigma_max * math.exp(-(N - i) / (beta1 * N) - (H - 1 - h) / (beta2 * H))
 
-# inner loop
+# one annealing step
 def dial_update(theta: PyTree, trajs: PyTree, costs: jax.Array,
                 temp_sample: float = 1.0):
     """DIAL's update: MPPI whose temperature is the spread of the returns.
@@ -152,7 +153,7 @@ def dial_update(theta: PyTree, trajs: PyTree, costs: jax.Array,
 # outer loop
 def dial_step(key: PRNGKeyArray, ctrl, x0: PyTree, theta: PyTree,
               n: int = 2, beta1: float = 1.0, beta2: float = 1.0,
-              temp_sample: float = 1.0, return_costs: bool = False) -> PyTree:
+              temp_sample: float = 0.06, return_costs: bool = False) -> PyTree:
     """One DIAL-MPC replan: `n` annealing levels, each re-sampling at a
     shrinking per-knot sigma (`dial_sigma`) and folding the batch in with
     `dial_update`.
@@ -171,9 +172,6 @@ def dial_step(key: PRNGKeyArray, ctrl, x0: PyTree, theta: PyTree,
         sigma = jnp.stack([dial_sigma(i, h, base, n, num_knots, beta1, beta2)
                            for h in range(num_knots)])
         key, sub = jax.random.split(key)
-
-        # Run **Sequential Importance Sampling** inside the **inner** loop
         trajs, costs = ctrl.run_sis(sub, x0, theta._replace(stdev=sigma))
-
         theta, _ = dial_update(theta, trajs, costs, temp_sample)
     return (theta, costs) if return_costs else theta
