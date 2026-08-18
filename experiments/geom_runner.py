@@ -191,7 +191,7 @@ def make_replan(ctrl: PFMP, algorithm: str, hp: dict, particles: int):
     return replan
 
 
-def _make_simulator(task: GeomTask, replan: Callable):
+def _make_simulator(task: GeomTask, replan: Callable, widen_stdev: bool = False):
     """jit(vmap(...)) of the outer loop: replan -> execute -> shift, then measure.
 
     `execute`/`shift` are None for open-loop tasks, where the world never moves.
@@ -201,10 +201,14 @@ def _make_simulator(task: GeomTask, replan: Callable):
 
     def one(key, x0, theta):
         # Warm-start unconditionally, including for the methods whose proposal
-        # ignores `theta.mean`: it is what gives `mean` its shape, and the scan
-        # carry's pytree structure has to survive the first update writing it.
+        # ignores `theta.mean`: it is what gives `mean` its shape.
         if task.warm_start is not None:
             theta = task.warm_start(x0, theta)
+        # CEM's covariance refit only fires when `stdev` is already per-knot, and
+        # theta is the scan carry, so the widening has to happen before the loop.
+        # `topk` only: DIAL builds its schedule from a scalar `theta.stdev`.
+        if widen_stdev and jnp.ndim(theta.stdev) == 0:
+            theta = theta._replace(stdev=jnp.full_like(theta.mean, theta.stdev))
 
         def step(carry, _):
             key, x, theta = carry
@@ -226,12 +230,13 @@ def run_algorithm(task: GeomTask, algorithm: str, num: int, particles: int,
                   hp: dict, seed: int = 0, group_size: int = None):
     """Run `num` problems of `task` under one method. Batched in groups because
     some tasks (MBM) have per-problem array shapes that match only within a
-    dataset. Every hyperparameter is closed into the compiled program, so each
-    distinct `hp` costs one compile.
+    dataset. Every hyperparameter is closed into the compiled program.
     """
     group_size = group_size or num
+    _, update_kind, _ = method_decomp(algorithm)
     ctrl = build_controller(task, algorithm, particles)
-    sim = _make_simulator(task, make_replan(ctrl, algorithm, hp, particles))
+    sim = _make_simulator(task, make_replan(ctrl, algorithm, hp, particles),
+                          widen_stdev=update_kind == "topk")
 
     out = []
     for lo in range(0, num, group_size):
