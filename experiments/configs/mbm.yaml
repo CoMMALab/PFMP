@@ -14,7 +14,10 @@ datasets:
 num_samples: 1000
 seed: 0
 tuned_params: experiments/checkpoints/mbm_tune.json
-algorithms: [sis, sir, mppi, cem, biased_mppi, biased_cem, dial]
+# Ordered so each biased variant sits beside its unbiased counterpart.
+# DIAL-MPC dropped: its annealing schedule presumes receding-horizon
+# replanning, and MBM is single-shot (n_replans = 1).
+algorithms: [sir, sis, biased_mppi+r, biased_mppi, ps, mppi, cem]
 
 # Categorical: one bar group per dataset, so the swept value is a 1-element
 # dataset list and `xticks` carries the label.

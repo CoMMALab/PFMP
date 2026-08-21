@@ -36,12 +36,12 @@ def cost_fn(x: jax.Array, u: jax.Array, th: Params, t: float) -> float:
     sdf_val = jnp.min(jax.vmap(lambda bounds: sdf_aabb(loc, bounds))(th.obstacles))
     obstacle_loss = jnp.nan_to_num(100. * hinge_loss(sdf_val, 0.25),
                                    nan=0.0, posinf=1e6, neginf=0.0)
-    goal_loss = jnp.linalg.norm(loc - th.goal) / 10.
-    return obstacle_loss**2 + goal_loss**2
+    goal_loss = jnp.linalg.norm(loc - th.goal)
+    return obstacle_loss + goal_loss
 
 
 def terminal_cost(x, th) -> float:
-    return 10 * jnp.linalg.norm(x[:2] - th.goal) ** 2
+    return 10 * jnp.linalg.norm(x[:2] - th.goal)
 
 
 def dynamics(x: jax.Array, u: jax.Array, theta: Params, t):
@@ -64,7 +64,7 @@ DT          = 0.01     # integration step, matching `dynamics`
 # Random-map generation, used by the batched runner.
 SEED               = 127
 PARTICLES          = 1024
-ESS_THRESH         = 0.5
+ESS_THRESH         = 0.2
 ARENA_WIDTH        = 6.0
 OBSTACLE_DENSITY   = 0.3
 BOX_SIZE_RANGE     = (0.4, 1.2)
@@ -123,7 +123,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--save", action="store_true",
                         help="Save animation as GIF instead of displaying")
-    parser.add_argument("--knots", type=int, default=20,
+    parser.add_argument("--knots", type=int, default=5,
                         help="Number of knots (default: 20)")
     parser.add_argument("--particles", type=int, default=32768,
                         help="Number of particles (default: 32768)")

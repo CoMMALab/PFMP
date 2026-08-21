@@ -4,12 +4,13 @@
 task: push_tee
 distance: 4.0        # base value; the sweep overrides it per point
 num: 128             # arenas per point, as reported in the paper
-num_samples: 2048
+num_samples: 256          # match the tuning budget (geom_optuna TASK_SETUP)
 seed: 42
 tuned_params: experiments/checkpoints/push_tee_tune.json
 # `ps` is included so this one sweep also supports the proposal-axis view
 # (ps/sis, mppi/biased_mppi, cem/biased_cem are matched-update pairs).
-algorithms: [sis, sir, ps, mppi, biased_mppi, cem, biased_cem, dial]
+# Each biased variant beside its unbiased counterpart.
+algorithms: [sir, sis, biased_mppi, biased_cem, ps, mppi, cem, dial]
 
 # Sweep axis for geom_runner / geom_analyze. `xticks` is the plotted coordinate
 # for each value: several arena sizes share an obstacle count, and the plot

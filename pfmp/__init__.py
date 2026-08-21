@@ -35,7 +35,7 @@ METHOD_ALIASES: dict[str, Tuple[ProposalType, UpdateType]] = {
     "dial":        ("gaussian", "diffuse"),  # Xue et. al. (2024), pinned to N_anneal = 2
     "sis":         ("informed", "argmin"),   # ours
     "sis_sample":  ("informed", "sample"),   # ours
-    "biased_mppi": ("informed", "mean"),     # Pezzato et. al. (2023)
+    "biased_mppi": ("informed", "mean"),     # Trevisan & Alonso-Mora (2024)
     "biased_cem":  ("informed", "topk"),     # ours (biased_mppi, extrapolated)
     "sample":      ("learned", "sample"),    # Piche et. al. (2018)
     "greedy":      ("learned", "argmin"),

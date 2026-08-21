@@ -77,8 +77,11 @@ def apply_hp(theta, hp: dict):
                              if k in theta._fields})
 
 
+ESS_THRESH_DEFAULT = 0.5      # pinned for every task; a bare `+r` resolves here
+
+
 def build_controller(task: GeomTask, algorithm: str, particles: int,
-                     ess_thresh: float = 0.5) -> PFMP:
+                     ess_thresh: float = ESS_THRESH_DEFAULT) -> PFMP:
     proposal, _, rho = method_decomp(algorithm)
     perturb = make_perturbation(task.clip_action)
     # A task with no q of its own collapses the proposal axis to gaussian, so on
@@ -100,11 +103,17 @@ def _elite_count(hp: dict, particles: int) -> int:
     return max(1, int(hp.get("cem_elite_frac", 0.1) * particles))
 
 
-def make_replan(ctrl: PFMP, algorithm: str, hp: dict, particles: int):
+def make_replan(ctrl: PFMP, algorithm: str, hp: dict, particles: int,
+                return_trajs: bool = False):
     """One planning iteration: (key, x, theta) -> (theta, per-knot ESS).
 
-    DIAL replaces this wholesale: it owns its own sampling loop.
+    `return_trajs` additionally returns the sampled knots and their costs, so a
+    figure can draw the particle cloud the update actually saw rather than
+    re-deriving one. DIAL replaces this wholesale: it owns its own sampling
+    loop, so it does not support the flag.
     """
+    if return_trajs and method_decomp(algorithm)[1] == "diffuse":
+        raise ValueError("return_trajs is unsupported for DIAL (owns its loop)")
     _, update_kind, rho = method_decomp(algorithm)
     sample = ctrl.run_sis if rho == 0.0 else ctrl.run_sir
 
@@ -187,7 +196,8 @@ def make_replan(ctrl: PFMP, algorithm: str, hp: dict, particles: int):
         # proposal produced, not the update applied to it.
         total = jnp.cumsum(costs, axis=1)                    # (P, K)
         ess_k = jax.vmap(ess, in_axes=1)(total)              # (K,)
-        return update(*args)[0], ess_k
+        theta = update(*args)[0]
+        return (theta, ess_k, trajs, costs) if return_trajs else (theta, ess_k)
     return replan
 
 
@@ -522,7 +532,7 @@ def code_hash():
     root = Path(__file__).resolve().parent.parent
     for rel in sorted(["pfmp/algorithm.py", "pfmp/update.py", "pfmp/interpolate.py",
                        "experiments/geom_runner.py", "examples/mbm.py",
-                       "examples/push_tee_2d.py"]):
+                       "examples/push_tee_2d.py", "examples/drive_2d.py"]):
         p = root / rel
         if p.exists():
             h.update(p.read_bytes())

@@ -29,7 +29,7 @@ from pfmp import PFMP
 from pfmp.interpolate import hermite_spline
 from pfmp.obstacle_grid import generate_map_batch, plot_obstacles
 # The tasks are imported from geom_runner
-from geom_runner import build_controller, load_task, make_perturbation
+from geom_runner import build_controller, load_task, make_perturbation, make_replan
 from drive_2d import (ARENA_WIDTH, BOX_SIZE_RANGE, DT, ESS_THRESH, MIN_MARGIN,
                       OBSTACLE_DENSITY, PARTICLES, SEED, U_STDEV,
                       STEER_LIMIT as DRIVE_STEER_LIMIT)
@@ -78,12 +78,14 @@ def _save(fig, name, output_dir):
 
 
 BASELINE_COLORS = {
-    'ps':   ('crimson',    'indianred',      r"PS"),
+    'ps':   ('#1E8449',    '#7DCEA0',        r"PS"),
     'mppi': ('royalblue',  'cornflowerblue', r"MPPI"),
     'cem':  ('darkorange', 'sandybrown',     r"CEM"),
 }
 NUM_CLOUD = 30   # particle paths shown per baseline per frame
-NUM_OUTER = 15   # default outer optimization iterations
+NUM_OUTER = 20   # default refinement passes; matches drive's
+                 # n_replans = num_knots, so the figure and the sweep
+                 # give every method the same budget
 SIGMA_MIN_FRAC = 0.1  # final noise = U_STDEV * this
 
 
@@ -111,7 +113,7 @@ def _draw_panel_bg(ax, x0, theta, cost_fn, xlim, ylim, plot_obs):
     points = jnp.stack([X.ravel(), Y.ravel()], axis=1)
     Z = jax.vmap(lambda loc: cost_fn(loc, jnp.zeros(1), theta, 0.0))(
         points).reshape(X.shape)
-    ax.contourf(X, Y, Z, levels=20, cmap='Greys', alpha=0.3)
+    ax.contourf(X, Y, Z, levels=24, cmap='Greys', alpha=0.5)
     plot_obstacles(ax, obs_to_plot)
     ax.plot(float(x0[0]), float(x0[1]), 'o', color='darkgreen', markersize=20,
             markeredgecolor='black', markeredgewidth=1.5, zorder=10)
@@ -126,6 +128,46 @@ def _draw_panel_bg(ax, x0, theta, cost_fn, xlim, ylim, plot_obs):
 # =============================================================================
 # Animation — baselines
 # =============================================================================
+
+def precompute_via_runner(task, algorithm, x0, theta, n_outer, particles,
+                          ess_thresh, num_show, hp=None):
+    """Record the cloud and plan at each pass of the runner's OWN replan loop.
+
+    This is the same `build_controller` + `make_replan` path `run_algorithm`
+    uses, so the figure cannot show an algorithm the numbers never ran. Drive is
+    open-loop (no execute/shift), so the loop is just repeated refinement of
+    `theta.mean` from the same x0 -- exactly what the sweep does.
+    """
+    ctrl = build_controller(task, algorithm, particles,
+                            ess_thresh=ess_thresh)._replace(
+        ess_resample_thresh=ess_thresh)
+    replan = make_replan(ctrl, algorithm, hp or {}, particles, return_trajs=True)
+    tq = jnp.linspace(0, ctrl.horizon, round(ctrl.horizon / ctrl.dt))
+    tk = ctrl.tk()
+
+    def rollout(knots):
+        us = hermite_spline(tq, tk, knots)
+        _, xy = jax.lax.scan(
+            lambda x, ut: task.dynamics(x, ut[0], theta, ut[1]), x0, (us, tq))
+        return xy[:, :2]
+
+    frames, th = [], theta
+    # `_make_simulator` widens a scalar stdev to per-knot for topk, which is what
+    # lets cem_update's covariance refit fire at all. This loop bypasses the
+    # simulator, so it has to do the same or the figure shows a CEM the sweep
+    # never ran.
+    from pfmp import method_decomp
+    if method_decomp(algorithm)[1] == "topk" and jnp.ndim(th.stdev) == 0:
+        th = th._replace(stdev=jnp.full_like(th.mean, th.stdev))
+    print(f"  {algorithm} ({n_outer} passes)...", end=" ", flush=True)
+    for i in range(n_outer):
+        th, _, trajs, costs = replan(jax.random.key(i), x0, th)
+        order = np.asarray(jnp.argsort(jnp.sum(costs, axis=1)))[:num_show]
+        cloud = np.array(jax.vmap(rollout)(trajs[jnp.array(order)]))
+        frames.append((cloud, np.array(rollout(th.mean))))
+    print("done")
+    return frames
+
 
 def precompute_baselines(names, pfmp, x0, theta, num_outer, fns):
     """N outer iterations of each baseline with annealed noise.
@@ -176,7 +218,7 @@ def precompute_baselines(names, pfmp, x0, theta, num_outer, fns):
 
 def setup_baseline_panel(ax, baselines_data, x0, theta, cost_fn, fns, xlim, ylim,
                           plot_obs=None, unroll=False, steps_per_knot=None,
-                          num_knots=None):
+                          num_knots=None, linestyle='-'):
     """Set up the baselines animation panel. Returns (update_fn, num_frames, interval)."""
     _draw_panel_bg(ax, x0, theta, cost_fn, xlim, ylim, plot_obs)
 
@@ -189,7 +231,8 @@ def setup_baseline_panel(ax, baselines_data, x0, theta, cost_fn, fns, xlim, ylim
                  for _ in range(NUM_CLOUD)]
         cloud_lines[name] = lines
         nom_line, = ax.plot([], [], color=color_best, linewidth=2.5, alpha=1.0,
-                            zorder=8, solid_capstyle='round', label=label)
+                            zorder=8, solid_capstyle='round', label=label,
+                            linestyle=linestyle)
         nominal_lines[name] = nom_line
 
     ax.legend(loc='upper left', fontsize=9, framealpha=0.85,
@@ -308,7 +351,10 @@ def figure_drive(config, args, output_dir):
     landscape. A still of the drive task's optimisation at its converged frame."""
     knots = int(config.get("num_knots", 20))
     arena, horizon = round(knots + 1.0, 1), knots * 0.5
-    particles = int(config.get("num_samples", PARTICLES))
+    # The plan figure is a qualitative illustration, so it uses its own
+    # particle budget rather than inheriting the sweep's (which is tuned for
+    # wall-clock across many maps). --particles overrides.
+    particles = int(args.particles or PARTICLES)
     n_outer = args.num_outer or NUM_OUTER
 
     cfg = {"task": "drive", "num": args.problem + 1, "num_knots": knots,
@@ -316,20 +362,23 @@ def figure_drive(config, args, output_dir):
     task, _ = load_task("drive", cfg)
     fns = (task.dynamics, task.running_cost, task.terminal_cost)
 
-    def ctrl(ess):
-        return build_controller(task, "ps", particles, ess_thresh=ess)._replace(
-            ess_resample_thresh=ess)
-
     x0, theta = task.sample_problem(args.problem)
     obstacles = theta.obstacles
     real_obs = obstacles[obstacles[:, 0] < 1e5]
 
-    print("Precomputing baselines:")
-    baselines = precompute_baselines(["ps", "mppi", "cem"], ctrl(0.0),
-                                     x0, theta, n_outer, fns)
-    print("Precomputing SMC:")
-    smc, _ = precompute_smc(ctrl(config.get("ess_thresh", ESS_THRESH)),
-                            x0, theta, n_outer, fns)
+    rho = config.get("ess_thresh", ESS_THRESH)
+    run = lambda alg, ess, n: precompute_via_runner(
+        task, alg, x0, theta, n_outer, particles, ess, n,
+        hp=config.get("hyperparams"))
+
+    # Same three updates in both panels, so the only difference between rows is
+    # rho. Keys stay the bare method names: BASELINE_COLORS is keyed on them, and
+    # a shared colour per update is what makes the two rows comparable.
+    METHODS = ("ps", "mppi", "cem")
+    print("rho = 0:")
+    baselines = {a: run(a, 0.0, NUM_CLOUD) for a in METHODS}
+    print(f"rho = {rho}:")
+    resampled = {a: run(f"{a}+r", rho, NUM_CLOUD) for a in METHODS}
 
     plt.style.use("default")
     # Size from the arena, not a fixed 8x10: the axes hold equal aspect, so a
@@ -349,10 +398,11 @@ def figure_drive(config, args, output_dir):
                  unroll=False, num_knots=knots, **lims)
 
     update_bot, frames, _ = setup_baseline_panel(
-        bot, baselines, steps_per_knot=spk, **panel)
-    update_top, _, _ = setup_smc_panel(top, smc, spk, **panel)
-    bot.set_title("MPC Baselines", fontsize=12)
-    top.set_title("SMC", fontsize=12)
+        bot, baselines, steps_per_knot=spk, linestyle=':', **panel)
+    update_top, _, _ = setup_baseline_panel(
+        top, resampled, steps_per_knot=spk, linestyle='-', **panel)
+    bot.set_title(r"SIS ($\rho = 0$)", fontsize=12)
+    top.set_title(rf"SIS/R ($\rho = {rho:g}$)", fontsize=12)
 
     update_bot(frames - 1)          # the still is the converged frame
     update_top(frames - 1)
@@ -536,6 +586,8 @@ def main():
     ap.add_argument("--seeds", type=int, nargs="+", help="push_tee: scenario seeds")
     ap.add_argument("--dataset", help="mbm: dataset dir")
     ap.add_argument("--num-outer", type=int, help="drive: outer iterations")
+    ap.add_argument("--particles", type=int,
+                    help="drive: particle count (default drive_2d.PARTICLES)")
     ap.add_argument("--out", help="output stem (no extension)")
     ap.add_argument("--output-dir")
     args = ap.parse_args()

@@ -2,28 +2,23 @@
 # scales with the knot count, so difficulty and plan length grow together.
 task: drive
 num: 128           # maps
-num_knots: 20
+num_knots: 18
 num_samples: 1024
-seed: 123
+seed: 12
 tuned_params: experiments/checkpoints/drive_tune.json
-# Update x resampling: each update at rho = 0, 0.1, 0.2.
-algorithms: [sis, sis+r0.1, sis+r0.2, mppi, mppi+r0.1, mppi+r0.2,
-             cem, cem+r0.1, cem+r0.2]
+algorithms: [ps, ps+r0.2, mppi, mppi+r0.2, cem, cem+r0.2]
 
-# Knot count and arena length grow together, so this is a horizon sweep.
 sweep:
   name: drive_fig
   key: num_knots
   values:
   - 5
   - 8
-  - 10
-  - 14
+  - 12
   - 18
-  - 22
-  - 30
+  - 28
   xlabel: Planning horizon (knots)
-  facet: update
+  facet: none
   panels:
   - metric: collided
     kind: rate
@@ -31,6 +26,3 @@ sweep:
   - metric: goal_dist
     kind: cost
     ylabel: Distance to goal (median)
-
-# What the tuner optimises. Drive has no success threshold, so it minimises the
-# cost it is already scored on; median because the cost distribution is heavy

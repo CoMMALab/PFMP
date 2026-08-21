@@ -166,6 +166,9 @@ class PFMP(NamedTuple):
         steps_per_knot = int(step_len / self.dt)
         t1 = t0 + step_len
 
+        # Note: interp beyond linear is currently unused,
+        # was used in early experiments before we realized
+        # linear is generally more stable for inference.
         if isinstance(u0, (Jet1, jax.Array)):
             nout = 1
         elif isinstance(u0, Jet2):
