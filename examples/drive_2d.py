@@ -123,7 +123,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--save", action="store_true",
                         help="Save animation as GIF instead of displaying")
-    parser.add_argument("--knots", type=int, default=5,
+    parser.add_argument("--knots", type=int, default=20,
                         help="Number of knots (default: 20)")
     parser.add_argument("--particles", type=int, default=32768,
                         help="Number of particles (default: 32768)")
