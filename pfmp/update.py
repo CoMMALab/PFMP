@@ -1,13 +1,11 @@
-"""Update rules (U) and the annealing/degeneracy helpers they share.
+""" Update Rules
 
 Every update rule is  update(theta, trajs, costs, *hyperparams) -> (theta, aux)
 with the SAME convention:
     trajs : PyTree, each leaf (P, K, ...)   particles × knots × action
     costs : (P, K)                          per-knot cost, particle-major
-Reducing the knot axis (summing to a total return) is each rule's own job, so
-call sites just pass what run_sir/run_sis return — no transpose, no pre-sum.
 
-This is the "outer loop" axis of the proposal x resampling x update
+This is the "outer loop"/update axis of the proposal x resampling x update
 decomposition: these functions only ever read a completed batch of rollouts,
 never the PFMP sampler that produced them (see algorithm.py for that half).
 """
@@ -27,21 +25,14 @@ def ess(costs: jax.Array) -> jax.Array:
     """
     total = jnp.sum(costs, axis=1) if costs.ndim == 2 else costs
     n = total.shape[0]
-    # Deliberately NOT guarded against an all-non-finite cloud: the result is
-    # NaN, which is correct. Substituting uniform weights would report ESS = 1.0
-    # (maximum diversity) for a population carrying no information, and since
-    # that case coincides with total failure, the mean ESS would then track the
-    # failure rate rather than the concentration. `mppi_update` still guards, so
-    # the *plan* stays finite; only the diagnostic is allowed to be missing.
     ws = jnp.exp(-(total - jnp.min(total)))
     ps = ws / jnp.sum(ws)
     return (1.0 / jnp.sum(ps ** 2)) / n
 
 
 def _check_update_shapes(trajs, costs):
-    """Runtime contract shared by all update rules: costs (P, K), trajs leaves
-    (P, K, ...). Shapes are static under jit/vmap, so this fails at trace time on
-    a mismatched call instead of silently reducing the wrong axis."""
+    """Runtime verification shared by all update rules: costs (P, K), trajs with leaf shape
+    (P, K, ...). Shapes are static under jit/vmap."""
     assert costs.ndim == 2, f"costs must be (P, K); got {costs.shape}"
     P, K = costs.shape
     for u in jax.tree.leaves(trajs):
@@ -57,12 +48,7 @@ def ps_update(theta: PyTree, trajs: PyTree, costs: jax.Array, *_):
     return theta._replace(mean=new_mean), costs[best]     # (K,) costs of the chosen traj
 
 
-# Posterior sampling: draw one trajectory from the weighted particle set rather
-# than summarising it. This is the update used by Piché et al. (2018) — the
-# particle set approximates the controlled posterior, so sampling from it returns
-# a control distributed according to that posterior instead of its MAP
-# (`ps_update`) or its mean (`mppi_update`). Needs a key, passed as the first
-# hyperparameter, so it keeps the shared update signature.
+# Posterior sampling: draw one trajectory from the weighted particle set.
 def sample_update(theta: PyTree, trajs: PyTree, costs: jax.Array,
                   key: PRNGKeyArray, temperature: float = 1.0):
     _check_update_shapes(trajs, costs)
@@ -74,26 +60,17 @@ def sample_update(theta: PyTree, trajs: PyTree, costs: jax.Array,
 
 
 # Model Predictive Path Integral: softmax over trajectories by TOTAL return, one
-# weight per trajectory applied to every knot. Stable softmax (shift by the min
-# total) so exp() cannot underflow to all-zeros -> 0/0 = NaN.
+# weight per trajectory applied to every knot.
 def mppi_update(theta: PyTree, trajs: PyTree, costs: jax.Array,
                 temperature: float = 1.0):
     _check_update_shapes(trajs, costs)
     total = jnp.sum(costs, axis=1)                        # (P,) total return
-    # If EVERY particle is non-finite (all collided) the shift below is
-    # inf - inf = NaN, which poisons the mean, and the NaN plan then rolls out
-    # to a NaN path where `sdf < 0` is False -- so a total failure gets recorded
-    # as "did not collide". Fall back to uniform weights: no particle carries
-    # information, so every one counts equally and the new mean is the average
-    # of the sampled trajectories (approximately the current plan, since the
-    # proposal is centred on it).
+    # Uniform weights if all particles are NaN
     total = jnp.where(jnp.any(jnp.isfinite(total)), total, 0.0)
     total = total - jnp.min(total)
     weights = jnp.exp(-total / temperature)
     weights = weights / jnp.sum(weights)                  # (P,) one weight per trajectory
-    # Contract the particle axis, whatever the leaf's rank. A scalar action space
-    # gives (P, K) leaves, where a hardcoded weights[:, None, None] would silently
-    # broadcast to (P, P, K) instead of erroring.
+    # Contract the particle axis, whatever the leaf's rank.
     new_mean = jax.tree.map(lambda u: jnp.tensordot(weights, u, axes=1), trajs)
     return theta._replace(mean=new_mean), weights
 
@@ -116,36 +93,24 @@ def cem_update(theta: PyTree, trajs: PyTree, costs: jax.Array,
 
 # DIAL-MPC comes in two pieces. `dial_update` is a normal update rule and obeys
 # the convention above. `dial_step` is not: it owns an outer optimizing loop that
-# calls the SAMPLER itself rather than just consuming a single batch, which
-# is DIAL's whole mechanism. N annealing levels, each sampling at a shrinking
-# PER-KNOT sigma (`dial_sigma`) around the current mean. Per-knot, not averaged
-# across knots: DIAL anneals wider->narrower across annealing levels AND across
-# the horizon (canonical dial-mpc's sigma_control is a per-knot vector);
-# averaging collapses the second (action-level) half of that dual-loop schedule.
+# calls the sampler itself rather than just consuming a single batch.
+# DIAL's mechanism is N annealing levels, each sampling at a shrinking
+# per-knot sigma (`dial_sigma`) around the current mean.
 def dial_sigma(i: int, h: int, sigma_max: float, N: int, H: int,
                beta1: float, beta2: float) -> float:
-    """DIAL-MPC annealing schedule (matches Hydrax `DIAL.sample_knots`):
-    σ_{i,h} = σ_max · exp(−(N−i)/(β₁N) − (H−1−h)/(β₂H)). The (H−1−h) term (not
-    H−h) is what lets the terminal knot sample at the full σ_max, exp(0)."""
+    """DIAL-MPC annealing schedule (matches Hydrax `DIAL.sample_knots`)"""
     return sigma_max * math.exp(-(N - i) / (beta1 * N) - (H - 1 - h) / (beta2 * H))
 
 # one annealing step
 def dial_update(theta: PyTree, trajs: PyTree, costs: jax.Array,
                 temp_sample: float = 1.0):
     """DIAL's update: MPPI whose temperature is the spread of the returns.
-
-    This is the only thing separating DIAL's update from plain MPPI. Setting
-    the temperature from `std(returns)` makes it adaptive, so one `temp_sample`
-    transfers across tasks and cost scales where a fixed lambda would not.
-    (Hydrax's DIAL omits this and uses a fixed lambda; the original does not.)
-
+    This is the only thing separating DIAL's update from plain MPPI.
     temp_sample: scales that temperature. Lower is more peaked. Reference
-        default is 0.06 as opposed to our 1.0.
+        default is 0.06, we set to 1.0 for simplicity.
     """
     total = jnp.sum(costs, axis=1)
-    # Drop non-finite returns (infinite collision cost) from the std, else one
-    # collided particle makes the temperature NaN and poisons the update. They
-    # still get zero weight inside mppi_update, as they should.
+    # Zero out non-finite returns (infinite collision cost) from the std.
     temp = jnp.maximum(
         jnp.std(jnp.where(jnp.isfinite(total), total, 0.0)) * temp_sample, 1e-6)
     return mppi_update(theta, trajs, costs, temp)
