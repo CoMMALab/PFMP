@@ -47,8 +47,7 @@ def method_decomp(method: str) -> Tuple[ProposalType, UpdateType, Optional[float
         "sis" -> ("informed", "argmin", 0.0)    "mppi+r0.25" -> (..., 0.25)
         "cem+r" -> (..., None)                  "sir", "pfmp" -> "sis+r"
 
-    A bare `+r` means "whatever ess_thresh resolves to", returned as None for
-    the caller; no suffix is rho = 0 (never resample).
+    A bare `+r` means returns `rho = None`.
     """
     base, sep, val = method.partition("+r")
     if base in ("sir", "pfmp"):            # legacy aliases for sis + resampling

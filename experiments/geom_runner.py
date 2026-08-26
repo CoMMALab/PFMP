@@ -50,9 +50,8 @@ class GeomTask(NamedTuple):
     horizon: float
     num_knots: int
     dt: float
-    # The object-informed proposal, if the task has one. Optional: drive
-    # has no second proposal to contrast against, so its SMC methods fall back
-    # to the shared perturbation and differ from the baselines only in resampling
+    # The optional object-informed proposal, if the task has one.
+    # Otherwise fall back to shared perturbation.
     custom_init: Callable = None      # (key, x, theta) -> u
     custom_proposal: Callable = None  # (key, x, u, theta, t) -> u
     clip_action: Callable = None      # (u, theta) -> u   bounds for the shared
@@ -67,8 +66,7 @@ class GeomTask(NamedTuple):
                                   #   and could disagree with it.
 
 
-# Which proposal / update / resampling each algorithm name selects. This IS the
-# decomposition: everything else in this file is plumbing.
+# Which proposal / update / resampling each algorithm name selects.
 ALGORITHMS = tuple(METHOD_ALIASES)   # each may take a "+r[rho]" suffix
 
 def apply_hp(theta, hp: dict):
@@ -77,11 +75,10 @@ def apply_hp(theta, hp: dict):
                              if k in theta._fields})
 
 
-ESS_THRESH_DEFAULT = 0.5      # pinned for every task; a bare `+r` resolves here
+ESS_THRESH_DEFAULT = PFMP._field_defaults["ess_resample_thresh"]
 
 
-def build_controller(task: GeomTask, algorithm: str, particles: int,
-                     ess_thresh: float = ESS_THRESH_DEFAULT) -> PFMP:
+def build_controller(task: GeomTask, algorithm: str, particles: int) -> PFMP:
     proposal, _, rho = method_decomp(algorithm)
     perturb = make_perturbation(task.clip_action)
     # A task with no q of its own collapses the proposal axis to gaussian, so on
@@ -89,10 +86,15 @@ def build_controller(task: GeomTask, algorithm: str, particles: int,
     init, prop = ((task.custom_init, task.custom_proposal)
                   if proposal == "informed" and task.custom_proposal is not None
                   else perturb)
-    return PFMP(task.dynamics, task.running_cost, task.terminal_cost, init, prop,
-                horizon=task.horizon, num_knots=task.num_knots, particles=particles,
-                ess_resample_thresh=ess_thresh if rho is None else rho,
-                dt=task.dt)
+    if rho is not None:
+        return PFMP(task.dynamics, task.running_cost, task.terminal_cost, init, prop,
+                    horizon=task.horizon, num_knots=task.num_knots, particles=particles,
+                    ess_resample_thresh=rho,
+                    dt=task.dt)
+    else:  # use default ess_resample_thresh
+        return PFMP(task.dynamics, task.running_cost, task.terminal_cost, init, prop,
+                    horizon=task.horizon, num_knots=task.num_knots, particles=particles,
+                    dt=task.dt)
 
 
 def _elite_count(hp: dict, particles: int) -> int:
@@ -549,25 +551,17 @@ def run_sweep(config, key, values, algorithms, cache_path):
     """
     import json
     cache_path = Path(cache_path)
-    # The cache is self-describing: it stores the axis and the method list
-    # beside the results, so plotting needs the results file and nothing else.
     blob = json.loads(cache_path.read_text()) if cache_path.exists() else {}
     results = blob.get("results", {})
     axis = dict(config.get("sweep") or {}, key=key, values=values)
     axis.setdefault("name", f"{config['task']}_{key}_fig")
 
-    # A cell is only reusable if it carries every metric the config now asks
-    # for. Without this, adding a metric to `measure` would leave old cells in
-    # place and silently plot a figure that is missing series.
     wanted = {p["metric"] for p in (axis.get("panels") or [])}
     wanted |= {axis["metric"]} if axis.get("metric") else set()
 
     def fresh(cell):
         return wanted <= set(cell)
 
-    # The resolved hyperparameters travel with the results: a label like
-    # "PS (rho=0.5)" has to state the value actually used, not a constant
-    # retyped in the plotting code.
     used_hp = {}
 
     code = code_hash()
@@ -588,19 +582,21 @@ def run_sweep(config, key, values, algorithms, cache_path):
         ev = tuned = None
 
         for alg in algorithms:
-            if alg in results[vkey] and fresh(results[vkey][alg]):
+            cached = alg in results[vkey] and fresh(results[vkey][alg])
+            if tuned is None:
+                tuned = load_tuned(cfg.get("tuned_params"), algorithms)
+            hp = dict(cfg.get("hyperparams", {}))
+            hp.update(tuned.get(alg, {}))
+            used_hp[alg] = {k: v for k, v in hp.items()
+                            if isinstance(v, (int, float, bool))}
+            *_, rho = method_decomp(alg)
+            used_hp[alg]["ess_thresh"] = ESS_THRESH_DEFAULT if rho is None else rho
+            if cached:
                 print(f"  {key}={vkey} {alg:12s} cached")
                 continue
             if ev is None:                       # build lazily, once per value
                 ev = Evaluator(cfg)
-                tuned = load_tuned(cfg.get("tuned_params"), algorithms)
-            hp = dict(cfg.get("hyperparams", {}))
-            hp.update(tuned.get(alg, {}))
             res = ev(alg, tuned.get(alg, {}))
-            used_hp[alg] = {k: v for k, v in hp.items()
-                            if isinstance(v, (int, float, bool))}
-            *_, rho = method_decomp(alg)
-            used_hp[alg]["ess_thresh"] = 0.5 if rho is None else rho
             results[vkey][alg] = {k: np.asarray(v).tolist() for k, v in res.items()}
             print(f"  {key}={vkey} {alg:12s} " + _summarise(res))
             flush()

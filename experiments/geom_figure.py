@@ -138,8 +138,7 @@ def precompute_via_runner(task, algorithm, x0, theta, n_outer, particles,
     open-loop (no execute/shift), so the loop is just repeated refinement of
     `theta.mean` from the same x0 -- exactly what the sweep does.
     """
-    ctrl = build_controller(task, algorithm, particles,
-                            ess_thresh=ess_thresh)._replace(
+    ctrl = build_controller(task, algorithm, particles)._replace(
         ess_resample_thresh=ess_thresh)
     replan = make_replan(ctrl, algorithm, hp or {}, particles, return_trajs=True)
     tq = jnp.linspace(0, ctrl.horizon, round(ctrl.horizon / ctrl.dt))
@@ -414,7 +413,7 @@ PUSH_TEE_SEED = 42            # push_tee_2d.SEED
 PUSH_TEE_PARTICLES = 2048     # push_tee_2d.PARTICLES
 
 def _make_trace_figure(seeds, distance, n_obs=None, particles=None):
-    """2×2 grid of scenarios; each panel overlays PS (red) and PFMP (green) traces."""
+    """2×2 grid of scenarios; each panel overlays PS (red) and SIS (green) traces."""
     from matplotlib.patches import Polygon
     import matplotlib.patches as mpatches
     import push_tee_2d as pt
@@ -456,7 +455,7 @@ def _make_trace_figure(seeds, distance, n_obs=None, particles=None):
                     facecolor='dimgray', edgecolor='black', linewidth=1.2, zorder=3))
 
         key_ps, key_pfmp = jax.random.split(jax.random.key(seed))
-        for method, color, key in [('ps', '#E74C3C', key_ps), ('pfmp', '#27AE60', key_pfmp)]:
+        for method, color, key in [('ps', '#E74C3C', key_ps), ('sis', '#27AE60', key_pfmp)]:
             states, _ = pt.simulate(method, x0, theta, key, particles, n_replans)
             draw_tee_trace(ax, states, color)
 
@@ -503,8 +502,7 @@ def figure_mbm(config, args, output_dir):
     cfg = dict(config, datasets=[dataset], num=args.problem + 1,
                seed=config.get("seed", 0))
     task, group = load_task("mbm", cfg)
-    ctrl = build_controller(task, "sir", int(config.get("num_samples", 1000)),
-                            ess_thresh=0.5)
+    ctrl = build_controller(task, "sir", int(config.get("num_samples", 1000)))
     x0, theta = task.sample_problem(args.problem)
     theta = task.warm_start(x0, theta)   # as geom_runner does, so mean has a shape
 

@@ -1,9 +1,5 @@
 """Figures for the sweeps in `geom_runner.py`.
 
-Takes a results path and nothing else: the runner stores the axis, the method
-list and the hyperparameters beside the raw values, so a figure can never be
-labelled by a config that changed after the run.
-
     python experiments/geom_runner.py  experiments/configs/push_tee.yaml out/push_tee
     python experiments/geom_analyze.py out/push_tee
 """
@@ -12,15 +8,12 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import NamedTuple
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
-sys.path.insert(0, str(Path(__file__).parent))
-
 
 
 from pfmp import method_decomp
@@ -28,13 +21,7 @@ from geom_runner import ESS_THRESH_DEFAULT
 
 OUTPUT_DIR = Path(__file__).parent.parent / "figures"
 
-# Shared with push_tee_2d_sweep so figures stay comparable across the paper. Solid
-# + heavy = has an object-informed proposal; dashed + light = does not.
 LABELS = {
-    # SIS/SIR are the same update (argmin) at two resampling thresholds, so
-    # they are labelled by rho rather than by two names; `label_for` fills the
-    # value in from the run. `ps` is that same algorithm on a task with no
-    # custom proposal.
     "sis": "PS", "ps": "PS", "sir": "PS",
     "biased_mppi": "Biased-MPPI", "mppi": "MPPI",
     "biased_cem": "Biased-CEM", "cem": "CEM",
@@ -45,7 +32,7 @@ COLORS = {
     "sir": "#1E8449",                    # green: resampling
     "biased_mppi": "#21618C", "mppi": "#85C1E9",
     "biased_cem": "#B9770E", "cem": "#F8C471",
-    "sis_sample": "#52BE80", "dial": "#9B59B6",
+    "sis_sample": "#52BE80", "dial": "#4A235A",
 }
 def label_for(alg, hyperparams, style="rho"):
     """Method label stating the rho it actually ran at."""
@@ -83,8 +70,8 @@ AXIS_LABEL = {
 # `pfmp.method_decomp` is the single decoder; these only name the levels.
 UPDATE_LABEL = {"argmin": "PS", "sample": "sample", "mean": "MPPI",
                 "topk": "CEM", "diffuse": "DIAL-MPC"}
-PROPOSAL_LABEL = {"informed": "object-informed", "gaussian": "Gaussian",
-                  "learned": "learned"}
+PROPOSAL_LABEL = {"informed": "Programmable", "gaussian": "Gaussian",
+                  "learned": "Learned"}
 
 
 def proposal_of(alg):
@@ -142,33 +129,36 @@ AXIS_COLORS = {
     ("informed", "mean"):    "#21618C",   # Biased-MPPI  deep blue
     ("gaussian", "topk"):    "#E67E22",   # CEM          amber (= UPDATE_COLORS)
     ("informed", "topk"):    "#B9770E",   # Biased-CEM   deep amber
-    ("gaussian", "diffuse"): "#9B59B6",   # DIAL-MPC     purple
+    ("gaussian", "diffuse"): "#4A235A",   # DIAL-MPC     purple
     ("informed", "sample"):  "#52BE80",   # SIS-sample   light green
     ("learned",  "sample"):  "#7F8C8D",   # Piche        grey
     ("learned",  "argmin"):  "#95A5A6",
 }
 
-PROPOSAL_HATCH = {"gaussian": "///", "informed": "", "learned": "..."}
-
-# Bar charts encode the two axes separately: hue is the update, hatch is the
-# proposal. Line charts cannot -- they have only hue and dash -- so they keep
-# the (proposal, update) palette above.
 UPDATE_COLORS = {"argmin": "#1E8449", "mean": "#2E86C1", "topk": "#E67E22",
-                 "diffuse": "#9B59B6", "sample": "#7F8C8D"}
-# The resampling variant gets its own brighter shade of the same hue: it is a
-# different point on the rho axis, not a different update.
-RESAMPLE_COLORS = {"argmin": "#2ECC71", "mean": "#5DADE2", "topk": "#F5B041"}
+                 "diffuse": "#4A235A", "sample": "#7F8C8D"}
+
+BAR_FILL = {
+    ("gaussian", False): ("///", "Gaussian"),
+    ("informed", False): ("",    "Programmable"),
+    ("informed", True):  (".",   "Programmable + Resampling"),
+}
 
 
-def _bar_key(alg):
-    """(update, resampling?) -- the two things a bar's colour encodes."""
-    _, update, rho = method_decomp(alg)
-    return update, (rho is None or rho > 0)
+def _bar_colour_for(update):
+    return UPDATE_COLORS.get(update, "gray")
 
 
-def _bar_colour_for(update, resampling):
-    table = RESAMPLE_COLORS if resampling else UPDATE_COLORS
-    return table.get(update, UPDATE_COLORS.get(update, "gray"))
+def _bar_fill(alg):
+    """(hatch, label) for the merged proposal/rho channel. See `BAR_FILL`."""
+    proposal, _, rho = method_decomp(alg)
+    resampling = rho is None or rho > 0
+    if (proposal, resampling) not in BAR_FILL:
+        raise ValueError(
+            f"{alg}: no bar fill for {(proposal, resampling)}. The fill "
+            "collapses proposal and rho into one ladder, which only works "
+            "while no Gaussian method resamples; give it its own channel.")
+    return BAR_FILL[(proposal, resampling)]
 
 
 def _line_marker(alg):
@@ -187,15 +177,13 @@ def _line_marker(alg):
 
 def _bar_colour(alg):
     try:
-        update, resampling = _bar_key(alg)
+        return UPDATE_COLORS.get(method_decomp(alg)[1], "gray")
     except ValueError:
         return "gray"
-    table = RESAMPLE_COLORS if resampling else UPDATE_COLORS
-    return table.get(update, UPDATE_COLORS.get(update, "gray"))
 
 
 def _hatch(alg):
-    return PROPOSAL_HATCH.get(method_decomp(alg)[0], "")
+    return _bar_fill(alg)[0]
 
 
 def _colour(key):
@@ -234,21 +222,13 @@ class Sweep(NamedTuple):
 
 
 def load_sweep(blk):
-    """Build the Sweep from the axis the cache stored beside its results.
-
-    `panels` is the general form; a bare metric/kind/ylabel is read as a single
-    panel so a one-plot sweep needs no extra nesting in the yaml.
-    """
+    """Build the Sweep from the axis the cache stored beside its results."""
     panels = blk.get("panels") or [{"metric": blk.get("metric", "success"),
                                     "kind": blk.get("kind", "rate"),
                                     "ylabel": blk.get("ylabel", "")}]
     return Sweep(key=blk["key"], values=blk["values"], xticks=blk.get("xticks"),
                  xlabel=blk.get("xlabel", blk["key"]), panels=panels,
                  xscale=blk.get("xscale", "linear"),
-                 # `facet: none` in yaml parses as the string "none", not None
-                 # (YAML nulls are null/~/Null/NULL). Normalise here so every
-                 # `facet is None` check downstream is right -- the legend keys
-                 # off it to decide whether column titles already carry the hue.
                  facet=(None if blk.get("facet") in (None, "none", "None")
                         else blk["facet"]),
                  style=blk.get("style", "rho"),
@@ -325,9 +305,6 @@ def _draw_panel(ax, data, algorithms, sweep, panel, categorical, legend, hp,
         width = 0.8 / len(algorithms)
         for i, alg in enumerate(algorithms):
             _, c, lo, hi = data[alg]
-            # Clamp at zero: Wilson's bound at k == n is exactly the point
-            # estimate in exact arithmetic but ~1e-14 below it in floating
-            # point, and matplotlib rejects a negative yerr outright.
             ax.bar(idx + i * width - 0.4 + width / 2, c, width * 0.92,
                    color=_bar_colour(alg), label="_nolegend_",
                    hatch=_hatch(alg), edgecolor="white", linewidth=0.0,
@@ -337,16 +314,9 @@ def _draw_panel(ax, data, algorithms, sweep, panel, categorical, legend, hp,
         ax.set_xticks(idx)
         ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=11)
     else:
-        # `style_algs` is the union across a combined figure; without it a
-        # panel whose sweep happens to omit a method would assign that method's
-        # line style to someone else.
         _, styles = encodings(style_algs or algorithms, hp, sweep.style)
         for alg in algorithms:
             x, c, lo, hi = data[alg]
-            # Three channels for three axes, matching the plan figure's use of
-            # dash for rho: hue = update (+R in the brighter shade, so rho is
-            # redundantly encoded and the +R series pops), dash = rho,
-            # marker fill = proposal.
             _, skey = _axes_of(alg, hp, sweep.style)
             col = _bar_colour(alg)
             mk, mfc = _line_marker(alg)
@@ -359,8 +329,6 @@ def _draw_panel(ax, data, algorithms, sweep, panel, categorical, legend, hp,
                     zorder=4, label="_nolegend_")
         xs = data[algorithms[0]][0]
         if sweep.xscale == "log":
-            # Geometric sweeps (particle counts) squash against the origin on a
-            # linear axis; tick only at the values actually run.
             ax.set_xscale("log")
             ax.set_xticks(xs)
             ax.set_xticklabels([f"{x:g}" for x in xs])
@@ -379,12 +347,6 @@ def _draw_panel(ax, data, algorithms, sweep, panel, categorical, legend, hp,
 
 
 def _legend_rows(fig, rows):
-    """One legend box whose rows are the channel groups.
-
-    matplotlib fills a legend column-major, so handing it the rows in order
-    would interleave them. Pad each row to the widest, then transpose, so a
-    column-major fill lands the groups on the lines we asked for.
-    """
     from matplotlib.lines import Line2D
 
     rows = [r for r in rows if r]
@@ -400,11 +362,6 @@ def _legend_rows(fig, rows):
 
 
 def _split_legend(fig, algorithms, hp, faceted, style="rho"):
-    """Legend strip above the grid: hue = update, line style = rho.
-
-    Outside the axes because `loc="best"` lands on a curve in a full panel.
-    Faceted plots drop the hue key -- the column titles already carry it.
-    """
     from matplotlib.lines import Line2D
 
     _, styles = encodings(algorithms, hp, style)
@@ -412,54 +369,46 @@ def _split_legend(fig, algorithms, hp, faceted, style="rho"):
            else (lambda k: rf"$\rho$ = {k:.3g}"))
     handles, proposal_handles = [], []
     if not faceted:
-        # hue = update (+R gets its own shade), marker fill = proposal
         keys = []
         for a in algorithms:
-            k = _bar_key(a)
-            if k not in keys:
-                keys.append(k)
-        handles = [Line2D([], [], color=_bar_colour_for(u, r), lw=2.2,
-                          label=UPDATE_LABEL.get(u, u) + ("+R" if r else ""))
-                   for u, r in keys]
-        proposal_handles = [
-            Line2D([], [], color="0.35", lw=0, marker="o", markersize=6,
-                   markerfacecolor="0.35", label="Biased"),
-            Line2D([], [], color="0.35", lw=0, marker="o", markersize=6,
-                   markerfacecolor="white", markeredgewidth=1.4,
-                   label="Unbiased")]
+            u = method_decomp(a)[1]
+            if u not in keys:
+                keys.append(u)
+        handles = [Line2D([], [], color=_bar_colour_for(u), lw=2.2,
+                          label=UPDATE_LABEL.get(u, u)) for u in keys]
+        if len({proposal_of(a)[1] for a in algorithms}) > 1:
+            proposal_handles = [
+                Line2D([], [], color="0.35", lw=0, marker="o", markersize=6,
+                       markerfacecolor="0.35", label="Programmable"),
+                Line2D([], [], color="0.35", lw=0, marker="o", markersize=6,
+                       markerfacecolor="white", markeredgewidth=1.4,
+                       label="Gaussian")]
     rho_handles = [Line2D([], [], color="0.35", lw=2.0, linestyle=st, label=fmt(k))
                    for k, st in styles.items()]
     _legend_rows(fig, [handles, proposal_handles + rho_handles])
 
 
 def _bar_legend(fig, algorithms, hp):
-    """One entry per method: hue is the update, hatch the proposal, so neither
-    channel identifies a bar on its own."""
     from matplotlib.patches import Patch
 
-    keys = []
+    updates, fills = [], []
     for a in algorithms:
-        k = _bar_key(a)
-        if k not in keys:
-            keys.append(k)
-    handles = [Patch(facecolor=_bar_colour_for(u, r), edgecolor="white",
-                     label=UPDATE_LABEL.get(u, u) + ("+R" if r else ""))
-               for u, r in keys]
-    # "Biased"/"Unbiased" rather than "proposal": it matches the method names
-    # (Biased-MPPI, Biased-CEM), so a solid MPPI bar reads as Biased-MPPI
-    # without the reader translating. Pezzato et al. call the same thing an
-    # ancillary controller.
-    handles += [Patch(facecolor="0.55", edgecolor="white", label="Biased"),
-                Patch(facecolor="0.55", hatch=PROPOSAL_HATCH["gaussian"],
-                      edgecolor="white", label="Unbiased")]
-    _legend_rows(fig, [handles[:-2], handles[-2:]])
+        u = method_decomp(a)[1]
+        if u not in updates:
+            updates.append(u)
+        hatch, label = _bar_fill(a)
+        if (hatch, label) not in fills:
+            fills.append((hatch, label))
+
+    hue_row = [Patch(facecolor=_bar_colour_for(u), edgecolor="white",
+                     label=UPDATE_LABEL.get(u, u)) for u in updates]
+    order = [lab for _, lab in BAR_FILL.values()]
+    fill_row = [Patch(facecolor="0.55", hatch=h, edgecolor="white", label=lab)
+                for h, lab in sorted(fills, key=lambda hl: order.index(hl[1]))]
+    _legend_rows(fig, [hue_row, fill_row])
 
 
 def make_figure(results, sweep, algorithms, output_dir=OUTPUT_DIR, hp=None):
-    """Rows are metrics; columns are facets. Faceting by update rule keeps each
-    cell to one hue and a few markers: nine series with nine confidence bands in
-    one axes is unreadable, and curves that coincide (SIS under MPPI, on a task
-    where they are the same algorithm) vanish entirely."""
     import matplotlib.pyplot as plt
 
     if sweep.facet == "update":
@@ -474,21 +423,13 @@ def make_figure(results, sweep, algorithms, output_dir=OUTPUT_DIR, hp=None):
                    sweep.panels[0]["kind"])
     categorical = isinstance(next(iter(probe.values()))[0][0], str)
     nrow, ncol = len(sweep.panels), len(groups)
-    # Nothing to facet, several metrics: lay the panels out as columns. They
-    # share an x axis and differ only in the metric, so stacking them halves
-    # the width each one gets and the figure has to be shrunk to fit a page.
     side_by_side = ncol == 1 and nrow > 1
     if side_by_side:
         nrow, ncol = 1, len(sweep.panels)
 
     fig, axes = plt.subplots(nrow, ncol, squeeze=False, sharex=True,
-                             # never share y across side-by-side panels: the
-                             # columns are different metrics on different scales
                              sharey=False if side_by_side
                                     else ("row" if ncol > 1 else False),
-                             # side-by-side panels get a wider aspect: two
-                             # square panels make a figure too tall to place
-                             # without shrinking it back down again
                              figsize=((6.5 if categorical else
                                        (3.6 if side_by_side else 4.2)) * ncol,
                                       (3.1 if side_by_side else 4.2) * nrow))
@@ -534,14 +475,6 @@ def print_table(results, sweep, algorithms, hp=None):
 
 
 def make_combined_figure(blobs, output_dir, name):
-    """One figure, one panel per sweep, under a single shared legend.
-
-    The push-T result is two views of one comparison -- success against obstacle
-    count and against particle budget. As separate figures they repeat the
-    legend and the y axis, and each has to be scaled to half a text width to sit
-    beside the other, which is what makes the axis text unreadable. Drawn
-    together, each panel keeps a full panel's width.
-    """
     import matplotlib.pyplot as plt
 
     sweeps = [load_sweep(dict(b["sweep"])) for b in blobs]

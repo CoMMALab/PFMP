@@ -4,7 +4,7 @@ task: drive
 num: 128           # maps
 num_knots: 18
 num_samples: 1024
-seed: 12
+seed: 34
 tuned_params: experiments/checkpoints/drive_tune.json
 algorithms: [ps, ps+r0.2, mppi, mppi+r0.2, cem, cem+r0.2]
 

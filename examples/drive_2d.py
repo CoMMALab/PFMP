@@ -93,7 +93,7 @@ def make_theta(num_knots: int, horizon: float) -> tuple[jax.Array, Params]:
 # Animation
 # =============================================================================
 
-def animate(num_knots: int = 20, particles: int = 32768, save_gif: bool = False,
+def animate(num_knots: int = 20, particles: int = 1024, save_gif: bool = False,
             smooth: bool = False, stride: int = 3):
     horizon = num_knots * 0.5
     init, proposal = make_perturbation(clip_action)
@@ -125,8 +125,8 @@ if __name__ == "__main__":
                         help="Save animation as GIF instead of displaying")
     parser.add_argument("--knots", type=int, default=20,
                         help="Number of knots (default: 20)")
-    parser.add_argument("--particles", type=int, default=32768,
-                        help="Number of particles (default: 32768)")
+    parser.add_argument("--particles", type=int, default=1024,
+                        help="Number of particles (default: 1024)")
     parser.add_argument("--smooth", action="store_true",
                         help="Smooth car interpolation between knots")
     args = parser.parse_args()
