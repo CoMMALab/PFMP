@@ -1,0 +1,145 @@
+{
+  "sis": {
+    "best_params": {
+      "stdev": 0.079109594125345
+    },
+    "best_value": 0.7971428571428572,
+    "validation_value": 0.82,
+    "trials": 200,
+    "requested_trials": 200,
+    "saturated": false,
+    "objective": {
+      "metric": "success",
+      "minimise": false,
+      "agg": "mean",
+      "ceiling": 1.0,
+      "overrides": {}
+    }
+  },
+  "sir": {
+    "best_params": {
+      "stdev": 0.4930104876432431
+    },
+    "best_value": 0.8742857142857143,
+    "validation_value": 0.8828571428571429,
+    "trials": 200,
+    "requested_trials": 200,
+    "saturated": false,
+    "objective": {
+      "metric": "success",
+      "minimise": false,
+      "agg": "mean",
+      "ceiling": 1.0,
+      "overrides": {}
+    }
+  },
+  "mppi": {
+    "best_params": {
+      "stdev": 0.5947082042596091,
+      "mppi_temperature": 1.7857756504847115
+    },
+    "best_value": 0.3742857142857143,
+    "validation_value": 0.33714285714285713,
+    "trials": 200,
+    "requested_trials": 200,
+    "saturated": false,
+    "objective": {
+      "metric": "success",
+      "minimise": false,
+      "agg": "mean",
+      "ceiling": 1.0,
+      "overrides": {}
+    }
+  },
+  "cem": {
+    "best_params": {
+      "stdev": 0.480774106700821,
+      "cem_num_elites": 5
+    },
+    "best_value": 0.3342857142857143,
+    "validation_value": 0.2857142857142857,
+    "trials": 200,
+    "requested_trials": 200,
+    "saturated": false,
+    "objective": {
+      "metric": "success",
+      "minimise": false,
+      "agg": "mean",
+      "ceiling": 1.0,
+      "overrides": {}
+    }
+  },
+  "biased_mppi": {
+    "best_params": {
+      "stdev": 0.07924274872696599,
+      "mppi_temperature": 0.010001759620172627
+    },
+    "best_value": 0.7971428571428572,
+    "validation_value": 0.8171428571428572,
+    "trials": 200,
+    "requested_trials": 200,
+    "saturated": false,
+    "objective": {
+      "metric": "success",
+      "minimise": false,
+      "agg": "mean",
+      "ceiling": 1.0,
+      "overrides": {}
+    }
+  },
+  "biased_cem": {
+    "best_params": {
+      "stdev": 0.07938776217817223,
+      "cem_num_elites": 1
+    },
+    "best_value": 0.7971428571428572,
+    "validation_value": 0.82,
+    "trials": 200,
+    "requested_trials": 200,
+    "saturated": false,
+    "objective": {
+      "metric": "success",
+      "minimise": false,
+      "agg": "mean",
+      "ceiling": 1.0,
+      "overrides": {}
+    }
+  },
+  "dial": {
+    "best_params": {
+      "stdev": 0.5995214330011498,
+      "dial_temp_sample": 0.015887160973777705,
+      "dial_beta1": 4.510513948403568,
+      "dial_beta2": 0.9005300719293385
+    },
+    "best_value": 0.02,
+    "validation_value": 0.005714285714285714,
+    "trials": 200,
+    "requested_trials": 200,
+    "saturated": false,
+    "objective": {
+      "metric": "success",
+      "minimise": false,
+      "agg": "mean",
+      "ceiling": 1.0,
+      "overrides": {}
+    }
+  },
+  "ps": {
+    "best_params": {
+      "stdev": 0.4527562757629006
+    },
+    "best_value": 0.18,
+    "validation_value": 0.12285714285714286,
+    "trials": 200,
+    "requested_trials": 200,
+    "saturated": false,
+    "objective": {
+      "metric": "success",
+      "minimise": false,
+      "agg": "mean",
+      "ceiling": 1.0,
+      "overrides": {}
+    }
+  }
+}

@@ -106,10 +106,8 @@ python experiments/mjlab/mjlab_cartpole.py --train
 The runner skips `learned` with a warning when no checkpoint is found, so the
 other methods still run. `learned_checkpoint: null` picks the newest run.
 
-## Known gaps
+## Notes
 
-- `mjx_runner.py` lazily imports `pfmp.tasks.pushT` for a PFMP-native push-T
-  task. That module does not exist, so this path is unreachable; the push-T
-  experiments all go through the geom pipeline.
-- `checkpoints/` keeps superseded tuning runs (`*_legacy`, `*_pre_*`) beside the
-  current ones. The configs name the file they use.
+`mjx_runner.py` keeps a `pfmp_native` branch for tasks that carry their own
+dynamics, cost and proposal rather than wrapping a hydrax task. No config uses
+it today; the push-T experiments go through the geom pipeline instead.

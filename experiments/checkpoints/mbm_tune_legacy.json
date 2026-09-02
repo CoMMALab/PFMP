@@ -1,0 +1,44 @@
+{
+  "ps": {
+    "best_params": {
+      "stdev": 0.1358102522433401
+    },
+    "best_value": 0.6,
+    "validation_value": null,
+    "source": "figures/mbm_baseline_tune.json (legacy protocol)"
+  },
+  "mppi": {
+    "best_params": {
+      "mppi_temperature": 0.06483396718810075,
+      "stdev": 0.29952045896713575
+    },
+    "best_value": 0.4714285714285714,
+    "validation_value": null,
+    "source": "figures/mbm_baseline_tune.json (legacy protocol)"
+  },
+  "cem": {
+    "best_params": {
+      "cem_elite_frac": 0.005541800589819367,
+      "stdev": 0.23188930744699154
+    },
+    "best_value": 0.6,
+    "validation_value": null,
+    "source": "figures/mbm_baseline_tune.json (legacy protocol)"
+  },
+  "biased_mppi": {
+    "best_params": {
+      "mppi_temperature": 0.04207988669606638
+    },
+    "best_value": 0.6714285714285714,
+    "validation_value": null,
+    "source": "figures/mbm_baseline_tune.json (legacy protocol)"
+  },
+  "biased_cem": {
+    "best_params": {
+      "cem_elite_frac": 0.005438458543971959
+    },
+    "best_value": 0.5571428571428572,
+    "validation_value": null,
+    "source": "figures/mbm_baseline_tune.json (legacy protocol)"
+  }
+}

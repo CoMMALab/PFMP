@@ -1,0 +1,179 @@
+{
+  "mppi": {
+    "best_params": {
+      "stdev": 0.2352631155364552,
+      "mppi_temperature": 0.01796838539067282
+    },
+    "best_value": 0.53125,
+    "validation_value": 0.4375,
+    "trials": 200,
+    "requested_trials": 200,
+    "saturated": false,
+    "objective": {
+      "metric": "success",
+      "minimise": false,
+      "agg": "mean",
+      "ceiling": 1.0,
+      "overrides": {
+        "distance": 4.0,
+        "num": 128,
+        "num_samples": 256
+      }
+    }
+  },
+  "sis": {
+    "best_params": {
+      "stdev": 0.13004615759204569
+    },
+    "best_value": 1.0,
+    "validation_value": 1.0,
+    "trials": 1,
+    "requested_trials": 200,
+    "saturated": true,
+    "objective": {
+      "metric": "success",
+      "minimise": false,
+      "agg": "mean",
+      "ceiling": 1.0,
+      "overrides": {
+        "distance": 4.0,
+        "num": 128,
+        "num_samples": 256
+      }
+    }
+  },
+  "sir": {
+    "best_params": {
+      "stdev": 0.3711285993073122
+    },
+    "best_value": 1.0,
+    "validation_value": 0.984375,
+    "trials": 2,
+    "requested_trials": 200,
+    "saturated": true,
+    "objective": {
+      "metric": "success",
+      "minimise": false,
+      "agg": "mean",
+      "ceiling": 1.0,
+      "overrides": {
+        "distance": 4.0,
+        "num": 128,
+        "num_samples": 256
+      }
+    }
+  },
+  "cem": {
+    "best_params": {
+      "stdev": 0.24741363377609896,
+      "cem_num_elites": 1,
+      "cem_stdev_floor": 0.06997889067975761
+    },
+    "best_value": 0.59375,
+    "validation_value": 0.5,
+    "trials": 200,
+    "requested_trials": 200,
+    "saturated": false,
+    "objective": {
+      "metric": "success",
+      "minimise": false,
+      "agg": "mean",
+      "ceiling": 1.0,
+      "overrides": {
+        "distance": 4.0,
+        "num": 128,
+        "num_samples": 256
+      }
+    }
+  },
+  "biased_mppi": {
+    "best_params": {
+      "stdev": 0.11021722047012367,
+      "mppi_temperature": 2.525362404921718
+    },
+    "best_value": 1.0,
+    "validation_value": 0.90625,
+    "trials": 16,
+    "requested_trials": 200,
+    "saturated": true,
+    "objective": {
+      "metric": "success",
+      "minimise": false,
+      "agg": "mean",
+      "ceiling": 1.0,
+      "overrides": {
+        "distance": 4.0,
+        "num": 128,
+        "num_samples": 256
+      }
+    }
+  },
+  "biased_cem": {
+    "best_params": {
+      "stdev": 0.03588768018374848,
+      "cem_num_elites": 1,
+      "cem_stdev_floor": 0.020641931231085348
+    },
+    "best_value": 1.0,
+    "validation_value": 0.90625,
+    "trials": 18,
+    "requested_trials": 200,
+    "saturated": true,
+    "objective": {
+      "metric": "success",
+      "minimise": false,
+      "agg": "mean",
+      "ceiling": 1.0,
+      "overrides": {
+        "distance": 4.0,
+        "num": 128,
+        "num_samples": 256
+      }
+    }
+  },
+  "dial": {
+    "best_params": {
+      "stdev": 0.10511896583360347,
+      "dial_temp_sample": 0.010062112269536525,
+      "dial_beta1": 8.092979062854573,
+      "dial_beta2": 4.0334279641779665
+    },
+    "best_value": 0.484375,
+    "validation_value": 0.375,
+    "trials": 200,
+    "requested_trials": 200,
+    "saturated": false,
+    "objective": {
+      "metric": "success",
+      "minimise": false,
+      "agg": "mean",
+      "ceiling": 1.0,
+      "overrides": {
+        "distance": 4.0,
+        "num": 128,
+        "num_samples": 256
+      }
+    }
+  },
+  "ps": {
+    "best_params": {
+      "stdev": 0.3794113150082153
+    },
+    "best_value": 0.5625,
+    "validation_value": 0.40625,
+    "trials": 200,
+    "requested_trials": 200,
+    "saturated": false,
+    "objective": {
+      "metric": "success",
+      "minimise": false,
+      "agg": "mean",
+      "ceiling": 1.0,
+      "overrides": {
+        "distance": 4.0,
+        "num": 128,
+        "num_samples": 256
+      }
+    }
+  }
+}
