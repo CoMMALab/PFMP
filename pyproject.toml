@@ -7,8 +7,7 @@ name = "pfmp"
 version = "0.1.0"
 description = "MPC in Jax"
 authors = [
-    { name = "Austin Garrett", email = "agarrett777@gmail.com" },
-    { name = "Zachary Kingston", email = "zkingston@purdue.edu" },
+    { name = "Anonymous Authors" },
 ]
 dependencies = [
     "jax[cuda12]==0.10",
