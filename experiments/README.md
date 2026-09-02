@@ -1,58 +1,115 @@
 # Experiments
 
-Benchmarking scripts for comparing PFMP against baseline MPC algorithms.
+Two independent pipelines. Both take a YAML config and write a cache that an
+analyzer turns into tables and figures.
 
-## Running an experiment
+| pipeline | scripts | used for |
+|----------|---------|----------|
+| **geom** | `geom_runner.py`, `geom_analyze.py`, `geom_figure.py`, `geom_optuna.py` | 2D navigation, MotionBenchMaker, push-T — the sweep figures |
+| **mjx** | `mjx_runner.py`, `mjx_analyze.py` | MuJoCo non-linear control benchmarks — the cost/time table |
 
-```bash
-python experiments/mjx_runner.py experiments/configs/CartPole.yaml results/CartPole
+They do not share config formats or method vocabularies. Pick by task.
+
+## geom: sweeps over one axis
+
+```shell
+python experiments/geom_runner.py experiments/configs/push_tee.yaml out/push_tee
+python experiments/geom_analyze.py out/push_tee
 ```
 
-`runner.py` takes a YAML config and an output directory.
-It runs each algorithm in `algorithms`, saves per-algorithm trajectories to `<outdir>/<algorithm>.npz`.
+The runner solves every (sweep value, algorithm) cell and caches results to
+`<outdir>/sweep_<key>.json`. Cells are cached individually, so re-running skips
+work already done.
 
-## Analyzing results
+The analyzer prints a table and writes `<name>.pdf`/`.png`. Pass several caches
+with `--name` to draw them as panels of one figure:
 
-```bash
+```shell
+python experiments/geom_analyze.py \
+    out/push_tee/sweep_distance.json out/push_tee/sweep_num_samples.json \
+    --name push_tee_2d_results_fig
+```
+
+`geom_figure.py <task>` draws the qualitative figures instead — particle clouds
+and trajectory traces rather than aggregate curves.
+
+### Methods
+
+Method names are decomposition strings, parsed by `pfmp.method_decomp`:
+
+| name | proposal | update | resampling |
+|------|----------|--------|-----------|
+| `ps` | Gaussian | `argmin` | 0 |
+| `mppi` | Gaussian | `mean` | 0 |
+| `cem` | Gaussian | `topk` | 0 |
+| `dial` | Gaussian | `diffuse` | 0 |
+| `sis` | programmable | `argmin` | 0 |
+| `sir` | programmable | `argmin` | task default |
+| `biased_mppi` | programmable | `mean` | 0 |
+| `biased_cem` | programmable | `topk` | 0 |
+
+Any name takes a `+r` suffix to add resampling — `mppi+r0.5` pins the ESS
+threshold, bare `+r` uses the task's default. That is the only way to set the
+resampling axis; it is not a separate config field.
+
+### Configs
+
+| config | task | sweeps |
+|--------|------|--------|
+| `drive.yaml` | 2D bicycle navigation | planning horizon (knots) |
+| `mbm.yaml` | MotionBenchMaker 7-DoF | dataset (categorical) |
+| `push_tee.yaml` | 2D push-T | arena size, i.e. obstacle count |
+| `push_tee_particles.yaml` | 2D push-T | particle budget |
+
+A config names the task, the methods, the fixed hyperparameters, and one sweep
+axis. `tuned_params` points at a JSON in `checkpoints/` holding per-method
+values found by Optuna.
+
+### Tuning
+
+```shell
+python experiments/geom_optuna.py experiments/configs/push_tee.yaml --trials 200
+```
+
+The search space is set by the **update rule**, not the method name: every
+method tunes `stdev`, `mean` adds `mppi_temperature`, `topk` adds
+`cem_num_elites` and a covariance floor, `diffuse` adds DIAL's annealing
+parameters. Proposal mixture weights are fixed, never tuned. Results land in
+`checkpoints/<task>_tune.json`.
+
+## mjx: MuJoCo control benchmarks
+
+```shell
+python experiments/mjx_runner.py experiments/configs/CartPole.yaml results/CartPole
 python experiments/mjx_analyze.py results/CartPole
 ```
 
-Prints a `latex_booktabs` cost table and shows a scatter plot per method.
+The runner saves per-algorithm trajectories under `<outdir>/<algorithm>`; the
+analyzer prints a booktabs cost table and a scatter plot per method. Both use
+`fire`, so arguments are positional.
 
-## Configs
+Configs: `CartPole.yaml`, `DoubleCartPole.yaml`, `HalfCheetah.yaml`,
+`Walker.yaml`, `Cube.yaml`.
 
-| Config | Task |
-|--------|------|
-| `CartPole.yaml` | Inverted cart-pole |
-| `DoubleCartPole.yaml` | Double inverted cart-pole |
-| `Walker.yaml` | Bipedal walker |
+Algorithms here are plain names, **not** decomposition strings — `ps`, `mppi`,
+`cem` and `dial` come from [hydrax](https://github.com/vincekurtz/hydrax),
+`icem` is ours (subclassing hydrax's CEM to override `sample_knots`), and `sis`,
+`sir`, `learned` and `biased_mppi` are PFMP. The resampling threshold is
+hardcoded at 0.5 for the PFMP entries rather than read from the config.
 
-### Algorithms
+`learned` needs an actor trained by the scripts in `mjlab/`:
 
-| Key | Description |
-|-----|-------------|
-| `sis` | PFMP (SIS) |
-| `sir` | PFMP (SIR) |
-| `ps` | Predictive Sampling (Hydrax) |
-| `mppi` | MPPI (Hydrax) |
-| `cem` | CEM (Hydrax) |
-
-PFMP-native tasks (e.g. `PushT`) only support `sis` / `sir`.
-
-### Config fields
-
-```yaml
-task: "CartPole"
-algorithms: ["sis", "sir", "ps", "mppi", "cem"]
-num: 20              # rollouts per algorithm
-max_step: 1000       # steps per rollout
-plan_horizon: 1.0    # seconds
-num_knots: 4
-num_samples: 1024
-noise_level: 0.3
-spline_type: "linear"
-mppi_temperature: 0.1
-cem_num_elites: 3
-cem_sigma_start: 0.5
-cem_sigma_min: 0.1
+```shell
+python experiments/mjlab/mjlab_cartpole.py --train
 ```
+
+The runner skips `learned` with a warning when no checkpoint is found, so the
+other methods still run. `learned_checkpoint: null` picks the newest run.
+
+## Known gaps
+
+- `mjx_runner.py` lazily imports `pfmp.tasks.pushT` for a PFMP-native push-T
+  task. That module does not exist, so this path is unreachable; the push-T
+  experiments all go through the geom pipeline.
+- `checkpoints/` keeps superseded tuning runs (`*_legacy`, `*_pre_*`) beside the
+  current ones. The configs name the file they use.

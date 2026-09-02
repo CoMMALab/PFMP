@@ -5,7 +5,9 @@ num: 128           # maps
 num_knots: 18
 num_samples: 1024
 seed: 34
-tuned_params: experiments/checkpoints/drive_tune.json
+# Deliberately untuned: this experiment isolates the resampling axis, so every
+# method runs at library defaults and each rho pair shares hyperparameters.
+# There is no `tuned_params` here on purpose.
 algorithms: [ps, ps+r0.2, mppi, mppi+r0.2, cem, cem+r0.2]
 
 sweep:

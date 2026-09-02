@@ -62,10 +62,7 @@ class Experiment(NamedTuple):
     icem_beta: float = 2.5  # colored-noise exponent for iCEM
 
 def _load_task(name):
-    """Instantiate a task by name. PFMP-native tasks are imported lazily."""
-    if name == "PushT":
-        from pfmp.tasks.pushT import PushT
-        return PushT()
+    """Instantiate a task by name, from hydrax's tasks unless overridden here."""
     if name == "HalfCheetah":
         path = os.path.join(os.path.dirname(__file__), "..", "examples", "half_cheetah.py")
         spec = importlib.util.spec_from_file_location("half_cheetah", path)
@@ -119,8 +116,10 @@ def main(yamlfile, outdir):
             sample_problem = None
 
             if pfmp_native:
-                # PFMP-native task (e.g. PushT) — provides its own dynamics,
-                # cost functions, proposals, and optionally ik_interp.
+                # A task that carries its own dynamics, costs, proposal and
+                # optionally ik_interp, rather than wrapping a hydrax task.
+                # No task in `configs/` is native today; the 2D push-T
+                # experiments go through experiments/geom_runner.py instead.
                 if cfg.algorithm not in ("sis", "sir"):
                     raise ValueError(
                         f"Task {cfg.task} only supports PFMP algorithms (sis/sir), "
