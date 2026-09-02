@@ -138,11 +138,57 @@ AXIS_COLORS = {
 UPDATE_COLORS = {"argmin": "#1E8449", "mean": "#2E86C1", "topk": "#E67E22",
                  "diffuse": "#4A235A", "sample": "#7F8C8D"}
 
+# Outline -> hatched -> solid: an ink ladder, so more capability reads as more
+# filled. Hollow vs solid carries the proposal axis, matching the line figures
+# where a filled marker is programmable and a hollow one is Gaussian. `drive` does pair a Gaussian proposal with
+# resampling, but it plots as lines (which keep rho on the dash), and only `mbm`
+# is categorical -- hence the guard in `_bar_fill` rather than a fourth level.
 BAR_FILL = {
-    ("gaussian", False): ("///", "Gaussian"),
-    ("informed", False): ("",    "Programmable"),
-    ("informed", True):  (".",   "Programmable + Resampling"),
+    ("gaussian", False): (0, "Gaussian"),
+    ("informed", False): (1, "Programmable"),
+    ("informed", True):  (2, "Programmable + Resampling"),
 }
+
+
+# Blend fractions per rung: toward white, unchanged, toward black.
+_BAR_LEVEL_MIX = {0: ("w", 0.55), 1: (None, 0.0), 2: ("k", 0.34)}
+
+
+def _shade(colour, level):
+    """The level-th step of `colour`'s light-to-dark ladder.
+
+    Accepts anything matplotlib parses, not just hex: the legend builds its
+    swatches from a neutral grey.
+    """
+    from matplotlib.colors import to_hex
+    toward, frac = _BAR_LEVEL_MIX[level]
+    if toward is None:
+        return colour
+    hex_colour = to_hex(colour)
+    r, g, b = (int(hex_colour[i:i + 2], 16) for i in (1, 3, 5))
+    tgt = 255 if toward == "w" else 0
+    return "#%02X%02X%02X" % tuple(
+        round(c + (tgt - c) * frac) for c in (r, g, b))
+
+
+def _bar_style(colour, level):
+    """Patch kwargs for one rung: outline, translucent, solid.
+
+    Opacity rises with capability, so the ladder reads in the same direction as
+    the labels, and bars of one rung sit contiguously (see `_bar_order`) so the
+    reader compares within a block rather than hunting across the group. The
+    outline stays the full hue at every rung, which keeps the update rule
+    readable even where the fill is faint.
+    """
+    from matplotlib.colors import to_rgba
+    if level == 0:
+        return dict(facecolor="none", edgecolor=colour, linewidth=1.2)
+    if level == 1:
+        # Alpha on the face only, never the `alpha` kwarg: that fades the edge
+        # too, and the outline is what keeps the bar's update rule legible.
+        return dict(facecolor=to_rgba(colour, 0.38), edgecolor=colour,
+                    linewidth=1.2)
+    return dict(facecolor=colour, edgecolor=colour, linewidth=1.2)
 
 
 def _bar_colour_for(update):
@@ -150,7 +196,7 @@ def _bar_colour_for(update):
 
 
 def _bar_fill(alg):
-    """(hatch, label) for the merged proposal/rho channel. See `BAR_FILL`."""
+    """(level, label) for the merged proposal/rho channel. See `BAR_FILL`."""
     proposal, _, rho = method_decomp(alg)
     resampling = rho is None or rho > 0
     if (proposal, resampling) not in BAR_FILL:
@@ -165,7 +211,7 @@ def _line_marker(alg):
     """Filled marker = biased (informed) proposal, hollow = unbiased.
 
     Lines have only hue and dash, which is one channel short of the three axes,
-    so the marker's fill carries the proposal -- the same job the hatch does on
+    so the marker's fill carries the proposal -- the same job the fill ladder does on
     the bars.
     """
     try:
@@ -182,8 +228,8 @@ def _bar_colour(alg):
         return "gray"
 
 
-def _hatch(alg):
-    return _bar_fill(alg)[0]
+def _bar_patch(alg):
+    return _bar_style(_bar_colour(alg), _bar_fill(alg)[0])
 
 
 def _colour(key):
@@ -306,8 +352,7 @@ def _draw_panel(ax, data, algorithms, sweep, panel, categorical, legend, hp,
         for i, alg in enumerate(algorithms):
             _, c, lo, hi = data[alg]
             ax.bar(idx + i * width - 0.4 + width / 2, c, width * 0.92,
-                   color=_bar_colour(alg), label="_nolegend_",
-                   hatch=_hatch(alg), edgecolor="white", linewidth=0.0,
+                   label="_nolegend_", **_bar_patch(alg),
                    yerr=[np.maximum(c - lo, 0.0), np.maximum(hi - c, 0.0)],
                    capsize=2,
                    error_kw=dict(lw=0.8, ecolor="0.3"))
@@ -396,16 +441,29 @@ def _bar_legend(fig, algorithms, hp):
         u = method_decomp(a)[1]
         if u not in updates:
             updates.append(u)
-        hatch, label = _bar_fill(a)
-        if (hatch, label) not in fills:
-            fills.append((hatch, label))
+        level, label = _bar_fill(a)
+        if (level, label) not in fills:
+            fills.append((level, label))
 
     hue_row = [Patch(facecolor=_bar_colour_for(u), edgecolor="white",
                      label=UPDATE_LABEL.get(u, u)) for u in updates]
     order = [lab for _, lab in BAR_FILL.values()]
-    fill_row = [Patch(facecolor="0.55", hatch=h, edgecolor="white", label=lab)
-                for h, lab in sorted(fills, key=lambda hl: order.index(hl[1]))]
+    fill_row = [Patch(label=lab, **_bar_style("0.55", lv))
+                for lv, lab in sorted(fills, key=lambda hl: order.index(hl[1]))]
     _legend_rows(fig, [hue_row, fill_row])
+
+
+def _bar_order(algorithms):
+    """Sort so each fill rung is contiguous, keeping config order within a rung.
+
+    Bars are compared within a rung far more often than across one, so putting
+    all the Gaussian methods together (then programmable, then +resampling)
+    makes the axis being varied adjacent rather than interleaved.
+    """
+    try:
+        return sorted(algorithms, key=lambda a: _bar_fill(a)[0])
+    except ValueError:
+        return list(algorithms)
 
 
 def make_figure(results, sweep, algorithms, output_dir=OUTPUT_DIR, hp=None):
@@ -417,7 +475,7 @@ def make_figure(results, sweep, algorithms, output_dir=OUTPUT_DIR, hp=None):
             seen.setdefault(_axes_of(alg, hp, sweep.style)[0], []).append(alg)
         groups = [(_group_label(g), algs) for g, algs in seen.items()]
     else:
-        groups = [(None, list(algorithms))]
+        groups = [(None, _bar_order(algorithms))]
 
     probe = series(results, sweep, algorithms, sweep.panels[0]["metric"],
                    sweep.panels[0]["kind"])
