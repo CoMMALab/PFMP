@@ -38,6 +38,9 @@ dependencies = [
 # Vendored analytic Franka IK (GeoFIK pybind wrapper); builds the C++ ext in place.
 geofikinpy = { path = "fr3/geofikinpy_src", editable = true }
 
+[project.optional-dependencies]
+dev = ["pytest"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
