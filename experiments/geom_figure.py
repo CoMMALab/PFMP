@@ -82,6 +82,15 @@ BASELINE_COLORS = {
     'mppi': ('royalblue',  'cornflowerblue', r"MPPI"),
     'cem':  ('darkorange', 'sandybrown',     r"CEM"),
 }
+# Spelled-out names for the supplementary video, where there is room and no
+# surrounding table to be consistent with. The still figure keeps the short
+# forms in BASELINE_COLORS so it matches the paper's tables.
+BASELINE_LONG = {
+    "PS":   "Predictive Sampling (MAP)",
+    "MPPI": "Model Predictive Path Integral",
+    "CEM":  "Cross-Entropy Method",
+}
+
 NUM_CLOUD = 30   # particle paths shown per baseline per frame
 NUM_OUTER = 20   # default refinement passes; matches drive's
                  # n_replans = num_knots, so the figure and the sweep
@@ -251,7 +260,10 @@ def setup_baseline_panel(ax, baselines_data, x0, theta, cost_fn, fns, xlim, ylim
             end = (inner + 1) * steps_per_knot
             for name, iters in baselines_data.items():
                 cloud_xys, nom_xy = iters[outer]
-                _draw(name, cloud_xys[:, :end, :], nom_xy)
+                # Truncate the nominal too, not just the cloud: unrolling is
+                # meant to show the plan being extended knot by knot, and a
+                # fully-drawn nominal makes every frame look converged.
+                _draw(name, cloud_xys[:, :end, :], nom_xy[:end])
         return update, num_outer * inner_frames, 300
     else:
         def update(frame):
@@ -373,7 +385,11 @@ def figure_drive(config, args, output_dir):
     # Same three updates in both panels, so the only difference between rows is
     # rho. Keys stay the bare method names: BASELINE_COLORS is keyed on them, and
     # a shared colour per update is what makes the two rows comparable.
-    METHODS = ("ps", "mppi", "cem")
+    # The still figure overlays all three updates to show they coincide; the
+    # animation shows only the MAP update, so the single visible difference
+    # between the two panels is the resampling threshold. Three near-identical
+    # curves per panel read as clutter in motion.
+    METHODS = ("ps",) if getattr(args, "animate", False) else ("ps", "mppi", "cem")
     print("rho = 0:")
     baselines = {a: run(a, 0.0, NUM_CLOUD) for a in METHODS}
     print(f"rho = {rho}:")
@@ -394,7 +410,7 @@ def figure_drive(config, args, output_dir):
     lims = dict(xlim=(-0.5, arena + 0.5), ylim=(-0.5, ARENA_WIDTH + 0.5))
     spk = round((horizon / (knots - 1)) / DT)
     panel = dict(x0=x0, theta=theta, cost_fn=task.running_cost, fns=fns, plot_obs=real_obs,
-                 unroll=False, num_knots=knots, **lims)
+                 unroll=getattr(args, "animate", False), num_knots=knots, **lims)
 
     update_bot, frames, _ = setup_baseline_panel(
         bot, baselines, steps_per_knot=spk, linestyle=':', **panel)
@@ -402,6 +418,46 @@ def figure_drive(config, args, output_dir):
         top, resampled, steps_per_knot=spk, linestyle='-', **panel)
     bot.set_title(r"SIS ($\rho = 0$)", fontsize=12)
     top.set_title(rf"SIS/R ($\rho = {rho:g}$)", fontsize=12)
+
+    if getattr(args, "animate", False):
+        bot.set_title(r"Sequential Importance Sampling  ($\rho = 0$)", fontsize=13)
+        top.set_title(rf"Sequential Importance Sampling + Resampling  "
+                      rf"($\rho = {rho:g}$)", fontsize=13)
+        for ax in (top, bot):
+            handles, labels = ax.get_legend_handles_labels()
+            ax.legend(handles, [BASELINE_LONG.get(l, l) for l in labels],
+                      loc="upper left", fontsize=9, framealpha=0.85,
+                      edgecolor="black", fancybox=False)
+
+    if getattr(args, "animate", False):
+        # Same two panels, played over the horizon instead of stilled at the
+        # end: the point of the drive task is that the rho = 0 population
+        # sprays across the arena while the resampled one concentrates, which
+        # only reads in motion.
+        #
+        # `unroll=True` above makes a frame one *knot* of the sequential
+        # extension rather than one outer refinement pass, and we play only the
+        # last outer pass -- the converged plan being built left to right, which
+        # is the mechanism the paper describes. Playing all `num_outer` passes
+        # instead shows the plan being re-optimised, a different story.
+        from matplotlib.animation import FuncAnimation
+        inner = knots - 1
+        start = frames - inner              # first frame of the final pass
+        def _step(i):
+            update_bot(start + i)
+            update_top(start + i)
+        anim = FuncAnimation(fig, _step, frames=inner, interval=200, blit=False)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out = output_dir / f"{args.out or 'drive_plan_anim'}.mp4"
+        print(f"Writing {inner} frames (one rollout, {knots} knots) to {out}…")
+        try:
+            anim.save(str(out), writer="ffmpeg", fps=args.fps, dpi=150)
+        except Exception as e:                      # no ffmpeg writer available
+            out = out.with_suffix(".gif")
+            print(f"  ffmpeg writer unavailable ({e}); falling back to {out}")
+            anim.save(str(out), writer="pillow", fps=args.fps, dpi=120)
+        print(f"Saved {out}")
+        return
 
     update_bot(frames - 1)          # the still is the converged frame
     update_top(frames - 1)
@@ -587,6 +643,9 @@ def main():
     ap.add_argument("--particles", type=int,
                     help="drive: particle count (default drive_2d.PARTICLES)")
     ap.add_argument("--out", help="output stem (no extension)")
+    ap.add_argument("--animate", action="store_true",
+                    help="drive: write an mp4 over the horizon instead of a still")
+    ap.add_argument("--fps", type=int, default=5, help="drive: --animate frame rate")
     ap.add_argument("--output-dir")
     args = ap.parse_args()
 

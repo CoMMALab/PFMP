@@ -162,7 +162,13 @@ and writes the figure. `experiments/configs/` holds one per experiment.
 
 ## Tests
 
+The test runner is not a runtime dependency; install it first:
+
 ```shell
-pytest -m "not slow"    # fast subset, ~19s
-pytest                  # everything; ~11 tests JIT an MJX rollout
+uv pip install ".[dev]"          # or: uv pip install pytest
+```
+
+```shell
+python -m pytest -m "not slow"   # fast subset, ~19s
+python -m pytest                 # everything; ~11 tests JIT an MJX rollout
 ```

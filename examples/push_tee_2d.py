@@ -415,7 +415,8 @@ def _t_verts_world(t_xy: np.ndarray, t_angle: float) -> np.ndarray:
 from pfmp import dial_step
 
 
-def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REPLANS):
+def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REPLANS,
+             report_every: int = 20):
     """Run closed-loop simulation, return (states, plans)."""
     # One decoder for the three axes, shared with geom_runner (pfmp.method_decomp).
     proposal_kind, update_kind, rho = method_decomp(method)
@@ -494,7 +495,7 @@ def simulate(method: str, x0, theta, key, particles: int, n_replans: int = N_REP
         new_tk = tk + STEPS_PER_REPLAN * DT
         theta  = theta._replace(mean=hermite_spline(new_tk, tk, theta.mean))
 
-        if (step_i + 1) % 20 == 0:
+        if (step_i + 1) % report_every == 0:
             s = states[-1]
             pos_err   = float(np.linalg.norm(s[0:2] - goal_xy))
             angle_err = float(abs(((s[2] - goal_angle + np.pi) % (2 * np.pi)) - np.pi))
@@ -607,6 +608,16 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--save-gif', action='store_true')
+    parser.add_argument('--mp4', action='store_true',
+                        help='write .mp4 via ffmpeg instead of .gif via pillow')
+    parser.add_argument('--stride', type=int, default=25,
+                        help='keep every Nth sim state when saving (default 25)')
+    parser.add_argument('--fps', type=int, default=20)
+    parser.add_argument('--max-frames', type=int, default=0,
+                        help='stop saving after N frames (0 = whole run); the '
+                             'tail of a solved run is the block sitting still')
+    parser.add_argument('--report-every', type=int, default=20,
+                        help='print pos/angle error every N replan steps')
     parser.add_argument('--seed', type=int, default=SEED)
     parser.add_argument('--particles', type=int, default=PARTICLES)
     parser.add_argument('--method', choices=['pfmp', 'mppi', 'biased_mppi', 'biased_cem', 'dial', 'ps', 'cem'], default='pfmp')
@@ -622,7 +633,8 @@ def main():
         args.seed, args.distance, args.n_obs)
 
     key = jax.random.key(args.seed)
-    states, plans = simulate(args.method, x0, theta, key, args.particles, n_replans)
+    states, plans = simulate(args.method, x0, theta, key, args.particles, n_replans,
+                             report_every=args.report_every)
     goal_xy    = np.array(theta.goal_xy)
     goal_angle = float(theta.goal_angle)
     obstacles  = np.array(theta.obstacles)
@@ -640,8 +652,18 @@ def main():
     ax.set_xticks([]); ax.set_yticks([])
     for spine in ax.spines.values():
         spine.set_edgecolor('black'); spine.set_linewidth(1.5)
-    ax.set_title(f"{args.method.upper()}: T-block Pushing "
-                 f"({args.distance:.1f}x T-width arena)", fontsize=13)
+    # Name the method by its decomposition, not its internal string: the video
+    # has no table beside it, so the title has to say which proposal is running.
+    _TITLES = {
+        "pfmp":        "Sequential Importance Sampling + Proposal Program",
+        "ps":          "Sequential Importance Sampling + Gaussian Proposal",
+        "mppi":        "Model Predictive Path Integral + Gaussian Proposal",
+        "cem":         "Cross-Entropy Method + Gaussian Proposal",
+        "dial":        "DIAL-MPC + Gaussian Proposal",
+        "biased_mppi": "Model Predictive Path Integral + Programmable Proposal",
+        "biased_cem":  "Cross-Entropy Method + Programmable Proposal",
+    }
+    ax.set_title(_TITLES.get(args.method, args.method.upper()), fontsize=12)
 
     # Outer robot margin (solid, subtle)
     ax.add_patch(mpatches.FancyBboxPatch(
@@ -698,10 +720,12 @@ def main():
     plan_line, = ax.plot([], [], color='royalblue', alpha=0.4,
                          linewidth=1.0, zorder=6)
 
-    # Info text
+    # Info text. Suppressed when saving: the numbers are for interactive
+    # debugging, and in a side-by-side video they compete with the titles.
     info_text = ax.text(
         0.02, 0.98, '', transform=ax.transAxes,
         fontsize=9, verticalalignment='top',
+        visible=not args.save_gif,
         bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7),
     )
 
@@ -716,7 +740,7 @@ def main():
         mpatches.Patch(facecolor='royalblue', alpha=0.6,
                        label='Planned waypoints'),
     ]
-    ax.legend(handles=legend_handles, loc='upper right', fontsize=8,
+    ax.legend(handles=legend_handles, loc='upper left', fontsize=8,
               framealpha=0.85, edgecolor='black', fancybox=False)
 
     # Trail buffer
@@ -763,7 +787,17 @@ def main():
         return t_patch, robot_circle, trail_line, plan_dots, plan_line, info_text
 
     n_frames = len(states)
-    anim = FuncAnimation(fig, update, frames=n_frames,
+    # One state per sim step is far more than a viewer needs, and pillow holds
+    # every frame in memory while writing -- a full-length run (9k states) gets
+    # OOM-killed mid-save. Stride down when saving; interactive playback keeps
+    # every frame.
+    if args.save_gif:
+        stop = n_frames if args.max_frames <= 0 else min(
+            n_frames, args.max_frames * max(1, args.stride))
+        save_frames = range(0, stop, max(1, args.stride))
+    else:
+        save_frames = n_frames
+    anim = FuncAnimation(fig, update, frames=save_frames,
                          interval=20, blit=True, repeat=True, repeat_delay=1500)
 
     plt.tight_layout()
@@ -771,10 +805,12 @@ def main():
     if args.save_gif:
         from pathlib import Path
         suffix = f"dist{args.distance:.0f}_s{args.seed}"
-        out = Path(__file__).parent.parent / "figures" / f"push_tee_{args.method}_{suffix}.gif"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        print(f"Saving gif to {out}…")
-        anim.save(str(out), writer='pillow', fps=30, dpi=120)
+        stem = Path(__file__).parent.parent / "figures" / f"push_tee_{args.method}_{suffix}"
+        stem.parent.mkdir(parents=True, exist_ok=True)
+        ext, writer = ("mp4", "ffmpeg") if args.mp4 else ("gif", "pillow")
+        out = stem.with_suffix(f".{ext}")
+        print(f"Saving {len(save_frames)} frames (stride {args.stride}) to {out}…")
+        anim.save(str(out), writer=writer, fps=args.fps, dpi=120)
         print("Saved.")
     else:
         plt.show()
