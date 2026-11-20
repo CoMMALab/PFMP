@@ -1,0 +1,39 @@
+<mujoco model="panda_cube_grasp">
+  <include file="mjx_grasp_scene.xml"/>
+
+  <worldbody>
+    <!-- Same acrylic table footprint as the push-T scene, drawn for reference only. -->
+    <geom type="box" name="workspace"
+        pos="0.3798 -0.0254 0.001" size="0.5398 0.9462 0.001"
+        rgba="0.7 0.7 0.7 0.25" contype="0" conaffinity="0" group="2"/>
+
+    <!-- 45 mm cube: comfortably inside the Franka hand's 80 mm maximum opening. -->
+    <body name="cube" pos="0.5 0.0 0.0225">
+      <freejoint name="cube_free"/>
+      <inertial mass="0.1" pos="0 0 0" diaginertia="3.375e-5 3.375e-5 3.375e-5"/>
+      <geom type="box" name="cube" size="0.0225 0.0225 0.0225"
+          rgba="0.9 0.3 0.2 1" condim="4"
+          friction="1.0 0.02 0.002" contype="1" conaffinity="1"
+          solimp="0.95 0.99 0.001" solref="0.01 1"/>
+    </body>
+
+    <!-- Cameras for offscreen rendering (sim_grasp.py --video). "overview"
+         frames the table and the full 0.5 m lift; "closeup" is tighter on the
+         grasp itself. Neither tracks, so the cube leaving frame is meaningful. -->
+    <camera name="overview" pos="1.15 -0.95 0.85" xyaxes="0.8253 0.5647 -0.0000 -0.2434 0.3558 0.9023"/>
+    <camera name="closeup"  pos="0.95 -0.55 0.45" xyaxes="0.7740 0.6332 -0.0000 -0.2101 0.2568 0.9433"/>
+
+    <!-- Lift target, visual only. -->
+    <site name="lift_target" pos="0.5 0.0 0.5225" size="0.012"
+        rgba="0.1 0.9 0.1 0.4" group="2"/>
+  </worldbody>
+
+  <keyframe>
+    <key name="home"
+        qpos="0 -0.785398 0 -2.356194 0 1.570796 0.785398
+              0.04 0.04
+              0.5 0.0 0.0225 1 0 0 0"
+        ctrl="0 -0.785398 0 -2.356194 0 1.570796 0.785398 0.04"/>
+  </keyframe>
+
+</mujoco>
